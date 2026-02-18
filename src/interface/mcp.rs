@@ -5,6 +5,7 @@
 //! 7 tools: init, node_create, node_update, node_move, toc, checklist, import
 
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use rmcp::{
     handler::server::{tool::ToolCallContext, tool::ToolRouter, wrapper::Parameters},
@@ -32,9 +33,9 @@ use crate::infra::json_store::JsonBookRepository;
 // Public entry point
 // =============================================================================
 
-/// MCP Serverを起動する。
-pub async fn run(book_path: PathBuf) -> anyhow::Result<()> {
-    let server = OutlineMcpServer::new(book_path);
+/// MCP Serverを起動する。shelf_dirは複数Book格納ディレクトリ。
+pub async fn run(shelf_dir: PathBuf) -> anyhow::Result<()> {
+    let server = OutlineMcpServer::new(shelf_dir);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -46,21 +47,85 @@ pub async fn run(book_path: PathBuf) -> anyhow::Result<()> {
 
 #[derive(Clone)]
 struct OutlineMcpServer {
-    book_path: PathBuf,
+    shelf_dir: PathBuf,
+    selected: Arc<RwLock<Option<String>>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl OutlineMcpServer {
-    fn new(book_path: PathBuf) -> Self {
+    fn new(shelf_dir: PathBuf) -> Self {
         Self {
-            book_path,
+            shelf_dir,
+            selected: Arc::new(RwLock::new(None)),
             tool_router: Self::tool_router(),
         }
     }
 
-    fn service(&self) -> BookService<JsonBookRepository> {
-        let repo = JsonBookRepository::new(&self.book_path);
+    /// slug からBookファイルパスを返す。
+    fn book_path(&self, slug: &str) -> PathBuf {
+        self.shelf_dir.join(format!("{slug}.json"))
+    }
+
+    /// 選択中BookのServiceを返す。未選択ならエラー。
+    fn service(&self) -> Result<BookService<JsonBookRepository>, McpError> {
+        let guard = self
+            .selected
+            .read()
+            .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+        let slug = guard.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                None,
+            )
+        })?;
+        let repo = JsonBookRepository::new(self.book_path(slug));
+        Ok(BookService::new(repo))
+    }
+
+    /// 指定slugのServiceを返す（選択状態不要）。
+    fn service_for(&self, slug: &str) -> BookService<JsonBookRepository> {
+        let repo = JsonBookRepository::new(self.book_path(slug));
         BookService::new(repo)
+    }
+
+    /// Shelf内のslug一覧をソート順で返す。
+    fn list_book_slugs(&self) -> Result<Vec<String>, McpError> {
+        if !self.shelf_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let dir = std::fs::read_dir(&self.shelf_dir)
+            .map_err(|e| McpError::internal_error(format!("Failed to read shelf: {e}"), None))?;
+        let mut slugs: Vec<String> = dir
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(String::from)
+            })
+            .collect();
+        slugs.sort();
+        Ok(slugs)
+    }
+
+    /// 番号 or slug → slug に解決する。
+    fn resolve_book_ref(&self, book_ref: &str) -> Result<String, McpError> {
+        if let Ok(num) = book_ref.parse::<usize>() {
+            let slugs = self.list_book_slugs()?;
+            if num == 0 || num > slugs.len() {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Book number {} out of range (1-{}). Use `shelf` to see available books.",
+                        num,
+                        slugs.len()
+                    ),
+                    None,
+                ));
+            }
+            return Ok(slugs[num - 1].clone());
+        }
+        Ok(book_ref.to_string())
     }
 
     fn to_mcp_error(e: AppError) -> McpError {
@@ -77,7 +142,7 @@ impl OutlineMcpServer {
     fn resolve_id(&self, s: &str) -> Result<NodeId, McpError> {
         // 1. 階層番号（"1", "2-3", "1-2-1" 等）
         if is_hierarchical_id(s) {
-            let svc = self.service();
+            let svc = self.service()?;
             let book = svc.read_tree().map_err(Self::to_mcp_error)?;
             let mapping = build_hierarchical_ids(&book);
             if let Some((_, id)) = mapping.iter().find(|(num, _)| num == s) {
@@ -94,7 +159,7 @@ impl OutlineMcpServer {
             return Ok(id);
         }
 
-        let svc = self.service();
+        let svc = self.service()?;
         let book = svc.read_tree().map_err(Self::to_mcp_error)?;
 
         // 3. 短縮プレフィックスでBook内を検索
@@ -170,10 +235,12 @@ impl ServerHandler for OutlineMcpServer {
                 website_url: None,
             },
             instructions: Some(
-                "2-step workflow: \
-                 (1) `toc` — shows numbered table of contents (e.g. '1. Coding Standards', '2. Testing'). \
-                 (2) Use the ID with `checklist(subtree_root='2')` to export that section as a working checklist. \
-                 Node IDs from `toc` (e.g. '1', '2-3') work in all tools: `node_create`, `node_update`, `node_move`, `checklist`."
+                "Multi-book shelf workflow: \
+                 (1) `shelf` — list all books. \
+                 (2) `select_book('1')` — select a book by number or slug. \
+                 (3) `toc` — shows numbered table of contents. \
+                 (4) Use the ID with `checklist`, `node_create`, `node_update`, `node_move`. \
+                 First-time: `init` to create a new book in the shelf."
                     .to_string(),
             ),
         }
@@ -204,6 +271,23 @@ impl ServerHandler for OutlineMcpServer {
 // =============================================================================
 // Request types
 // =============================================================================
+
+/// slugが安全なファイル名であることを検証する。
+fn validate_slug(slug: &str) -> Result<(), McpError> {
+    if slug.is_empty() {
+        return Err(McpError::invalid_params("slug must not be empty", None));
+    }
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(McpError::invalid_params(
+            "slug must contain only alphanumeric characters, hyphens, and underscores",
+            None,
+        ));
+    }
+    Ok(())
+}
 
 /// filenameにパス区切り文字や".."が含まれていないことを検証する。
 fn validate_filename(filename: &str) -> Result<(), McpError> {
@@ -337,8 +421,23 @@ struct McpImportRequest {
 struct McpInitRequest {
     #[schemars(description = "Book title")]
     pub title: String,
+    #[schemars(
+        description = "Book slug for filename (e.g. 'rust', 'development'). Alphanumeric, hyphens, underscores only."
+    )]
+    pub slug: String,
     #[schemars(description = "Maximum tree depth (default: 4, recommended: 3-4)")]
     pub max_depth: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct McpShelfRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct McpSelectBookRequest {
+    #[schemars(
+        description = "Book to select: number from `shelf` output (e.g. '1') or book slug (e.g. 'rust')"
+    )]
+    pub book: String,
 }
 
 // =============================================================================
@@ -361,7 +460,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpNodeCreateRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service();
+        let svc = self.service()?;
         let node_type = parse_node_type(&req.node_type)?;
         let parent = req
             .parent
@@ -405,7 +504,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpNodeUpdateRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service();
+        let svc = self.service()?;
         let id = self.resolve_id(&req.node_id)?;
         let node_type = req.node_type.as_deref().map(parse_node_type).transpose()?;
 
@@ -443,7 +542,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpNodeMoveRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service();
+        let svc = self.service()?;
         let id = self.resolve_id(&req.node_id)?;
 
         match req.action.as_str() {
@@ -502,7 +601,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpTocRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service();
+        let svc = self.service()?;
         let book = svc.read_tree().map_err(Self::to_mcp_error)?;
 
         let subtree_id = req
@@ -553,7 +652,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpEjectRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service();
+        let svc = self.service()?;
         let book = svc.read_tree().map_err(Self::to_mcp_error)?;
 
         let include_placeholders = req.include_placeholders.unwrap_or(true);
@@ -632,7 +731,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpImportRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service();
+        let svc = self.service()?;
         let import_path = validate_import_path(&req.file_path)?;
         let content = std::fs::read_to_string(&import_path)
             .map_err(|e| McpError::internal_error(format!("Failed to read file: {e}"), None))?;
@@ -651,10 +750,10 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "init",
-        description = "Create a new empty book. Required once before adding any nodes.",
+        description = "Create a new book in the shelf. Requires a slug (filename) and title. Auto-selects the new book.",
         annotations(
             read_only_hint = false,
-            destructive_hint = true,
+            destructive_hint = false,
             idempotent_hint = false,
             open_world_hint = false
         )
@@ -663,17 +762,144 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpInitRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service();
+        validate_slug(&req.slug)?;
+
+        let path = self.book_path(&req.slug);
+        if path.exists() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Book '{}' already exists. Choose a different slug.",
+                    req.slug
+                ),
+                None,
+            ));
+        }
+
+        std::fs::create_dir_all(&self.shelf_dir).map_err(|e| {
+            McpError::internal_error(format!("Failed to create shelf directory: {e}"), None)
+        })?;
+
+        let svc = self.service_for(&req.slug);
         let max_depth = req.max_depth.unwrap_or(4);
         let book = svc
             .create_book(&req.title, max_depth)
             .map_err(Self::to_mcp_error)?;
 
+        // Auto-select
+        let mut guard = self
+            .selected
+            .write()
+            .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+        *guard = Some(req.slug.clone());
+
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Created book: '{}' (id: {}, max_depth: {})",
+            "Created book: '{}' (slug: {}, max_depth: {}). Auto-selected.",
             book.title(),
-            book.id(),
+            req.slug,
             book.max_depth()
+        ))]))
+    }
+
+    #[tool(
+        name = "shelf",
+        description = "List all books in the shelf. Shows book slugs, titles, and node counts. The currently selected book is marked with ★.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn shelf(
+        &self,
+        #[allow(unused_variables)] Parameters(_req): Parameters<McpShelfRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let slugs = self.list_book_slugs()?;
+
+        if slugs.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Shelf is empty. Use `init` to create a new book.",
+            )]));
+        }
+
+        let selected = self
+            .selected
+            .read()
+            .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+
+        let mut entries: Vec<(String, String, usize)> = Vec::new();
+        for slug in &slugs {
+            let svc = self.service_for(slug);
+            match svc.read_tree() {
+                Ok(book) => {
+                    entries.push((slug.clone(), book.title().to_string(), book.node_count()));
+                }
+                Err(_) => {
+                    entries.push((slug.clone(), "(failed to load)".to_string(), 0));
+                }
+            }
+        }
+
+        let mut output = format!("# Shelf ({} books)\n\n", entries.len());
+        for (i, (slug, title, count)) in entries.iter().enumerate() {
+            let marker = if selected.as_deref() == Some(slug.as_str()) {
+                " ★"
+            } else {
+                ""
+            };
+            output.push_str(&format!(
+                "{}. {} — \"{}\" ({} nodes){}\n",
+                i + 1,
+                slug,
+                title,
+                count,
+                marker
+            ));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "select_book",
+        description = "Select a book to work with. Use a number from `shelf` output or a book slug. All subsequent operations (toc, node_create, etc.) will target the selected book.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn select_book(
+        &self,
+        Parameters(req): Parameters<McpSelectBookRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let slug = self.resolve_book_ref(&req.book)?;
+
+        let path = self.book_path(&slug);
+        if !path.exists() {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Book '{}' not found in shelf. Use `shelf` to list available books.",
+                    slug
+                ),
+                None,
+            ));
+        }
+
+        let svc = self.service_for(&slug);
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+
+        let mut guard = self
+            .selected
+            .write()
+            .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+        *guard = Some(slug.clone());
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Selected: {} — \"{}\" ({} nodes)",
+            slug,
+            book.title(),
+            book.node_count()
         ))]))
     }
 }
@@ -746,17 +972,47 @@ mod tests {
 
     #[test]
     fn server_info() {
-        let server = OutlineMcpServer::new(PathBuf::from("test.json"));
+        let server = OutlineMcpServer::new(PathBuf::from("/tmp/test-shelf"));
         let info = server.get_info();
         assert_eq!(info.server_info.name, "outline-mcp");
         assert!(!info.server_info.version.is_empty());
     }
 
     #[test]
-    fn init_request_defaults() {
-        let req: McpInitRequest = serde_json::from_str(r#"{"title": "Test"}"#).unwrap();
+    fn init_request_with_slug() {
+        let req: McpInitRequest =
+            serde_json::from_str(r#"{"title": "Test", "slug": "test"}"#).unwrap();
         assert_eq!(req.title, "Test");
+        assert_eq!(req.slug, "test");
         assert!(req.max_depth.is_none());
+    }
+
+    #[test]
+    fn validate_slug_valid() {
+        assert!(validate_slug("rust").is_ok());
+        assert!(validate_slug("my-book").is_ok());
+        assert!(validate_slug("dev_standards").is_ok());
+        assert!(validate_slug("book123").is_ok());
+    }
+
+    #[test]
+    fn validate_slug_invalid() {
+        assert!(validate_slug("").is_err());
+        assert!(validate_slug("has space").is_err());
+        assert!(validate_slug("path/traversal").is_err());
+        assert!(validate_slug("dot..dot").is_err());
+        assert!(validate_slug("日本語").is_err());
+    }
+
+    #[test]
+    fn shelf_request_empty() {
+        let _req: McpShelfRequest = serde_json::from_str("{}").unwrap();
+    }
+
+    #[test]
+    fn select_book_request() {
+        let req: McpSelectBookRequest = serde_json::from_str(r#"{"book": "rust"}"#).unwrap();
+        assert_eq!(req.book, "rust");
     }
 
     #[test]
