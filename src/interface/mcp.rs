@@ -1,0 +1,921 @@
+//! MCP Server for outline-mcp
+//!
+//! MCP Protocol (stdio) <-> application::BookService / EjectService
+//!
+//! 7 tools: init, node_create, node_update, node_move, toc, checklist, import
+
+use std::path::PathBuf;
+
+use rmcp::{
+    handler::server::{tool::ToolCallContext, tool::ToolRouter, wrapper::Parameters},
+    model::{
+        CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+    },
+    service::{RequestContext, RoleServer},
+    tool, tool_router,
+    transport::stdio,
+    ErrorData as McpError, ServerHandler, ServiceExt,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::application::eject::{EjectConfig, EjectFormat, EjectService, EjectTree};
+use crate::application::error::AppError;
+use crate::application::service::BookService;
+use crate::domain::model::book::{AddNodeRequest, UpdateNodeRequest};
+use crate::domain::model::id::NodeId;
+use crate::domain::model::node::NodeType;
+use crate::infra::json_store::JsonBookRepository;
+
+// =============================================================================
+// Public entry point
+// =============================================================================
+
+/// MCP Serverを起動する。
+pub async fn run(book_path: PathBuf) -> anyhow::Result<()> {
+    let server = OutlineMcpServer::new(book_path);
+    let service = server.serve(stdio()).await?;
+    service.waiting().await?;
+    Ok(())
+}
+
+// =============================================================================
+// MCP Server
+// =============================================================================
+
+#[derive(Clone)]
+struct OutlineMcpServer {
+    book_path: PathBuf,
+    tool_router: ToolRouter<Self>,
+}
+
+impl OutlineMcpServer {
+    fn new(book_path: PathBuf) -> Self {
+        Self {
+            book_path,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    fn service(&self) -> BookService<JsonBookRepository> {
+        let repo = JsonBookRepository::new(&self.book_path);
+        BookService::new(repo)
+    }
+
+    fn to_mcp_error(e: AppError) -> McpError {
+        McpError::internal_error(format!("{e}"), None)
+    }
+
+    /// 階層番号 / Full UUID / short prefix / title部分一致 → NodeId。
+    ///
+    /// 優先順位:
+    /// 1. 階層番号 (e.g. "1", "2-3") — `toc` 出力と対応
+    /// 2. Full UUID
+    /// 3. 短縮UUIDプレフィックス
+    /// 4. タイトル部分一致（フォールバック）
+    fn resolve_id(&self, s: &str) -> Result<NodeId, McpError> {
+        // 1. 階層番号（"1", "2-3", "1-2-1" 等）
+        if is_hierarchical_id(s) {
+            let svc = self.service();
+            let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+            let mapping = build_hierarchical_ids(&book);
+            if let Some((_, id)) = mapping.iter().find(|(num, _)| num == s) {
+                return Ok(*id);
+            }
+            return Err(McpError::invalid_params(
+                format!("No node at position '{s}'. Run `toc` to see available IDs."),
+                None,
+            ));
+        }
+
+        // 2. Full UUIDとして解析
+        if let Ok(id) = parse_node_id(s) {
+            return Ok(id);
+        }
+
+        let svc = self.service();
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+
+        // 3. 短縮プレフィックスでBook内を検索
+        let id_matches: Vec<NodeId> = book
+            .all_node_ids()
+            .filter(|id| id.to_string().starts_with(s))
+            .collect();
+        match id_matches.len() {
+            1 => return Ok(id_matches[0]),
+            n if n > 1 => {
+                return Err(McpError::invalid_params(
+                    format!("Ambiguous ID prefix: '{s}' matches {n} nodes"),
+                    None,
+                ))
+            }
+            _ => {}
+        }
+
+        // 4. タイトル部分一致（case-insensitive, フォールバック）
+        let query = s.to_lowercase();
+        let title_matches: Vec<NodeId> = book
+            .all_nodes_dfs()
+            .iter()
+            .filter(|node| node.title().to_lowercase().contains(&query))
+            .map(|node| node.id())
+            .collect();
+        match title_matches.len() {
+            0 => Err(McpError::invalid_params(
+                format!("No node found matching: '{s}'"),
+                None,
+            )),
+            1 => Ok(title_matches[0]),
+            n => Err(McpError::invalid_params(
+                format!(
+                    "Ambiguous title match: '{s}' matches {n} nodes: {}",
+                    title_matches
+                        .iter()
+                        .map(|id| {
+                            let hier = find_hierarchical_id(&book, *id)
+                                .unwrap_or_else(|| id.short().to_string());
+                            book.get_node(*id)
+                                .map(|n| format!("'{}' ({})", n.title(), hier))
+                                .unwrap_or(hier)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None,
+            )),
+        }
+    }
+}
+
+// =============================================================================
+// ServerHandler impl
+// =============================================================================
+
+impl ServerHandler for OutlineMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: ProtocolVersion::V_2025_03_26,
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "outline-mcp".to_string(),
+                title: Some("Outline MCP — Session Guide & Checklist".to_string()),
+                description: Some(
+                    "Tree-structured runbook with numbered IDs. \
+                     2-step workflow: `toc` → pick ID → `checklist`."
+                        .to_string(),
+                ),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                icons: None,
+                website_url: None,
+            },
+            instructions: Some(
+                "2-step workflow: \
+                 (1) `toc` — shows numbered table of contents (e.g. '1. Coding Standards', '2. Testing'). \
+                 (2) Use the ID with `checklist(subtree_root='2')` to export that section as a working checklist. \
+                 Node IDs from `toc` (e.g. '1', '2-3') work in all tools: `node_create`, `node_update`, `node_move`, `checklist`."
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool_ctx = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tool_ctx).await
+    }
+}
+
+// =============================================================================
+// Request types
+// =============================================================================
+
+/// filenameにパス区切り文字や".."が含まれていないことを検証する。
+fn validate_filename(filename: &str) -> Result<(), McpError> {
+    if filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+        || filename.is_empty()
+    {
+        return Err(McpError::invalid_params(
+            "filename must not contain path separators, '..', or be empty",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// importパスの拡張子を検証する。
+fn validate_import_path(file_path: &str) -> Result<PathBuf, McpError> {
+    let path = PathBuf::from(file_path);
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("json") => Ok(path),
+        _ => Err(McpError::invalid_params(
+            "Only .json files can be imported",
+            None,
+        )),
+    }
+}
+
+fn parse_node_type(s: &str) -> Result<NodeType, McpError> {
+    match s {
+        "section" => Ok(NodeType::Section),
+        "content" => Ok(NodeType::Content),
+        other => Err(McpError::invalid_params(
+            format!("Unknown node_type: '{other}'. Use: section, content"),
+            None,
+        )),
+    }
+}
+
+/// MCP経由のテキストに含まれるリテラル `\n` を実際の改行に変換する。
+fn unescape_newlines(s: &str) -> String {
+    s.replace("\\n", "\n")
+}
+
+fn normalize_text(s: Option<String>) -> Option<String> {
+    s.map(|v| unescape_newlines(&v))
+}
+
+fn parse_node_id(s: &str) -> Result<NodeId, McpError> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .map_err(|_| McpError::invalid_params(format!("Invalid node_id: '{s}'"), None))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct McpNodeCreateRequest {
+    #[schemars(
+        description = "Parent ID from `toc` output (e.g. '1', '2-3'). Omit for root-level node. UUID also accepted."
+    )]
+    pub parent: Option<String>,
+    #[schemars(description = "Node title (required)")]
+    pub title: String,
+    #[schemars(description = "Node type: section or content")]
+    pub node_type: String,
+    #[schemars(description = "Optional markdown body content")]
+    pub body: Option<String>,
+    #[schemars(
+        description = "Optional placeholder hint for checklist export (e.g. 'write test cases here')"
+    )]
+    pub placeholder: Option<String>,
+    #[schemars(description = "Position among siblings (0-based). Omit to append at end.")]
+    pub position: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct McpNodeUpdateRequest {
+    #[schemars(description = "Node ID from `toc` output (e.g. '2-3'). UUID also accepted.")]
+    pub node_id: String,
+    #[schemars(description = "New title (omit to keep current)")]
+    pub title: Option<String>,
+    #[schemars(description = "New body (null to clear, omit to keep current)")]
+    pub body: Option<Option<String>>,
+    #[schemars(description = "New node type: section or content")]
+    pub node_type: Option<String>,
+    #[schemars(description = "New placeholder hint (null to clear)")]
+    pub placeholder: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct McpNodeMoveRequest {
+    #[schemars(description = "Node ID from `toc` output (e.g. '2-3'). UUID also accepted.")]
+    pub node_id: String,
+    #[schemars(description = "Action: 'move' to relocate, 'remove' to delete (with descendants)")]
+    pub action: String,
+    #[schemars(
+        description = "New parent ID from `toc` output (null for root). Required for 'move' action."
+    )]
+    pub new_parent: Option<String>,
+    #[schemars(description = "Position among new siblings (0-based). Default: append at end.")]
+    pub position: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct McpTocRequest {
+    #[schemars(description = "Section ID from `toc` output (e.g. '2'). Omit to show entire book.")]
+    pub subtree_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct McpEjectRequest {
+    #[schemars(description = "Output directory path (default: current directory)")]
+    pub output_dir: Option<String>,
+    #[schemars(description = "Output filename (default: '<book-title>.md')")]
+    pub filename: Option<String>,
+    #[schemars(description = "Include placeholder hints as fill-in fields (default: true)")]
+    pub include_placeholders: Option<bool>,
+    #[schemars(description = "Output format: 'markdown' (default) or 'json' (tree-structured)")]
+    pub format: Option<String>,
+    #[schemars(
+        description = "Section ID from `toc` output (e.g. '2'). Omit to export entire book."
+    )]
+    pub subtree_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct McpImportRequest {
+    #[schemars(description = "Path to JSON file exported by eject (format: json)")]
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct McpInitRequest {
+    #[schemars(description = "Book title")]
+    pub title: String,
+    #[schemars(description = "Maximum tree depth (default: 4, recommended: 3-4)")]
+    pub max_depth: Option<u8>,
+}
+
+// =============================================================================
+// Tool implementations
+// =============================================================================
+
+#[tool_router]
+impl OutlineMcpServer {
+    #[tool(
+        name = "node_create",
+        description = "Add a new node to the book. Use a parent ID from `toc` output (e.g. '1') to nest under a section, or omit for root-level.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn node_create(
+        &self,
+        Parameters(req): Parameters<McpNodeCreateRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service();
+        let node_type = parse_node_type(&req.node_type)?;
+        let parent = req
+            .parent
+            .as_deref()
+            .map(|s| self.resolve_id(s))
+            .transpose()?;
+
+        let add_req = AddNodeRequest {
+            parent,
+            title: unescape_newlines(&req.title),
+            node_type,
+            body: normalize_text(req.body),
+            placeholder: normalize_text(req.placeholder),
+            position: req.position.unwrap_or(usize::MAX),
+        };
+
+        let id = svc.add_node(add_req).map_err(Self::to_mcp_error)?;
+
+        // 階層番号を逆引き
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+        let hier = find_hierarchical_id(&book, id).unwrap_or_else(|| id.short().to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Created: {}. {}",
+            hier,
+            book.get_node(id).map(|n| n.title()).unwrap_or("?")
+        ))]))
+    }
+
+    #[tool(
+        name = "node_update",
+        description = "Edit a node's title, body, type, or placeholder. Specify the node by ID from `toc` output (e.g. '2-3'). Only specified fields are changed.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn node_update(
+        &self,
+        Parameters(req): Parameters<McpNodeUpdateRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service();
+        let id = self.resolve_id(&req.node_id)?;
+        let node_type = req.node_type.as_deref().map(parse_node_type).transpose()?;
+
+        let update_req = UpdateNodeRequest {
+            title: req.title.map(|t| unescape_newlines(&t)),
+            body: req.body.map(normalize_text),
+            node_type,
+            placeholder: req.placeholder.map(normalize_text),
+        };
+
+        svc.update_node(id, update_req)
+            .map_err(Self::to_mcp_error)?;
+
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+        let hier = find_hierarchical_id(&book, id).unwrap_or_else(|| id.short().to_string());
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Updated: {}. {}",
+            hier,
+            book.get_node(id).map(|n| n.title()).unwrap_or("?")
+        ))]))
+    }
+
+    #[tool(
+        name = "node_move",
+        description = "Move or delete a node (and its descendants). Specify node by ID from `toc` output (e.g. '2-3'). Action 'move' relocates, 'remove' deletes.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn node_move(
+        &self,
+        Parameters(req): Parameters<McpNodeMoveRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service();
+        let id = self.resolve_id(&req.node_id)?;
+
+        match req.action.as_str() {
+            "move" => {
+                let new_parent = req
+                    .new_parent
+                    .as_deref()
+                    .map(|s| self.resolve_id(s))
+                    .transpose()?;
+                let position = req.position.unwrap_or(usize::MAX);
+                svc.move_node(id, new_parent, position)
+                    .map_err(Self::to_mcp_error)?;
+
+                let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+                let hier =
+                    find_hierarchical_id(&book, id).unwrap_or_else(|| id.short().to_string());
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Moved → {}. {}",
+                    hier,
+                    book.get_node(id).map(|n| n.title()).unwrap_or("?")
+                ))]))
+            }
+            "remove" => {
+                // 削除前に階層番号を取得
+                let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+                let hier =
+                    find_hierarchical_id(&book, id).unwrap_or_else(|| id.short().to_string());
+                let title = book
+                    .get_node(id)
+                    .map(|n| n.title().to_string())
+                    .unwrap_or_default();
+
+                svc.remove_node(id).map_err(Self::to_mcp_error)?;
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Removed: {}. {} (and descendants)",
+                    hier, title
+                ))]))
+            }
+            other => Err(McpError::invalid_params(
+                format!("Unknown action: '{other}'. Use: move, remove"),
+                None,
+            )),
+        }
+    }
+
+    #[tool(
+        name = "toc",
+        description = "Show table of contents with numbered IDs (e.g. 1, 1-1, 2-3). Run this first — use the returned IDs to specify nodes in `checklist`, `node_create`, and other tools.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn toc(
+        &self,
+        Parameters(req): Parameters<McpTocRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service();
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+
+        let subtree_id = req
+            .subtree_root
+            .as_deref()
+            .map(|s| self.resolve_id(s))
+            .transpose()?;
+
+        let nodes = match subtree_id {
+            Some(root_id) => book.subtree_nodes(root_id),
+            None => book.all_nodes_dfs(),
+        };
+
+        if nodes.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Book is empty. Use `node_create` to add nodes.",
+            )]));
+        }
+
+        let id_map = build_hierarchical_ids(&book);
+
+        let mut output = format!("# {} ({} nodes)\n\n", book.title(), book.node_count());
+        for node in &nodes {
+            let depth = book.depth_of(node.id());
+            let indent = "  ".repeat(depth.saturating_sub(1) as usize);
+            let hier_id = id_map
+                .iter()
+                .find(|(_, id)| *id == node.id())
+                .map(|(num, _)| num.as_str())
+                .unwrap_or("?");
+            output.push_str(&format!("{}{}. {}\n", indent, hier_id, node.title()));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    #[tool(
+        name = "checklist",
+        description = "Export a section as a Markdown checklist with checkboxes. First run `toc` to find the section ID, then pass it as subtree_root (e.g. '2'). Omit subtree_root for full book export. Book is NOT modified.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn checklist(
+        &self,
+        Parameters(req): Parameters<McpEjectRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service();
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+
+        let include_placeholders = req.include_placeholders.unwrap_or(true);
+        let format = match req.format.as_deref() {
+            Some("json") => EjectFormat::Json,
+            Some("markdown") | None => EjectFormat::Markdown,
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!("Unknown format: '{other}'. Use: markdown, json"),
+                    None,
+                ))
+            }
+        };
+        let subtree_root = req
+            .subtree_root
+            .as_deref()
+            .map(|s| self.resolve_id(s))
+            .transpose()?;
+
+        let output_dir = req
+            .output_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let default_ext = match format {
+            EjectFormat::Markdown => "md",
+            EjectFormat::Json => "json",
+        };
+        let filename = req.filename.unwrap_or_else(|| {
+            match subtree_root {
+                Some(root_id) => {
+                    // subtree指定時: "2_Testing.md", "6-3_DSL_Architecture.md"
+                    let hier =
+                        find_hierarchical_id(&book, root_id).unwrap_or_else(|| "0".to_string());
+                    let title = book
+                        .get_node(root_id)
+                        .map(|n| n.title().replace(' ', "_"))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    format!("{}_{}.{}", hier, title, default_ext)
+                }
+                None => {
+                    // 全体: "Rust_Development_Runbook.md"
+                    format!("{}.{}", book.title().replace(' ', "_"), default_ext)
+                }
+            }
+        });
+        validate_filename(&filename)?;
+
+        let config = EjectConfig {
+            output_dir,
+            filename,
+            include_placeholders,
+            format,
+            subtree_root,
+        };
+
+        let path = EjectService::eject(&book, &config).map_err(Self::to_mcp_error)?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Checklist exported to: {}",
+            path.display()
+        ))]))
+    }
+
+    #[tool(
+        name = "import",
+        description = "Import a book from a JSON file (previously exported with `checklist` format: json). Replaces the current book entirely.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn import(
+        &self,
+        Parameters(req): Parameters<McpImportRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service();
+        let import_path = validate_import_path(&req.file_path)?;
+        let content = std::fs::read_to_string(&import_path)
+            .map_err(|e| McpError::internal_error(format!("Failed to read file: {e}"), None))?;
+        let tree: EjectTree = serde_json::from_str(&content)
+            .map_err(|e| McpError::invalid_params(format!("Invalid JSON: {e}"), None))?;
+
+        let book = EjectService::import_tree(&tree).map_err(Self::to_mcp_error)?;
+        let node_count = book.node_count();
+        svc.save_book(&book).map_err(Self::to_mcp_error)?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Imported '{}': {} nodes",
+            tree.title, node_count
+        ))]))
+    }
+
+    #[tool(
+        name = "init",
+        description = "Create a new empty book. Required once before adding any nodes.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn init(
+        &self,
+        Parameters(req): Parameters<McpInitRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service();
+        let max_depth = req.max_depth.unwrap_or(4);
+        let book = svc
+            .create_book(&req.title, max_depth)
+            .map_err(Self::to_mcp_error)?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Created book: '{}' (id: {}, max_depth: {})",
+            book.title(),
+            book.id(),
+            book.max_depth()
+        ))]))
+    }
+}
+
+// =============================================================================
+// Helpers — Hierarchical ID (e.g. "1", "2-3", "1-2-1")
+// =============================================================================
+
+use crate::domain::model::book::TemplateBook;
+
+/// 階層番号かどうか判定（`1`, `2-3`, `1-2-1` 等）
+fn is_hierarchical_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('-')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Book全体の (階層番号, NodeId) マッピングをDFS順で構築する。
+fn build_hierarchical_ids(book: &TemplateBook) -> Vec<(String, NodeId)> {
+    let mut result = Vec::new();
+    for (i, &root_id) in book.root_nodes().iter().enumerate() {
+        let num = format!("{}", i + 1);
+        result.push((num.clone(), root_id));
+        collect_children_ids(book, root_id, &num, &mut result);
+    }
+    result
+}
+
+fn collect_children_ids(
+    book: &TemplateBook,
+    parent_id: NodeId,
+    parent_num: &str,
+    result: &mut Vec<(String, NodeId)>,
+) {
+    if let Some(node) = book.get_node(parent_id) {
+        for (j, &child_id) in node.children().iter().enumerate() {
+            let num = format!("{}-{}", parent_num, j + 1);
+            result.push((num.clone(), child_id));
+            collect_children_ids(book, child_id, &num, result);
+        }
+    }
+}
+
+/// 指定NodeIdの階層番号を逆引きする。
+fn find_hierarchical_id(book: &TemplateBook, target: NodeId) -> Option<String> {
+    build_hierarchical_ids(book)
+        .into_iter()
+        .find(|(_, id)| *id == target)
+        .map(|(num, _)| num)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_node_type_valid() {
+        assert_eq!(parse_node_type("section").unwrap(), NodeType::Section);
+        assert_eq!(parse_node_type("content").unwrap(), NodeType::Content);
+    }
+
+    #[test]
+    fn parse_node_type_invalid() {
+        assert!(parse_node_type("unknown").is_err());
+    }
+
+    #[test]
+    fn server_info() {
+        let server = OutlineMcpServer::new(PathBuf::from("test.json"));
+        let info = server.get_info();
+        assert_eq!(info.server_info.name, "outline-mcp");
+        assert!(!info.server_info.version.is_empty());
+    }
+
+    #[test]
+    fn init_request_defaults() {
+        let req: McpInitRequest = serde_json::from_str(r#"{"title": "Test"}"#).unwrap();
+        assert_eq!(req.title, "Test");
+        assert!(req.max_depth.is_none());
+    }
+
+    #[test]
+    fn node_create_request_minimal() {
+        let req: McpNodeCreateRequest =
+            serde_json::from_str(r#"{"title": "Step 1", "node_type": "content"}"#).unwrap();
+        assert_eq!(req.title, "Step 1");
+        assert!(req.parent.is_none());
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn node_move_request_remove() {
+        let req: McpNodeMoveRequest = serde_json::from_str(
+            r#"{"node_id": "00000000-0000-0000-0000-000000000001", "action": "remove"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.action, "remove");
+        assert!(req.new_parent.is_none());
+    }
+
+    #[test]
+    fn eject_request_defaults() {
+        let req: McpEjectRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.output_dir.is_none());
+        assert!(req.filename.is_none());
+        assert!(req.include_placeholders.is_none());
+        assert!(req.format.is_none());
+        assert!(req.subtree_root.is_none());
+    }
+
+    #[test]
+    fn import_request_parse() {
+        let req: McpImportRequest =
+            serde_json::from_str(r#"{"file_path": "/tmp/book.json"}"#).unwrap();
+        assert_eq!(req.file_path, "/tmp/book.json");
+    }
+
+    // ---- Hierarchical ID tests ----
+
+    #[test]
+    fn is_hierarchical_id_valid() {
+        assert!(is_hierarchical_id("1"));
+        assert!(is_hierarchical_id("2-3"));
+        assert!(is_hierarchical_id("1-2-1"));
+        assert!(is_hierarchical_id("10-20-30"));
+    }
+
+    #[test]
+    fn is_hierarchical_id_invalid() {
+        assert!(!is_hierarchical_id(""));
+        assert!(!is_hierarchical_id("abc"));
+        assert!(!is_hierarchical_id("1-"));
+        assert!(!is_hierarchical_id("-1"));
+        assert!(!is_hierarchical_id("1--2"));
+        assert!(!is_hierarchical_id("a1b2c3d4")); // UUID short prefix
+    }
+
+    #[test]
+    fn build_hierarchical_ids_flat() {
+        use crate::domain::model::book::AddNodeRequest;
+
+        let mut book = TemplateBook::new("Test", 4);
+        let a = book
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "A".into(),
+                node_type: NodeType::Section,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+            })
+            .unwrap();
+        let b = book
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "B".into(),
+                node_type: NodeType::Section,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+            })
+            .unwrap();
+
+        let ids = build_hierarchical_ids(&book);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ("1".to_string(), a));
+        assert_eq!(ids[1], ("2".to_string(), b));
+    }
+
+    #[test]
+    fn build_hierarchical_ids_nested() {
+        use crate::domain::model::book::AddNodeRequest;
+
+        let mut book = TemplateBook::new("Test", 4);
+        let sec = book
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "Section".into(),
+                node_type: NodeType::Section,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+            })
+            .unwrap();
+        let c1 = book
+            .add_node(AddNodeRequest {
+                parent: Some(sec),
+                title: "Child 1".into(),
+                node_type: NodeType::Content,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+            })
+            .unwrap();
+        let c2 = book
+            .add_node(AddNodeRequest {
+                parent: Some(sec),
+                title: "Child 2".into(),
+                node_type: NodeType::Content,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+            })
+            .unwrap();
+
+        let ids = build_hierarchical_ids(&book);
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], ("1".to_string(), sec));
+        assert_eq!(ids[1], ("1-1".to_string(), c1));
+        assert_eq!(ids[2], ("1-2".to_string(), c2));
+    }
+
+    #[test]
+    fn find_hierarchical_id_lookup() {
+        use crate::domain::model::book::AddNodeRequest;
+
+        let mut book = TemplateBook::new("Test", 4);
+        let _a = book
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "A".into(),
+                node_type: NodeType::Section,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+            })
+            .unwrap();
+        let b = book
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "B".into(),
+                node_type: NodeType::Section,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+            })
+            .unwrap();
+
+        assert_eq!(find_hierarchical_id(&book, b), Some("2".to_string()));
+    }
+}

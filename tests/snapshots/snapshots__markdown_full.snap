@@ -1,0 +1,20 @@
+---
+source: tests/snapshots.rs
+expression: md
+---
+# Test Runbook
+
+## Design
+
+
+  - [ ] Define requirements
+    > requirements list: ___
+  - [ ] API design
+    REST endpoints
+## Implementation
+
+
+  - [ ] Write code
+  - [ ] Write tests
+    - [ ] unit
+    - [ ] integration

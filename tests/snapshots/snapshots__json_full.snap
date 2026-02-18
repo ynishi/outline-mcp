@@ -1,0 +1,47 @@
+---
+source: tests/snapshots.rs
+expression: stable
+---
+{
+  "title": "Test Runbook",
+  "max_depth": 4,
+  "nodes": [
+    {
+      "id": "stable-id-1",
+      "title": "Design",
+      "node_type": "section",
+      "children": [
+        {
+          "id": "stable-id-2",
+          "title": "Define requirements",
+          "node_type": "content",
+          "placeholder": "requirements list"
+        },
+        {
+          "id": "stable-id-3",
+          "title": "API design",
+          "node_type": "content",
+          "body": "REST endpoints"
+        }
+      ]
+    },
+    {
+      "id": "stable-id-4",
+      "title": "Implementation",
+      "node_type": "section",
+      "children": [
+        {
+          "id": "stable-id-5",
+          "title": "Write code",
+          "node_type": "content"
+        },
+        {
+          "id": "stable-id-6",
+          "title": "Write tests",
+          "node_type": "content",
+          "body": "- unit\n- integration"
+        }
+      ]
+    }
+  ]
+}

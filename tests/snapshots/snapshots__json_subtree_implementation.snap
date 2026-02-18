@@ -1,0 +1,21 @@
+---
+source: tests/snapshots.rs
+expression: stable
+---
+{
+  "title": "Implementation",
+  "max_depth": 4,
+  "nodes": [
+    {
+      "id": "stable-id-1",
+      "title": "Write code",
+      "node_type": "content"
+    },
+    {
+      "id": "stable-id-2",
+      "title": "Write tests",
+      "node_type": "content",
+      "body": "- unit\n- integration"
+    }
+  ]
+}

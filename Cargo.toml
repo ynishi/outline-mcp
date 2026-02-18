@@ -1,0 +1,25 @@
+[package]
+name = "outline-mcp"
+version = "0.1.0"
+edition = "2021"
+authors = ["Yutaka Nishimura"]
+description = "Tree-structured session guide & checklist as an MCP server"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ynishi/outline-mcp"
+keywords = ["mcp", "outline", "checklist", "tree"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }
+schemars = "1.2"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
+proptest = "1"
+tempfile = "3"
