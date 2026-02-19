@@ -290,6 +290,52 @@ fn validate_slug(slug: &str) -> Result<(), McpError> {
     Ok(())
 }
 
+/// タイトルをファイル名に安全な文字列に変換する。
+/// 英数字・`-_.()`以外を`_`に置換し、連続`_`を圧縮、先頭末尾の`_`を除去する。
+fn sanitize_for_filename(title: &str) -> String {
+    let sanitized: String = title
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '(' | ')') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    // 連続`_`を1つに圧縮
+    let mut result = String::with_capacity(sanitized.len());
+    let mut prev_underscore = true; // true開始で先頭`_`を除去
+    for c in sanitized.chars() {
+        if c == '_' {
+            if !prev_underscore {
+                result.push('_');
+            }
+            prev_underscore = true;
+        } else {
+            result.push(c);
+            prev_underscore = false;
+        }
+    }
+
+    // 末尾`_`を除去
+    while result.ends_with('_') {
+        result.pop();
+    }
+
+    // `..`をpath traversal防止のため`_`に置換
+    while result.contains("..") {
+        result = result.replace("..", "_");
+    }
+
+    if result.is_empty() {
+        "untitled".to_string()
+    } else {
+        result
+    }
+}
+
 /// filenameにパス区切り文字や".."が含まれていないことを検証する。
 fn validate_filename(filename: &str) -> Result<(), McpError> {
     if filename.contains('/')
@@ -690,13 +736,12 @@ impl OutlineMcpServer {
                         find_hierarchical_id(&book, root_id).unwrap_or_else(|| "0".to_string());
                     let title = book
                         .get_node(root_id)
-                        .map(|n| n.title().replace(' ', "_"))
+                        .map(|n| sanitize_for_filename(n.title()))
                         .unwrap_or_else(|| "unknown".to_string());
                     format!("{}_{}.{}", hier, title, default_ext)
                 }
                 None => {
-                    // 全体: "Rust_Development_Runbook.md"
-                    format!("{}.{}", book.title().replace(' ', "_"), default_ext)
+                    format!("{}.{}", sanitize_for_filename(book.title()), default_ext)
                 }
             }
         });
@@ -1174,5 +1219,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(find_hierarchical_id(&book, b), Some("2".to_string()));
+    }
+
+    // ---- sanitize_for_filename tests ----
+
+    #[test]
+    fn sanitize_basic_title() {
+        assert_eq!(sanitize_for_filename("Hello World"), "Hello_World");
+    }
+
+    #[test]
+    fn sanitize_slash_in_title() {
+        assert_eq!(sanitize_for_filename("TCP/IP Basics"), "TCP_IP_Basics");
+        assert_eq!(sanitize_for_filename("I/O Operations"), "I_O_Operations");
+    }
+
+    #[test]
+    fn sanitize_backslash() {
+        assert_eq!(sanitize_for_filename("Windows\\Linux"), "Windows_Linux");
+    }
+
+    #[test]
+    fn sanitize_preserves_allowed_chars() {
+        assert_eq!(
+            sanitize_for_filename("Review (Google EP)"),
+            "Review_(Google_EP)"
+        );
+        assert_eq!(sanitize_for_filename("v2.0-beta_1"), "v2.0-beta_1");
+    }
+
+    #[test]
+    fn sanitize_collapses_consecutive_underscores() {
+        assert_eq!(sanitize_for_filename("a / b / c"), "a_b_c");
+        assert_eq!(sanitize_for_filename("foo   bar"), "foo_bar");
+    }
+
+    #[test]
+    fn sanitize_strips_leading_trailing_underscores() {
+        assert_eq!(sanitize_for_filename(" leading"), "leading");
+        assert_eq!(sanitize_for_filename("trailing "), "trailing");
+        assert_eq!(sanitize_for_filename(" both "), "both");
+    }
+
+    #[test]
+    fn sanitize_double_dot_prevention() {
+        assert_eq!(sanitize_for_filename("Config..Settings"), "Config_Settings");
+        assert_eq!(sanitize_for_filename("a...b"), "a_.b");
+    }
+
+    #[test]
+    fn sanitize_special_characters() {
+        assert_eq!(sanitize_for_filename("file: name?"), "file_name");
+        assert_eq!(sanitize_for_filename("a<b>c|d\"e"), "a_b_c_d_e");
+    }
+
+    #[test]
+    fn sanitize_unicode() {
+        assert_eq!(sanitize_for_filename("日本語タイトル"), "untitled");
+        assert_eq!(sanitize_for_filename("混合 Mixed テスト"), "Mixed");
+    }
+
+    #[test]
+    fn sanitize_empty_and_whitespace() {
+        assert_eq!(sanitize_for_filename(""), "untitled");
+        assert_eq!(sanitize_for_filename("   "), "untitled");
+        assert_eq!(sanitize_for_filename("///"), "untitled");
     }
 }
