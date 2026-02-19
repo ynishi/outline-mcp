@@ -235,12 +235,13 @@ impl ServerHandler for OutlineMcpServer {
                 website_url: None,
             },
             instructions: Some(
-                "Multi-book shelf workflow: \
-                 (1) `shelf` — list all books. \
-                 (2) `select_book('1')` — select a book by number or slug. \
-                 (3) `toc` — shows numbered table of contents. \
-                 (4) Use the ID with `checklist`, `node_create`, `node_update`, `node_move`. \
-                 First-time: `init` to create a new book in the shelf."
+                "Create and manage action-ready checklists.\n\
+                 \n\
+                 Intended flow: capture knowledge as content nodes (one verifiable action each), \
+                 organize under section nodes, export via `checklist` when executing tasks.\n\
+                 \n\
+                 Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`, `checklist`. \
+                 `init` for new book."
                     .to_string(),
             ),
         }
