@@ -485,6 +485,10 @@ struct McpSelectBookRequest {
         description = "Book to select: number from `shelf` output (e.g. '1') or book slug (e.g. 'rust')"
     )]
     pub book: String,
+
+    #[schemars(description = "Suppress TOC output (default: false)")]
+    #[serde(default)]
+    pub quiet: bool,
 }
 
 // =============================================================================
@@ -894,7 +898,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "select_book",
-        description = "Select a book to work with. Use a number from `shelf` output or a book slug. All subsequent operations (toc, node_create, etc.) will target the selected book.",
+        description = "Select a book to work with. Use a number from `shelf` output or a book slug. All subsequent operations (toc, node_create, etc.) will target the selected book. Automatically shows TOC unless quiet=true.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -928,11 +932,15 @@ impl OutlineMcpServer {
             .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
         *guard = Some(slug.clone());
 
-        let nodes = book.all_nodes_dfs();
-        let toc_section = if nodes.is_empty() {
-            String::from("\n(empty)")
+        let toc_section = if req.quiet {
+            String::new()
         } else {
-            format!("\n\n{}", format_toc(&book, &nodes))
+            let nodes = book.all_nodes_dfs();
+            if nodes.is_empty() {
+                String::from("\n(empty)")
+            } else {
+                format!("\n\n{}", format_toc(&book, &nodes))
+            }
         };
 
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -1072,6 +1080,15 @@ mod tests {
     fn select_book_request() {
         let req: McpSelectBookRequest = serde_json::from_str(r#"{"book": "rust"}"#).unwrap();
         assert_eq!(req.book, "rust");
+        assert!(!req.quiet);
+    }
+
+    #[test]
+    fn select_book_request_quiet() {
+        let req: McpSelectBookRequest =
+            serde_json::from_str(r#"{"book": "rust", "quiet": true}"#).unwrap();
+        assert_eq!(req.book, "rust");
+        assert!(req.quiet);
     }
 
     #[test]
