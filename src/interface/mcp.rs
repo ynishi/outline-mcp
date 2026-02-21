@@ -668,20 +668,7 @@ impl OutlineMcpServer {
             )]));
         }
 
-        let id_map = build_hierarchical_ids(&book);
-
-        let mut output = format!("# {} ({} nodes)\n\n", book.title(), book.node_count());
-        for node in &nodes {
-            let depth = book.depth_of(node.id());
-            let indent = "  ".repeat(depth.saturating_sub(1) as usize);
-            let hier_id = id_map
-                .iter()
-                .find(|(_, id)| *id == node.id())
-                .map(|(num, _)| num.as_str())
-                .unwrap_or("?");
-            output.push_str(&format!("{}{}. {}\n", indent, hier_id, node.title()));
-        }
-
+        let output = format_toc(&book, &nodes);
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -941,11 +928,19 @@ impl OutlineMcpServer {
             .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
         *guard = Some(slug.clone());
 
+        let nodes = book.all_nodes_dfs();
+        let toc_section = if nodes.is_empty() {
+            String::from("\n(empty)")
+        } else {
+            format!("\n\n{}", format_toc(&book, &nodes))
+        };
+
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Selected: {} — \"{}\" ({} nodes)",
+            "Selected: {} — \"{}\" ({} nodes){}",
             slug,
             book.title(),
-            book.node_count()
+            book.node_count(),
+            toc_section
         ))]))
     }
 }
@@ -955,6 +950,24 @@ impl OutlineMcpServer {
 // =============================================================================
 
 use crate::domain::model::book::TemplateBook;
+use crate::domain::model::node::TemplateNode;
+
+/// Book の全ノードを TOC 形式にフォーマットする。
+fn format_toc(book: &TemplateBook, nodes: &[&TemplateNode]) -> String {
+    let id_map = build_hierarchical_ids(book);
+    let mut output = format!("# {} ({} nodes)\n\n", book.title(), book.node_count());
+    for node in nodes {
+        let depth = book.depth_of(node.id());
+        let indent = "  ".repeat(depth.saturating_sub(1) as usize);
+        let hier_id = id_map
+            .iter()
+            .find(|(_, id)| *id == node.id())
+            .map(|(num, _)| num.as_str())
+            .unwrap_or("?");
+        output.push_str(&format!("{}{}. {}\n", indent, hier_id, node.title()));
+    }
+    output
+}
 
 /// 階層番号かどうか判定（`1`, `2-3`, `1-2-1` 等）
 fn is_hierarchical_id(s: &str) -> bool {
