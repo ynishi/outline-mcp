@@ -485,6 +485,10 @@ struct McpSelectBookRequest {
         description = "Book to select: number from `shelf` output (e.g. '1') or book slug (e.g. 'rust')"
     )]
     pub book: String,
+
+    #[schemars(description = "Suppress TOC output (default: false)")]
+    #[serde(default)]
+    pub quiet: bool,
 }
 
 // =============================================================================
@@ -668,20 +672,7 @@ impl OutlineMcpServer {
             )]));
         }
 
-        let id_map = build_hierarchical_ids(&book);
-
-        let mut output = format!("# {} ({} nodes)\n\n", book.title(), book.node_count());
-        for node in &nodes {
-            let depth = book.depth_of(node.id());
-            let indent = "  ".repeat(depth.saturating_sub(1) as usize);
-            let hier_id = id_map
-                .iter()
-                .find(|(_, id)| *id == node.id())
-                .map(|(num, _)| num.as_str())
-                .unwrap_or("?");
-            output.push_str(&format!("{}{}. {}\n", indent, hier_id, node.title()));
-        }
-
+        let output = format_toc(&book, &nodes);
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -907,7 +898,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "select_book",
-        description = "Select a book to work with. Use a number from `shelf` output or a book slug. All subsequent operations (toc, node_create, etc.) will target the selected book.",
+        description = "Select a book to work with. Use a number from `shelf` output or a book slug. All subsequent operations (toc, node_create, etc.) will target the selected book. Automatically shows TOC unless quiet=true.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -941,11 +932,23 @@ impl OutlineMcpServer {
             .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
         *guard = Some(slug.clone());
 
+        let toc_section = if req.quiet {
+            String::new()
+        } else {
+            let nodes = book.all_nodes_dfs();
+            if nodes.is_empty() {
+                String::from("\n(empty)")
+            } else {
+                format!("\n\n{}", format_toc(&book, &nodes))
+            }
+        };
+
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Selected: {} — \"{}\" ({} nodes)",
+            "Selected: {} — \"{}\" ({} nodes){}",
             slug,
             book.title(),
-            book.node_count()
+            book.node_count(),
+            toc_section
         ))]))
     }
 }
@@ -955,6 +958,24 @@ impl OutlineMcpServer {
 // =============================================================================
 
 use crate::domain::model::book::TemplateBook;
+use crate::domain::model::node::TemplateNode;
+
+/// Book の全ノードを TOC 形式にフォーマットする。
+fn format_toc(book: &TemplateBook, nodes: &[&TemplateNode]) -> String {
+    let id_map = build_hierarchical_ids(book);
+    let mut output = format!("# {} ({} nodes)\n\n", book.title(), book.node_count());
+    for node in nodes {
+        let depth = book.depth_of(node.id());
+        let indent = "  ".repeat(depth.saturating_sub(1) as usize);
+        let hier_id = id_map
+            .iter()
+            .find(|(_, id)| *id == node.id())
+            .map(|(num, _)| num.as_str())
+            .unwrap_or("?");
+        output.push_str(&format!("{}{}. {}\n", indent, hier_id, node.title()));
+    }
+    output
+}
 
 /// 階層番号かどうか判定（`1`, `2-3`, `1-2-1` 等）
 fn is_hierarchical_id(s: &str) -> bool {
@@ -1059,6 +1080,15 @@ mod tests {
     fn select_book_request() {
         let req: McpSelectBookRequest = serde_json::from_str(r#"{"book": "rust"}"#).unwrap();
         assert_eq!(req.book, "rust");
+        assert!(!req.quiet);
+    }
+
+    #[test]
+    fn select_book_request_quiet() {
+        let req: McpSelectBookRequest =
+            serde_json::from_str(r#"{"book": "rust", "quiet": true}"#).unwrap();
+        assert_eq!(req.book, "rust");
+        assert!(req.quiet);
     }
 
     #[test]
