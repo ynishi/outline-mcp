@@ -1,6 +1,6 @@
 [package]
 name = "outline-mcp"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 authors = ["Yutaka Nishimura"]
 description = "Tree-structured session guide & checklist as an MCP server"
