@@ -1,8 +1,8 @@
 # outline-mcp
 
-Tree-structured session guide & checklist as an [MCP](https://modelcontextprotocol.io/) server.
+Tree-structured knowledge base as an [MCP](https://modelcontextprotocol.io/) server.
 
-LLM sessions are ephemeral. **outline-mcp** gives them a persistent, editable runbook — a tree of sections and content nodes that can be browsed (`toc`), exported as checklists (`checklist`), and evolved across sessions.
+LLM sessions are ephemeral. **outline-mcp** gives them a persistent, editable knowledge tree — sections and content nodes that can be browsed (`toc`), annotated with properties, and evolved across sessions. Nodes with `inject=true` are automatically included in session context.
 
 ## Quick Start
 
@@ -28,19 +28,18 @@ If the path argument is omitted, defaults to `outline-book.json` in the current 
 ## Workflow
 
 ```
-init  →  node_create  →  toc  →  checklist
-         node_update
-         node_move
-         import
+shelf  →  select_book  →  toc  →  node_create / node_update / node_move
+                                   checklist / import / init
 ```
 
 1. **`init`** — Create a new empty book
-2. **`node_create`** — Add sections and content nodes
-3. **`toc`** — View the table of contents with numbered IDs (e.g. `1`, `2-3`)
-4. **`checklist`** — Export a section (or the whole book) as a Markdown checklist with checkboxes
-5. **`node_update`** — Edit title, body, type, or placeholder of a node
-6. **`node_move`** — Relocate or delete nodes (with descendants)
-7. **`import`** — Import a book from a previously exported JSON file
+2. **`node_create`** — Add sections and content nodes (with optional `properties`)
+3. **`toc`** — View the table of contents with numbered IDs (e.g. `1`, `2-3`). Supports `filter` by properties
+4. **`select_book`** — Select a book. Nodes with `inject=true` property have their body auto-appended
+5. **`checklist`** — Export a section (or the whole book) as a Markdown checklist with checkboxes
+6. **`node_update`** — Edit title, body, type, placeholder, or properties of a node
+7. **`node_move`** — Relocate or delete nodes (with descendants)
+8. **`import`** — Import a book from a previously exported JSON file
 
 ### Node IDs
 
@@ -56,6 +55,19 @@ init  →  node_create  →  toc  →  checklist
 ```
 
 These IDs (`1`, `1-2`, `2-1`, etc.) work in all tools. Full UUIDs and title substring matching are also supported as fallbacks.
+
+### Node Properties
+
+Nodes can have key-value properties for metadata:
+
+```
+node_create  title="My Rule"  properties={"inject": "true", "scope": "rust"}
+```
+
+- **`inject=true`** — Node body is automatically included in `select_book` output (context injection)
+- Properties with value `"true"` appear as tags in `toc`: `1. My Rule [inject]`
+- `toc` supports filtering: `filter={"inject": "true"}` shows only matching nodes
+- Properties are preserved in JSON export/import
 
 ## Architecture
 

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use super::id::NodeId;
@@ -22,6 +24,9 @@ pub struct TemplateNode {
     node_type: NodeType,
     /// Eject時に展開される記入欄のヒントテキスト
     placeholder: Option<String>,
+    /// 任意のkey-valueメタデータ（inject, scope等）
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    properties: HashMap<String, String>,
 }
 
 impl TemplateNode {
@@ -39,6 +44,7 @@ impl TemplateNode {
             body: None,
             node_type,
             placeholder: None,
+            properties: HashMap::new(),
         }
     }
 
@@ -68,6 +74,14 @@ impl TemplateNode {
 
     pub fn placeholder(&self) -> Option<&str> {
         self.placeholder.as_deref()
+    }
+
+    pub fn properties(&self) -> &HashMap<String, String> {
+        &self.properties
+    }
+
+    pub fn get_property(&self, key: &str) -> Option<&str> {
+        self.properties.get(key).map(|s| s.as_str())
     }
 
     pub fn is_leaf(&self) -> bool {
@@ -103,5 +117,9 @@ impl TemplateNode {
 
     pub(crate) fn remove_child(&mut self, child_id: NodeId) {
         self.children.retain(|id| *id != child_id);
+    }
+
+    pub(crate) fn set_properties(&mut self, properties: HashMap<String, String>) {
+        self.properties = properties;
     }
 }

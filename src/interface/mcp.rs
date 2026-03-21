@@ -1,9 +1,11 @@
+// SMARTLINT: Status::InReview (1774100840)
 //! MCP Server for outline-mcp
 //!
 //! MCP Protocol (stdio) <-> application::BookService / EjectService
 //!
 //! 7 tools: init, node_create, node_update, node_move, toc, checklist, import
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -224,10 +226,10 @@ impl ServerHandler for OutlineMcpServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation {
                 name: "outline-mcp".to_string(),
-                title: Some("Outline MCP — Session Guide & Checklist".to_string()),
+                title: Some("Outline MCP — Tree-Structured Knowledge Base".to_string()),
                 description: Some(
-                    "Tree-structured runbook with numbered IDs. \
-                     2-step workflow: `toc` → pick ID → `checklist`."
+                    "Persistent tree-structured notes with numbered IDs and property-based context injection. \
+                     Workflow: `shelf` → `select_book` → `toc` → create/update nodes."
                         .to_string(),
                 ),
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -235,13 +237,17 @@ impl ServerHandler for OutlineMcpServer {
                 website_url: None,
             },
             instructions: Some(
-                "Create and manage action-ready checklists.\n\
+                "Create and manage tree-structured knowledge notes.\n\
                  \n\
-                 Intended flow: capture knowledge as content nodes (one verifiable action each), \
-                 organize under section nodes, export via `checklist` when executing tasks.\n\
+                 Intended flow: organize knowledge as tree nodes (sections and content), \
+                 browse with `toc`, and use node properties for metadata.\n\
                  \n\
-                 Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`, `checklist`. \
-                 `init` for new book."
+                 Context Injection: nodes with property `inject=true` have their body \
+                 automatically included in `select_book` output — use this to inject \
+                 persistent rules/context into every session.\n\
+                 \n\
+                 Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`. \
+                 `checklist` for task export. `init` for new book."
                     .to_string(),
             ),
         }
@@ -406,6 +412,10 @@ struct McpNodeCreateRequest {
     pub placeholder: Option<String>,
     #[schemars(description = "Position among siblings (0-based). Omit to append at end.")]
     pub position: Option<usize>,
+    #[schemars(
+        description = "Optional key-value properties (e.g. {\"inject\": \"true\", \"scope\": \"rust\"})"
+    )]
+    pub properties: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -420,6 +430,8 @@ struct McpNodeUpdateRequest {
     pub node_type: Option<String>,
     #[schemars(description = "New placeholder hint (null to clear)")]
     pub placeholder: Option<Option<String>>,
+    #[schemars(description = "Replace all properties (omit to keep current). Pass {} to clear.")]
+    pub properties: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -440,6 +452,10 @@ struct McpNodeMoveRequest {
 struct McpTocRequest {
     #[schemars(description = "Section ID from `toc` output (e.g. '2'). Omit to show entire book.")]
     pub subtree_root: Option<String>,
+    #[schemars(
+        description = "Filter by properties (e.g. {\"inject\": \"true\"}). Only matching nodes shown."
+    )]
+    pub filter: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -526,6 +542,7 @@ impl OutlineMcpServer {
             body: normalize_text(req.body),
             placeholder: normalize_text(req.placeholder),
             position: req.position.unwrap_or(usize::MAX),
+            properties: req.properties.unwrap_or_default(),
         };
 
         let id = svc.add_node(add_req).map_err(Self::to_mcp_error)?;
@@ -564,6 +581,7 @@ impl OutlineMcpServer {
             body: req.body.map(normalize_text),
             node_type,
             placeholder: req.placeholder.map(normalize_text),
+            properties: req.properties,
         };
 
         svc.update_node(id, update_req)
@@ -661,14 +679,25 @@ impl OutlineMcpServer {
             .map(|s| self.resolve_id(s))
             .transpose()?;
 
-        let nodes = match subtree_id {
+        let mut nodes = match subtree_id {
             Some(root_id) => book.subtree_nodes(root_id),
             None => book.all_nodes_dfs(),
         };
 
+        // プロパティフィルタ
+        if let Some(ref filter) = req.filter {
+            if !filter.is_empty() {
+                nodes.retain(|node| {
+                    filter
+                        .iter()
+                        .all(|(k, v)| node.get_property(k).map(|pv| pv == v).unwrap_or(false))
+                });
+            }
+        }
+
         if nodes.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
-                "Book is empty. Use `node_create` to add nodes.",
+                "No matching nodes. Use `node_create` to add nodes.",
             )]));
         }
 
@@ -943,12 +972,37 @@ impl OutlineMcpServer {
             }
         };
 
+        // Context Injection: inject=true ノードの body を自動出力
+        let inject_filter = {
+            let mut m = HashMap::new();
+            m.insert("inject".to_string(), "true".to_string());
+            m
+        };
+        let injected_nodes = book.nodes_matching(&inject_filter);
+        let inject_section = if injected_nodes.is_empty() {
+            String::new()
+        } else {
+            let mut buf = format!(
+                "\n\n---\n# Injected Context ({} rules)\n",
+                injected_nodes.len()
+            );
+            for node in &injected_nodes {
+                buf.push_str(&format!("\n## {}\n", node.title()));
+                if let Some(body) = node.body() {
+                    buf.push_str(body);
+                    buf.push('\n');
+                }
+            }
+            buf
+        };
+
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Selected: {} — \"{}\" ({} nodes){}",
+            "Selected: {} — \"{}\" ({} nodes){}{}",
             slug,
             book.title(),
             book.node_count(),
-            toc_section
+            toc_section,
+            inject_section
         ))]))
     }
 }
@@ -959,6 +1013,24 @@ impl OutlineMcpServer {
 
 use crate::domain::model::book::TemplateBook;
 use crate::domain::model::node::TemplateNode;
+
+/// Boolean property をタグ表示用に整形する。
+fn format_property_tags(node: &TemplateNode) -> String {
+    let props = node.properties();
+    if props.is_empty() {
+        return String::new();
+    }
+    let mut tags: Vec<&str> = props
+        .iter()
+        .filter(|(_, v)| *v == "true")
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if tags.is_empty() {
+        return String::new();
+    }
+    tags.sort_unstable();
+    format!(" [{}]", tags.join(", "))
+}
 
 /// Book の全ノードを TOC 形式にフォーマットする。
 fn format_toc(book: &TemplateBook, nodes: &[&TemplateNode]) -> String {
@@ -972,7 +1044,14 @@ fn format_toc(book: &TemplateBook, nodes: &[&TemplateNode]) -> String {
             .find(|(_, id)| *id == node.id())
             .map(|(num, _)| num.as_str())
             .unwrap_or("?");
-        output.push_str(&format!("{}{}. {}\n", indent, hier_id, node.title()));
+        let tags = format_property_tags(node);
+        output.push_str(&format!(
+            "{}{}. {}{}\n",
+            indent,
+            hier_id,
+            node.title(),
+            tags
+        ));
     }
     output
 }
@@ -1160,6 +1239,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
         let b = book
@@ -1170,6 +1250,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -1192,6 +1273,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
         let c1 = book
@@ -1202,6 +1284,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
         let c2 = book
@@ -1212,6 +1295,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -1235,6 +1319,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
         let b = book
@@ -1245,6 +1330,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 

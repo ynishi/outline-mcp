@@ -73,6 +73,7 @@ mod tests {
             body: Some("description".into()),
             placeholder: Some("notes".into()),
             position: usize::MAX,
+            properties: std::collections::HashMap::new(),
         })
         .unwrap();
 

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::domain::model::book::{AddNodeRequest, TemplateBook};
@@ -35,6 +37,8 @@ pub struct EjectTreeNode {
     pub placeholder: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<EjectTreeNode>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub properties: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +143,7 @@ impl EjectService {
             body: node.body().map(|s| s.to_string()),
             placeholder: node.placeholder().map(|s| s.to_string()),
             children,
+            properties: node.properties().clone(),
         })
     }
 
@@ -181,6 +186,7 @@ impl EjectService {
             body: tree_node.body.clone(),
             placeholder: tree_node.placeholder.clone(),
             position: usize::MAX,
+            properties: tree_node.properties.clone(),
         })?;
 
         for child in &tree_node.children {
@@ -288,6 +294,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -299,6 +306,7 @@ mod tests {
                 body: None,
                 placeholder: Some("requirements list".into()),
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -309,6 +317,7 @@ mod tests {
             body: Some("REST endpoints".into()),
             placeholder: None,
             position: usize::MAX,
+            properties: HashMap::new(),
         })
         .unwrap();
 
@@ -420,6 +429,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 children: vec![],
+                properties: HashMap::new(),
             }],
         };
 

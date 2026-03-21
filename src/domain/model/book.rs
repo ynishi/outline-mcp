@@ -15,6 +15,7 @@ pub struct AddNodeRequest {
     pub placeholder: Option<String>,
     /// 兄弟内での挿入位置（末尾ならusize::MAX）
     pub position: usize,
+    pub properties: HashMap<String, String>,
 }
 
 /// ノード更新リクエスト（Noneのフィールドは変更しない）
@@ -23,6 +24,7 @@ pub struct UpdateNodeRequest {
     pub body: Option<Option<String>>,
     pub node_type: Option<NodeType>,
     pub placeholder: Option<Option<String>>,
+    pub properties: Option<HashMap<String, String>>,
 }
 
 /// Template Book — 集約ルート。全ノード操作はここを経由する。
@@ -95,6 +97,9 @@ impl TemplateBook {
         let mut node = TemplateNode::new(node_id, req.parent, req.title, req.node_type);
         node.set_body(req.body);
         node.set_placeholder(req.placeholder);
+        if !req.properties.is_empty() {
+            node.set_properties(req.properties);
+        }
 
         self.nodes.insert(node_id, node);
 
@@ -134,6 +139,9 @@ impl TemplateBook {
         }
         if let Some(placeholder) = req.placeholder {
             node.set_placeholder(placeholder);
+        }
+        if let Some(properties) = req.properties {
+            node.set_properties(properties);
         }
 
         Ok(())
@@ -199,6 +207,18 @@ impl TemplateBook {
     /// 全ノードIDのイテレータ
     pub fn all_node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.nodes.keys().copied()
+    }
+
+    /// 指定プロパティ条件に一致するノードをDFS順で返す
+    pub fn nodes_matching(&self, filter: &HashMap<String, String>) -> Vec<&TemplateNode> {
+        self.all_nodes_dfs()
+            .into_iter()
+            .filter(|node| {
+                filter
+                    .iter()
+                    .all(|(k, v)| node.get_property(k).map(|pv| pv == v).unwrap_or(false))
+            })
+            .collect()
     }
 
     /// 全ノードをDFS順で返す（Eject用）
@@ -365,6 +385,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -383,6 +404,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -394,6 +416,7 @@ mod tests {
                 body: None,
                 placeholder: Some("list test cases here".into()),
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -413,6 +436,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -424,6 +448,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -434,6 +459,7 @@ mod tests {
             body: None,
             placeholder: None,
             position: usize::MAX,
+            properties: HashMap::new(),
         });
 
         assert!(matches!(
@@ -453,6 +479,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -464,6 +491,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -475,6 +503,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -496,6 +525,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -507,6 +537,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -525,6 +556,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -536,6 +568,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -547,6 +580,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -567,6 +601,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -577,6 +612,7 @@ mod tests {
                 body: Some(Some("description".into())),
                 node_type: Some(NodeType::Content),
                 placeholder: None,
+                properties: None,
             },
         )
         .unwrap();
@@ -598,6 +634,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -609,6 +646,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -620,6 +658,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 
@@ -631,6 +670,7 @@ mod tests {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: HashMap::new(),
             })
             .unwrap();
 

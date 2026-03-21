@@ -35,6 +35,7 @@ fn service_add_node() {
             body: None,
             placeholder: None,
             position: usize::MAX,
+            properties: std::collections::HashMap::new(),
         })
         .unwrap();
 
@@ -56,6 +57,7 @@ fn service_update_node() {
             body: Some(Some("Updated body".into())),
             node_type: None,
             placeholder: None,
+            properties: None,
         },
     )
     .unwrap();
@@ -208,6 +210,7 @@ fn import_rejects_deep_nesting() {
         body: None,
         placeholder: None,
         children: vec![],
+        properties: std::collections::HashMap::new(),
     };
     for i in (0..40).rev() {
         node = EjectTreeNode {
@@ -217,6 +220,7 @@ fn import_rejects_deep_nesting() {
             body: None,
             placeholder: None,
             children: vec![node],
+            properties: std::collections::HashMap::new(),
         };
     }
 

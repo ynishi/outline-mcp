@@ -85,6 +85,7 @@ impl TestBook {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: std::collections::HashMap::new(),
             })
             .unwrap();
         ids.insert("design", design);
@@ -97,6 +98,7 @@ impl TestBook {
                 body: None,
                 placeholder: Some("requirements list".into()),
                 position: usize::MAX,
+                properties: std::collections::HashMap::new(),
             })
             .unwrap();
         ids.insert("requirements", req);
@@ -109,6 +111,7 @@ impl TestBook {
                 body: Some("REST endpoints".into()),
                 placeholder: None,
                 position: usize::MAX,
+                properties: std::collections::HashMap::new(),
             })
             .unwrap();
         ids.insert("api", api);
@@ -121,6 +124,7 @@ impl TestBook {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: std::collections::HashMap::new(),
             })
             .unwrap();
         ids.insert("implementation", impl_sec);
@@ -133,6 +137,7 @@ impl TestBook {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: std::collections::HashMap::new(),
             })
             .unwrap();
         ids.insert("code", code);
@@ -145,6 +150,7 @@ impl TestBook {
                 body: Some("- unit\n- integration".into()),
                 placeholder: None,
                 position: usize::MAX,
+                properties: std::collections::HashMap::new(),
             })
             .unwrap();
         ids.insert("tests", tests);

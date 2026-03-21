@@ -80,6 +80,7 @@ proptest! {
             body: None,
             placeholder: None,
             position: usize::MAX,
+            properties: std::collections::HashMap::new(),
         }).unwrap();
 
         prop_assert_eq!(book.node_count(), before + 1);
@@ -99,6 +100,7 @@ proptest! {
             body: None,
             placeholder: None,
             position: usize::MAX,
+            properties: std::collections::HashMap::new(),
         }).unwrap();
 
         prop_assert!(book.depth_of(id) >= 1);
@@ -116,6 +118,7 @@ proptest! {
                 body: None,
                 placeholder: None,
                 position: usize::MAX,
+                properties: std::collections::HashMap::new(),
             }).unwrap();
         }
 
@@ -148,6 +151,7 @@ proptest! {
             body: None,
             placeholder: None,
             position: usize::MAX,
+            properties: std::collections::HashMap::new(),
         }).unwrap();
 
         let md = EjectService::render_markdown(&book, true, None);
