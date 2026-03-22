@@ -3,7 +3,7 @@
 //!
 //! MCP Protocol (stdio) <-> application::BookService / EjectService
 //!
-//! 7 tools: init, node_create, node_update, node_move, toc, checklist, import
+//! 8 tools: init, node_create, node_update, node_move, toc, checklist, import, gen_routing
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -494,6 +494,9 @@ struct McpInitRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct McpShelfRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct McpGenRoutingRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct McpSelectBookRequest {
@@ -1005,6 +1008,86 @@ impl OutlineMcpServer {
             inject_section
         ))]))
     }
+
+    #[tool(
+        name = "gen_routing",
+        description = "Generate a Markdown routing table from nodes with `routing` property across all books. Set `routing` property on nodes to define work scenarios (e.g. routing=\"Git操作\"). Use `|` separator for multiple scenarios. Optional `routing_ref` property overrides the default §ID reference (e.g. routing_ref=\"select_book で全体参照\").",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn gen_routing(
+        &self,
+        #[allow(unused_variables)] Parameters(_req): Parameters<McpGenRoutingRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let slugs = self.list_book_slugs()?;
+
+        // Collect: (scene, book_slug, reference_text)
+        let mut entries: Vec<(String, String, String)> = Vec::new();
+
+        for slug in &slugs {
+            let svc = self.service_for(slug);
+            let book = match svc.read_tree() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            let id_map = build_hierarchical_ids(&book);
+
+            for node in book.all_nodes_dfs() {
+                let routing = match node.get_property("routing") {
+                    Some(v) => v.to_string(),
+                    None => continue,
+                };
+
+                let reference = if let Some(r) = node.get_property("routing_ref") {
+                    r.to_string()
+                } else {
+                    let hier = id_map
+                        .iter()
+                        .find(|(_, id)| *id == node.id())
+                        .map(|(num, _)| num.as_str())
+                        .unwrap_or("?");
+                    format!("§{} {}", hier, node.title())
+                };
+
+                for scene in routing.split('|') {
+                    let scene = scene.trim();
+                    if !scene.is_empty() {
+                        entries.push((scene.to_string(), slug.clone(), reference.clone()));
+                    }
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No nodes with `routing` property found. Add `routing` property to nodes to include them in the routing table.",
+            )]));
+        }
+
+        // Group same (scene, book) → merge references
+        let mut grouped: Vec<(String, String, Vec<String>)> = Vec::new();
+        for (scene, book, reference) in &entries {
+            if let Some(existing) = grouped.iter_mut().find(|(s, b, _)| s == scene && b == book) {
+                existing.2.push(reference.clone());
+            } else {
+                grouped.push((scene.clone(), book.clone(), vec![reference.clone()]));
+            }
+        }
+
+        // Sort by book, then scene
+        grouped.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+
+        let mut output = String::from("| 場面 | Book | ノード |\n|---|---|---|\n");
+        for (scene, book, refs) in &grouped {
+            output.push_str(&format!("| {} | {} | {} |\n", scene, book, refs.join(", ")));
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
 }
 
 // =============================================================================
@@ -1400,5 +1483,10 @@ mod tests {
         assert_eq!(sanitize_for_filename(""), "untitled");
         assert_eq!(sanitize_for_filename("   "), "untitled");
         assert_eq!(sanitize_for_filename("///"), "untitled");
+    }
+
+    #[test]
+    fn gen_routing_request_empty() {
+        let _req: McpGenRoutingRequest = serde_json::from_str("{}").unwrap();
     }
 }
