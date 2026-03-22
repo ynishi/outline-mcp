@@ -29,7 +29,7 @@ If the path argument is omitted, defaults to `outline-book.json` in the current 
 
 ```
 shelf  →  select_book  →  toc  →  node_create / node_update / node_move
-                                   checklist / import / init
+                                   checklist / import / init / gen_routing
 ```
 
 1. **`init`** — Create a new empty book
@@ -40,6 +40,7 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 6. **`node_update`** — Edit title, body, type, placeholder, or properties of a node
 7. **`node_move`** — Relocate or delete nodes (with descendants)
 8. **`import`** — Import a book from a previously exported JSON file
+9. **`gen_routing`** — Generate a Markdown routing table from nodes with `routing` property across all books
 
 ### Node IDs
 
@@ -65,6 +66,8 @@ node_create  title="My Rule"  properties={"inject": "true", "scope": "rust"}
 ```
 
 - **`inject=true`** — Node body is automatically included in `select_book` output (context injection)
+- **`routing=<scene>`** — Marks the node for `gen_routing` output. Use `|` to assign multiple scenes (e.g. `routing="testing|TDD"`)
+- **`routing_ref=<text>`** — Overrides the default `§ID Title` reference in the routing table (e.g. `routing_ref="select_book で全体参照"`)
 - Properties with value `"true"` appear as tags in `toc`: `1. My Rule [inject]`
 - `toc` supports filtering: `filter={"inject": "true"}` shows only matching nodes
 - Properties are preserved in JSON export/import
