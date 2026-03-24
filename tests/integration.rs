@@ -27,7 +27,7 @@ fn service_add_node() {
     let tb = TestBook::standard();
     let svc = TestBook::service_with_book(&tb.book);
 
-    let id = svc
+    let (id, _warning) = svc
         .add_node(AddNodeRequest {
             parent: None,
             title: "New Section".into(),
@@ -60,6 +60,7 @@ fn service_update_node() {
             properties: None,
         },
     )
+    .map(|((), _warning)| ())
     .unwrap();
 
     let book = svc.read_tree().unwrap();
@@ -76,7 +77,9 @@ fn service_move_node() {
     let design_id = tb.ids["design"];
 
     // Implementation配下のcodeをDesign配下に移動
-    svc.move_node(code_id, Some(design_id), 0).unwrap();
+    svc.move_node(code_id, Some(design_id), 0)
+        .map(|((), _warning)| ())
+        .unwrap();
 
     let book = svc.read_tree().unwrap();
     let design = book.get_node(design_id).unwrap();
@@ -91,7 +94,9 @@ fn service_remove_node() {
     let svc = TestBook::service_with_book(&tb.book);
 
     // Design (+ 2 children) を削除 → 3ノード減
-    svc.remove_node(tb.ids["design"]).unwrap();
+    svc.remove_node(tb.ids["design"])
+        .map(|((), _warning)| ())
+        .unwrap();
 
     let book = svc.read_tree().unwrap();
     assert_eq!(book.node_count(), original_count - 3);

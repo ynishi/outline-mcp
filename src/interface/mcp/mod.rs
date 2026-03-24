@@ -26,6 +26,7 @@ use rmcp::{
 use crate::application::error::AppError;
 use crate::application::service::BookService;
 use crate::domain::model::id::NodeId;
+use crate::infra::changelog_store::JsonChangeLogRepository;
 use crate::infra::json_store::JsonBookRepository;
 
 use helpers::{build_hierarchical_ids, find_hierarchical_id, is_hierarchical_id};
@@ -81,13 +82,15 @@ impl OutlineMcpServer {
             )
         })?;
         let repo = JsonBookRepository::new(self.book_path(slug));
-        Ok(BookService::new(repo))
+        let changelog = Box::new(JsonChangeLogRepository::new(&self.shelf_dir, slug.as_str()));
+        Ok(BookService::new(repo).with_changelog(changelog))
     }
 
     /// 指定slugのServiceを返す（選択状態不要）。
     pub(super) fn service_for(&self, slug: &str) -> BookService<JsonBookRepository> {
         let repo = JsonBookRepository::new(self.book_path(slug));
-        BookService::new(repo)
+        let changelog = Box::new(JsonChangeLogRepository::new(&self.shelf_dir, slug));
+        BookService::new(repo).with_changelog(changelog)
     }
 
     /// Shelf内のslug一覧をソート順で返す。

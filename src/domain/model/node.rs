@@ -147,6 +147,8 @@ impl TemplateNode {
         self.updated_at = Some(Timestamp::now());
     }
 
+    // Subtask 4 (snapshot_restore) で使用予定
+    #[allow(dead_code)]
     pub(crate) fn set_status(&mut self, status: NodeStatus) {
         self.status = status;
     }

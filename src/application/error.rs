@@ -16,4 +16,7 @@ pub enum AppError {
 
     #[error("import: invalid node type: {0}")]
     ImportInvalidType(String),
+
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
 }

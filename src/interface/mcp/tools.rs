@@ -19,6 +19,7 @@ use super::OutlineMcpServer;
 
 use crate::domain::model::book::AddNodeRequest;
 use crate::domain::model::book::UpdateNodeRequest;
+use crate::domain::model::changelog::NodeStatus;
 
 #[tool_router(vis = "pub(super)")]
 impl OutlineMcpServer {
@@ -54,18 +55,22 @@ impl OutlineMcpServer {
             properties: req.properties.unwrap_or_default(),
         };
 
-        let id = svc.add_node(add_req).map_err(Self::to_mcp_error)?;
+        let (id, warning) = svc.add_node(add_req).map_err(Self::to_mcp_error)?;
 
         // 階層番号を逆引き
         let book = svc.read_tree().map_err(Self::to_mcp_error)?;
         let hier = find_hierarchical_id(&book, id).unwrap_or_else(|| id.short().to_string());
 
+        let mut msg = format!(
+            "Created: {}. {}",
+            hier,
+            book.get_node(id).map(|n| n.title()).unwrap_or("?")
+        );
+        if let Some(w) = warning {
+            msg.push_str(&format!("\n[WARNING] {w}"));
+        }
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            format!(
-                "Created: {}. {}",
-                hier,
-                book.get_node(id).map(|n| n.title()).unwrap_or("?")
-            ),
+            msg,
         )]))
     }
 
@@ -95,18 +100,23 @@ impl OutlineMcpServer {
             properties: req.properties,
         };
 
-        svc.update_node(id, update_req)
+        let ((), warning) = svc
+            .update_node(id, update_req)
             .map_err(Self::to_mcp_error)?;
 
         let book = svc.read_tree().map_err(Self::to_mcp_error)?;
         let hier = find_hierarchical_id(&book, id).unwrap_or_else(|| id.short().to_string());
 
+        let mut msg = format!(
+            "Updated: {}. {}",
+            hier,
+            book.get_node(id).map(|n| n.title()).unwrap_or("?")
+        );
+        if let Some(w) = warning {
+            msg.push_str(&format!("\n[WARNING] {w}"));
+        }
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            format!(
-                "Updated: {}. {}",
-                hier,
-                book.get_node(id).map(|n| n.title()).unwrap_or("?")
-            ),
+            msg,
         )]))
     }
 
@@ -135,18 +145,23 @@ impl OutlineMcpServer {
                     .map(|s| self.resolve_id(s))
                     .transpose()?;
                 let position = req.position.unwrap_or(usize::MAX);
-                svc.move_node(id, new_parent, position)
+                let ((), warning) = svc
+                    .move_node(id, new_parent, position)
                     .map_err(Self::to_mcp_error)?;
 
                 let book = svc.read_tree().map_err(Self::to_mcp_error)?;
                 let hier =
                     find_hierarchical_id(&book, id).unwrap_or_else(|| id.short().to_string());
+                let mut msg = format!(
+                    "Moved → {}. {}",
+                    hier,
+                    book.get_node(id).map(|n| n.title()).unwrap_or("?")
+                );
+                if let Some(w) = warning {
+                    msg.push_str(&format!("\n[WARNING] {w}"));
+                }
                 Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                    format!(
-                        "Moved → {}. {}",
-                        hier,
-                        book.get_node(id).map(|n| n.title()).unwrap_or("?")
-                    ),
+                    msg,
                 )]))
             }
             "remove" => {
@@ -159,9 +174,13 @@ impl OutlineMcpServer {
                     .map(|n| n.title().to_string())
                     .unwrap_or_default();
 
-                svc.remove_node(id).map_err(Self::to_mcp_error)?;
+                let ((), warning) = svc.remove_node(id).map_err(Self::to_mcp_error)?;
+                let mut msg = format!("Removed: {}. {} (and descendants)", hier, title);
+                if let Some(w) = warning {
+                    msg.push_str(&format!("\n[WARNING] {w}"));
+                }
                 Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                    format!("Removed: {}. {} (and descendants)", hier, title),
+                    msg,
                 )]))
             }
             other => Err(McpError::invalid_params(
@@ -496,7 +515,11 @@ impl OutlineMcpServer {
             m.insert("inject".to_string(), "true".to_string());
             m
         };
-        let injected_nodes = book.nodes_matching(&inject_filter);
+        let injected_nodes: Vec<_> = book
+            .nodes_matching(&inject_filter)
+            .into_iter()
+            .filter(|node| node.status() != NodeStatus::Draft)
+            .collect();
         let inject_section = if injected_nodes.is_empty() {
             String::new()
         } else {

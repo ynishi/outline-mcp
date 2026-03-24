@@ -12,26 +12,18 @@ pub trait BookRepository {
 
 /// ChangeLog の永続化抽象。Infra層が実装する。
 ///
-/// - slug 単位でファイルを管理する（`{slug}.changelog.json`）
+/// - インスタンスは slug 単位で生成される（1インスタンス = 1 slug）
 /// - エラー型は `Box<dyn Error + Send + Sync>` を直接使用（trait object化しやすさを優先）
 pub trait ChangeLogRepository: Send + Sync {
-    /// ChangeEntry を slug 対応の changelog に追記する。
-    fn append(
-        &self,
-        slug: &str,
-        entry: &ChangeEntry,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// ChangeEntry を changelog に追記する。
+    fn append(&self, entry: &ChangeEntry) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-    /// slug に対応する全 ChangeEntry を返す。
-    fn load_all(
-        &self,
-        slug: &str,
-    ) -> Result<Vec<ChangeEntry>, Box<dyn std::error::Error + Send + Sync>>;
+    /// 全 ChangeEntry を返す。
+    fn load_all(&self) -> Result<Vec<ChangeEntry>, Box<dyn std::error::Error + Send + Sync>>;
 
-    /// slug に対応する changelog から特定ノードの ChangeEntry を返す。
+    /// 特定ノードの ChangeEntry を返す。
     fn load_by_node(
         &self,
-        slug: &str,
         node_id: NodeId,
     ) -> Result<Vec<ChangeEntry>, Box<dyn std::error::Error + Send + Sync>>;
 }
