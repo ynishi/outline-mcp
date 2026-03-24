@@ -25,6 +25,7 @@ pub struct UpdateNodeRequest {
     pub node_type: Option<NodeType>,
     pub placeholder: Option<Option<String>>,
     pub properties: Option<HashMap<String, String>>,
+    pub status: Option<super::changelog::NodeStatus>,
 }
 
 /// Template Book — 集約ルート。全ノード操作はここを経由する。
@@ -142,6 +143,9 @@ impl TemplateBook {
         }
         if let Some(properties) = req.properties {
             node.set_properties(properties);
+        }
+        if let Some(status) = req.status {
+            node.set_status(status);
         }
 
         Ok(())
@@ -613,6 +617,7 @@ mod tests {
                 node_type: Some(NodeType::Content),
                 placeholder: None,
                 properties: None,
+                status: None,
             },
         )
         .unwrap();

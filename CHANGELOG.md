@@ -4,8 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-03-25
+
 ### Added
 
+- **History management**: snapshot, node_history, and dump tools for versioning and change tracking
+  - `snapshot_create` / `snapshot_list` / `snapshot_restore` — full book versioning
+  - `node_history` — per-node change log with before/after diffs
+  - `dump` — export full book as JSON file
+- **Node status**: `node_update` now supports `status` parameter (`active` / `draft`)
+  - Draft nodes are excluded from `select_book` context injection
 - `gen_routing` tool: generate Markdown routing tables from nodes with `routing` property across all books
   - `routing` property defines work scenarios (use `|` separator for multiple)
   - `routing_ref` property overrides default `§ID Title` reference text

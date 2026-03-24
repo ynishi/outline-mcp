@@ -5,6 +5,7 @@ use rmcp::ErrorData as McpError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::domain::model::changelog::NodeStatus;
 use crate::domain::model::id::NodeId;
 use crate::domain::model::node::NodeType;
 
@@ -113,6 +114,17 @@ pub(super) fn parse_node_type(s: &str) -> Result<NodeType, McpError> {
     }
 }
 
+pub(super) fn parse_node_status(s: &str) -> Result<NodeStatus, McpError> {
+    match s {
+        "active" => Ok(NodeStatus::Active),
+        "draft" => Ok(NodeStatus::Draft),
+        other => Err(McpError::invalid_params(
+            format!("Unknown status: '{other}'. Use: active, draft"),
+            None,
+        )),
+    }
+}
+
 /// MCP経由のテキストに含まれるリテラル `\n` を実際の改行に変換する。
 pub(super) fn unescape_newlines(s: &str) -> String {
     s.replace("\\n", "\n")
@@ -169,6 +181,10 @@ pub(super) struct McpNodeUpdateRequest {
     pub placeholder: Option<Option<String>>,
     #[schemars(description = "Replace all properties (omit to keep current). Pass {} to clear.")]
     pub properties: Option<HashMap<String, String>>,
+    #[schemars(
+        description = "Node status: 'active' or 'draft'. Draft nodes are excluded from select_book inject."
+    )]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

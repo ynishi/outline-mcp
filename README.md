@@ -30,17 +30,22 @@ If the path argument is omitted, defaults to `outline-book.json` in the current 
 ```
 shelf  →  select_book  →  toc  →  node_create / node_update / node_move
                                    checklist / import / init / gen_routing
+                                   snapshot_create / snapshot_list / snapshot_restore
+                                   node_history / dump
 ```
 
 1. **`init`** — Create a new empty book
 2. **`node_create`** — Add sections and content nodes (with optional `properties`)
 3. **`toc`** — View the table of contents with numbered IDs (e.g. `1`, `2-3`). Supports `filter` by properties
-4. **`select_book`** — Select a book. Nodes with `inject=true` property have their body auto-appended
+4. **`select_book`** — Select a book. Nodes with `inject=true` property have their body auto-appended (draft nodes excluded)
 5. **`checklist`** — Export a section (or the whole book) as a Markdown checklist with checkboxes
-6. **`node_update`** — Edit title, body, type, placeholder, or properties of a node
+6. **`node_update`** — Edit title, body, type, placeholder, properties, or status (`active`/`draft`) of a node
 7. **`node_move`** — Relocate or delete nodes (with descendants)
 8. **`import`** — Import a book from a previously exported JSON file
 9. **`gen_routing`** — Generate a Markdown routing table from nodes with `routing` property across all books
+10. **`snapshot_create`** / **`snapshot_list`** / **`snapshot_restore`** — Full book versioning (create, list, restore)
+11. **`node_history`** — View per-node change log with before/after diffs
+12. **`dump`** — Export full book as JSON file
 
 ### Node IDs
 

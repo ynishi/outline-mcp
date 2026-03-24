@@ -10,11 +10,12 @@ use crate::application::eject::{EjectConfig, EjectFormat, EjectService, EjectTre
 
 use super::helpers::{build_hierarchical_ids, find_hierarchical_id, format_toc};
 use super::request::{
-    normalize_text, parse_node_type, sanitize_for_filename, unescape_newlines, validate_filename,
-    validate_import_path, validate_slug, McpDumpRequest, McpEjectRequest, McpGenRoutingRequest,
-    McpImportRequest, McpInitRequest, McpNodeCreateRequest, McpNodeHistoryRequest,
-    McpNodeMoveRequest, McpNodeUpdateRequest, McpSelectBookRequest, McpShelfRequest,
-    McpSnapshotCreateRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest, McpTocRequest,
+    normalize_text, parse_node_status, parse_node_type, sanitize_for_filename, unescape_newlines,
+    validate_filename, validate_import_path, validate_slug, McpDumpRequest, McpEjectRequest,
+    McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpNodeCreateRequest,
+    McpNodeHistoryRequest, McpNodeMoveRequest, McpNodeUpdateRequest, McpSelectBookRequest,
+    McpShelfRequest, McpSnapshotCreateRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest,
+    McpTocRequest,
 };
 use super::OutlineMcpServer;
 
@@ -96,12 +97,15 @@ impl OutlineMcpServer {
         let id = self.resolve_id(&req.node_id)?;
         let node_type = req.node_type.as_deref().map(parse_node_type).transpose()?;
 
+        let status = req.status.as_deref().map(parse_node_status).transpose()?;
+
         let update_req = UpdateNodeRequest {
             title: req.title.map(|t| unescape_newlines(&t)),
             body: req.body.map(normalize_text),
             node_type,
             placeholder: req.placeholder.map(normalize_text),
             properties: req.properties,
+            status,
         };
 
         let ((), warning) = svc

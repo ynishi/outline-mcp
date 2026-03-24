@@ -58,6 +58,7 @@ fn service_update_node() {
             node_type: None,
             placeholder: None,
             properties: None,
+            status: None,
         },
     )
     .map(|((), _warning)| ())

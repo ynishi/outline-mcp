@@ -390,6 +390,7 @@ mod tests {
             node_type: None,
             placeholder: None,
             properties: None,
+            status: None,
         };
         let ((), warning) = svc.update_node(id, update_req).expect("update");
         assert!(warning.is_none());
