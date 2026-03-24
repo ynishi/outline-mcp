@@ -259,7 +259,9 @@ impl ServerHandler for OutlineMcpServer {
                  persistent rules/context into every session.\n\
                  \n\
                  Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`. \
-                 `checklist` for task export. `init` for new book."
+                 `checklist` for task export. `init` for new book.\n\
+                 History: `snapshot_create`/`snapshot_list`/`snapshot_restore` for versioning. \
+                 `node_history` for change tracking. `dump` for full export."
                     .to_string(),
             ),
         }

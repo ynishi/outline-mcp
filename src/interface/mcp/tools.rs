@@ -11,15 +11,19 @@ use crate::application::eject::{EjectConfig, EjectFormat, EjectService, EjectTre
 use super::helpers::{build_hierarchical_ids, find_hierarchical_id, format_toc};
 use super::request::{
     normalize_text, parse_node_type, sanitize_for_filename, unescape_newlines, validate_filename,
-    validate_import_path, validate_slug, McpEjectRequest, McpGenRoutingRequest, McpImportRequest,
-    McpInitRequest, McpNodeCreateRequest, McpNodeMoveRequest, McpNodeUpdateRequest,
-    McpSelectBookRequest, McpShelfRequest, McpTocRequest,
+    validate_import_path, validate_slug, McpDumpRequest, McpEjectRequest, McpGenRoutingRequest,
+    McpImportRequest, McpInitRequest, McpNodeCreateRequest, McpNodeHistoryRequest,
+    McpNodeMoveRequest, McpNodeUpdateRequest, McpSelectBookRequest, McpShelfRequest,
+    McpSnapshotCreateRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest, McpTocRequest,
 };
 use super::OutlineMcpServer;
 
 use crate::domain::model::book::AddNodeRequest;
 use crate::domain::model::book::UpdateNodeRequest;
-use crate::domain::model::changelog::NodeStatus;
+use crate::domain::model::changelog::{ChangeAction, ChangeEntry, NodeStatus};
+use crate::domain::model::timestamp::Timestamp;
+use crate::infra::changelog_store::JsonChangeLogRepository;
+use crate::infra::snapshot::SnapshotService;
 
 #[tool_router(vis = "pub(super)")]
 impl OutlineMcpServer {
@@ -628,6 +632,334 @@ impl OutlineMcpServer {
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             output,
+        )]))
+    }
+
+    #[tool(
+        name = "snapshot_create",
+        description = "Create a snapshot of the current book state. Use `snapshot_list` to view saved snapshots and `snapshot_restore` to revert.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn snapshot_create(
+        &self,
+        #[allow(unused_variables)] Parameters(_req): Parameters<McpSnapshotCreateRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service()?;
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+
+        let slug = {
+            let guard = self
+                .selected
+                .read()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                        None,
+                    )
+                })?
+                .clone()
+        };
+
+        let path = SnapshotService::create(&self.shelf_dir, &slug, &book).map_err(|e| {
+            McpError::internal_error(format!("Failed to create snapshot: {e}"), None)
+        })?;
+
+        let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+        // ファイル名からタイムスタンプ(millis)を取得
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let millis_str = stem.rsplit('.').next().unwrap_or("");
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            format!("Snapshot created: {} ({} bytes)", millis_str, size_bytes),
+        )]))
+    }
+
+    #[tool(
+        name = "snapshot_list",
+        description = "List all snapshots for the selected book. Use the timestamp value with `snapshot_restore` to revert to a specific state.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn snapshot_list(
+        &self,
+        #[allow(unused_variables)] Parameters(_req): Parameters<McpSnapshotListRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service()?;
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+
+        let slug = {
+            let guard = self
+                .selected
+                .read()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                        None,
+                    )
+                })?
+                .clone()
+        };
+
+        let infos = SnapshotService::list(&self.shelf_dir, &slug).map_err(|e| {
+            McpError::internal_error(format!("Failed to list snapshots: {e}"), None)
+        })?;
+
+        if infos.is_empty() {
+            return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                format!("No snapshots for \"{}\".", book.title()),
+            )]));
+        }
+
+        let mut output = format!(
+            "# Snapshots for \"{}\" ({} snapshots)\n\n",
+            book.title(),
+            infos.len()
+        );
+        for (i, info) in infos.iter().enumerate() {
+            let size_kb = info.size_bytes as f64 / 1024.0;
+            output.push_str(&format!(
+                "{}. {} — {} ({:.1} KB)\n",
+                i + 1,
+                info.timestamp.to_iso8601(),
+                info.timestamp.as_millis(),
+                size_kb
+            ));
+        }
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            output,
+        )]))
+    }
+
+    #[tool(
+        name = "snapshot_restore",
+        description = "Restore the selected book from a snapshot. This overwrites the current book state. Use `snapshot_list` to find available timestamps.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn snapshot_restore(
+        &self,
+        Parameters(req): Parameters<McpSnapshotRestoreRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let millis: i64 = req.timestamp.parse().map_err(|_| {
+            McpError::invalid_params(
+                format!(
+                    "Invalid timestamp: '{}'. Must be a millis integer.",
+                    req.timestamp
+                ),
+                None,
+            )
+        })?;
+
+        let slug = {
+            let guard = self
+                .selected
+                .read()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                        None,
+                    )
+                })?
+                .clone()
+        };
+
+        let restored = SnapshotService::restore(&self.shelf_dir, &slug, millis).map_err(|e| {
+            McpError::internal_error(format!("Failed to restore snapshot: {e}"), None)
+        })?;
+
+        let node_count = restored.node_count();
+
+        // changelog に Restore エントリを記録（ベストエフォート）
+        let cl_repo = JsonChangeLogRepository::new(&self.shelf_dir, &slug);
+        let ts = Timestamp::now();
+        let mut warning: Option<String> = None;
+        for id in restored.all_node_ids() {
+            let entry = ChangeEntry::new(id, ChangeAction::Restore, None, None, ts);
+            if let Err(e) = crate::domain::repository::ChangeLogRepository::append(&cl_repo, &entry)
+            {
+                warning = Some(format!("changelog write failed: {e}"));
+                break;
+            }
+        }
+
+        let svc = self.service()?;
+        svc.save_book(&restored).map_err(Self::to_mcp_error)?;
+
+        let mut msg = format!(
+            "Restored from snapshot {}. {} nodes.",
+            req.timestamp, node_count
+        );
+        if let Some(w) = warning {
+            msg.push_str(&format!("\n[WARNING] {w}"));
+        }
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            msg,
+        )]))
+    }
+
+    #[tool(
+        name = "node_history",
+        description = "Show the change history for a specific node. Returns entries in chronological order (oldest first).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn node_history(
+        &self,
+        Parameters(req): Parameters<McpNodeHistoryRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = self.resolve_id(&req.node_id)?;
+
+        let slug = {
+            let guard = self
+                .selected
+                .read()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                        None,
+                    )
+                })?
+                .clone()
+        };
+
+        let svc = self.service()?;
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+
+        let title = book
+            .get_node(id)
+            .map(|n| n.title().to_string())
+            .unwrap_or_else(|| id.short().to_string());
+
+        let cl_repo = JsonChangeLogRepository::new(&self.shelf_dir, &slug);
+        let mut entries = crate::domain::repository::ChangeLogRepository::load_by_node(
+            &cl_repo, id,
+        )
+        .map_err(|e| McpError::internal_error(format!("Failed to load history: {e}"), None))?;
+
+        // 時系列順（古い順）
+        entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+        if entries.is_empty() {
+            return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                format!("No history for \"{}\".", title),
+            )]));
+        }
+
+        let mut output = format!(
+            "# History for \"{}\" ({} entries)\n\n",
+            title,
+            entries.len()
+        );
+        for (i, entry) in entries.iter().enumerate() {
+            let action_str = match entry.action {
+                ChangeAction::Create => "create",
+                ChangeAction::Update => "update",
+                ChangeAction::Delete => "delete",
+                ChangeAction::Move => "move",
+                ChangeAction::Restore => "restore",
+            };
+            output.push_str(&format!(
+                "{}. [{}] {}\n",
+                i + 1,
+                entry.timestamp.to_iso8601(),
+                action_str
+            ));
+            if let Some(ref before) = entry.before {
+                output.push_str(&format!("   before: {}\n", before));
+            }
+            if let Some(ref after) = entry.after {
+                output.push_str(&format!("   after: {}\n", after));
+            }
+        }
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            output,
+        )]))
+    }
+
+    #[tool(
+        name = "dump",
+        description = "Export the entire selected book to a file. Unlike `checklist`, this always exports the full book (no subtree). Supports markdown (default) and json formats.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn dump(
+        &self,
+        Parameters(req): Parameters<McpDumpRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service()?;
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+
+        let format = match req.format.as_deref() {
+            Some("json") => EjectFormat::Json,
+            Some("markdown") | None => EjectFormat::Markdown,
+            Some(other) => {
+                return Err(McpError::invalid_params(
+                    format!("Unknown format: '{other}'. Use: markdown, json"),
+                    None,
+                ))
+            }
+        };
+
+        let default_ext = match format {
+            EjectFormat::Markdown => "md",
+            EjectFormat::Json => "json",
+        };
+
+        let filename = match req.filename {
+            Some(f) => f,
+            None => format!("{}.{}", sanitize_for_filename(book.title()), default_ext),
+        };
+        validate_filename(&filename)?;
+
+        let output_dir = PathBuf::from(&req.output_dir);
+
+        let config = EjectConfig {
+            output_dir,
+            filename,
+            include_placeholders: true,
+            format,
+            subtree_root: None,
+        };
+
+        let path = EjectService::eject(&book, &config).map_err(Self::to_mcp_error)?;
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            format!("Book dumped to: {}", path.display()),
         )]))
     }
 }

@@ -236,6 +236,34 @@ pub(super) struct McpShelfRequest {}
 pub(super) struct McpGenRoutingRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpSnapshotCreateRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpSnapshotListRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpSnapshotRestoreRequest {
+    #[schemars(description = "Timestamp (millis) from snapshot_list output")]
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpNodeHistoryRequest {
+    #[schemars(description = "Node ID from `toc` output (e.g. '2-3'). UUID also accepted.")]
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpDumpRequest {
+    #[schemars(description = "Output directory path")]
+    pub output_dir: String,
+    #[schemars(description = "Output format: 'markdown' (default) or 'json'")]
+    pub format: Option<String>,
+    #[schemars(description = "Output filename (default: '<book-title>.<ext>')")]
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(super) struct McpSelectBookRequest {
     #[schemars(
         description = "Book to select: number from `shelf` output (e.g. '1') or book slug (e.g. 'rust')"
@@ -416,5 +444,46 @@ mod tests {
     #[test]
     fn gen_routing_request_empty() {
         let _req: McpGenRoutingRequest = serde_json::from_str("{}").unwrap();
+    }
+
+    #[test]
+    fn snapshot_create_request_empty() {
+        let _req: McpSnapshotCreateRequest = serde_json::from_str("{}").unwrap();
+    }
+
+    #[test]
+    fn snapshot_list_request_empty() {
+        let _req: McpSnapshotListRequest = serde_json::from_str("{}").unwrap();
+    }
+
+    #[test]
+    fn snapshot_restore_request_parse() {
+        let req: McpSnapshotRestoreRequest =
+            serde_json::from_str(r#"{"timestamp": "1700000000000"}"#).unwrap();
+        assert_eq!(req.timestamp, "1700000000000");
+    }
+
+    #[test]
+    fn node_history_request_parse() {
+        let req: McpNodeHistoryRequest = serde_json::from_str(r#"{"node_id": "2-3"}"#).unwrap();
+        assert_eq!(req.node_id, "2-3");
+    }
+
+    #[test]
+    fn dump_request_parse_minimal() {
+        let req: McpDumpRequest = serde_json::from_str(r#"{"output_dir": "/tmp/out"}"#).unwrap();
+        assert_eq!(req.output_dir, "/tmp/out");
+        assert!(req.format.is_none());
+        assert!(req.filename.is_none());
+    }
+
+    #[test]
+    fn dump_request_parse_full() {
+        let req: McpDumpRequest = serde_json::from_str(
+            r#"{"output_dir": "/tmp/out", "format": "json", "filename": "book.json"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.format.as_deref(), Some("json"));
+        assert_eq!(req.filename.as_deref(), Some("book.json"));
     }
 }
