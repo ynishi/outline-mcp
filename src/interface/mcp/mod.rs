@@ -99,7 +99,16 @@ impl OutlineMcpServer {
             .map_err(|e| McpError::internal_error(format!("Failed to read shelf: {e}"), None))?;
         let mut slugs: Vec<String> = dir
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+            .filter(|e| {
+                let path = e.path();
+                let ext_ok = path.extension().and_then(|x| x.to_str()) == Some("json");
+                let stem_ok = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| !s.contains('.'))
+                    .unwrap_or(false);
+                ext_ok && stem_ok
+            })
             .filter_map(|e| {
                 e.path()
                     .file_stem()
