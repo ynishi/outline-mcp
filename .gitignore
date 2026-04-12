@@ -1,4 +1,6 @@
-/target
+target
 .claude
 .worktrees
+.ryo
+.mcp.json
 workspace
