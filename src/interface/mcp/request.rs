@@ -331,6 +331,23 @@ pub(super) struct McpSelectBookRequest {
     pub quiet: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpNodeQueryRequest {
+    #[schemars(
+        description = "Filter by properties (e.g. {\"added_by\": \"retrospector\"}). Only matching nodes shown."
+    )]
+    pub filter: Option<HashMap<String, String>>,
+    #[schemars(description = "Include node body in output (default: false)")]
+    #[serde(default)]
+    pub include_body: bool,
+    #[schemars(description = "Filter by node type: 'section' or 'content'")]
+    pub kind: Option<String>,
+    #[schemars(description = "Filter by status: 'active' or 'draft'")]
+    pub status: Option<String>,
+    #[schemars(description = "Subtree root ID (toc ID or UUID). Only search within this subtree.")]
+    pub subtree_root: Option<String>,
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -621,5 +638,36 @@ mod tests {
         )
         .unwrap();
         assert!(req.updates[0].body.is_none());
+    }
+
+    #[test]
+    fn node_query_request_minimal() {
+        let req: McpNodeQueryRequest = serde_json::from_str("{}").unwrap();
+        assert!(!req.include_body);
+        assert!(req.filter.is_none());
+        assert!(req.kind.is_none());
+        assert!(req.status.is_none());
+        assert!(req.subtree_root.is_none());
+    }
+
+    #[test]
+    fn node_query_request_full() {
+        let req: McpNodeQueryRequest = serde_json::from_str(
+            r#"{"filter": {"scope": "rust"}, "include_body": true, "kind": "content",
+                "status": "draft", "subtree_root": "2-3"}"#,
+        )
+        .unwrap();
+        assert!(req.include_body);
+        assert_eq!(
+            req.filter
+                .as_ref()
+                .unwrap()
+                .get("scope")
+                .map(String::as_str),
+            Some("rust")
+        );
+        assert_eq!(req.kind.as_deref(), Some("content"));
+        assert_eq!(req.status.as_deref(), Some("draft"));
+        assert_eq!(req.subtree_root.as_deref(), Some("2-3"));
     }
 }
