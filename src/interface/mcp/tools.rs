@@ -14,8 +14,8 @@ use super::request::{
     unescape_newlines, validate_filename, validate_import_path, validate_slug, McpBatchMoveRequest,
     McpBatchUpdateRequest, McpDumpRequest, McpEjectRequest, McpGenRoutingRequest, McpImportRequest,
     McpInitRequest, McpNodeCreateRequest, McpNodeHistoryRequest, McpNodeMoveRequest,
-    McpNodeUpdateRequest, McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest,
-    McpSnapshotListRequest, McpSnapshotRestoreRequest, McpTocRequest,
+    McpNodeQueryRequest, McpNodeUpdateRequest, McpSelectBookRequest, McpShelfRequest,
+    McpSnapshotCreateRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest, McpTocRequest,
 };
 use super::OutlineMcpServer;
 
@@ -1131,6 +1131,103 @@ impl OutlineMcpServer {
         }
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             msg,
+        )]))
+    }
+
+    #[tool(
+        description = "Query nodes by properties, status, type, or subtree. Returns UUIDs needed for batch operations. Use `include_body: true` to include node content.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn node_query(
+        &self,
+        Parameters(req): Parameters<McpNodeQueryRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::domain::model::node::NodeType;
+
+        let svc = self.service()?;
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+
+        let root_id = req
+            .subtree_root
+            .as_deref()
+            .map(|s| self.resolve_id(s))
+            .transpose()?;
+
+        let mut nodes = match root_id {
+            Some(id) => book.subtree_nodes(id),
+            None => book.all_nodes_dfs(),
+        };
+
+        if let Some(ref filter) = req.filter {
+            if !filter.is_empty() {
+                nodes.retain(|node| {
+                    filter
+                        .iter()
+                        .all(|(k, v)| node.get_property(k).map(|pv| pv == v).unwrap_or(false))
+                });
+            }
+        }
+
+        if let Some(ref k) = req.kind {
+            let nt = parse_node_type(k)?;
+            nodes.retain(|n| n.node_type() == &nt);
+        }
+
+        if let Some(ref s) = req.status {
+            let st = parse_node_status(s)?;
+            nodes.retain(|n| n.status() == st);
+        }
+
+        if nodes.is_empty() {
+            return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                "No matching nodes found.",
+            )]));
+        }
+
+        let mut output = format!("# Query Results ({} matches)\n", nodes.len());
+        for (i, node) in nodes.iter().enumerate() {
+            let short = node.id().short();
+            let full = node.id().to_string();
+            let type_str = match node.node_type() {
+                NodeType::Section => "section",
+                NodeType::Content => "content",
+            };
+            let status_str = match node.status() {
+                crate::domain::model::changelog::NodeStatus::Active => "active",
+                crate::domain::model::changelog::NodeStatus::Draft => "draft",
+            };
+            output.push_str(&format!(
+                "\n{}. [{}] {}\n   UUID: {}\n   Type: {}\n   Status: {}\n",
+                i + 1,
+                short,
+                node.title(),
+                full,
+                type_str,
+                status_str,
+            ));
+            let props = node.properties();
+            if !props.is_empty() {
+                let props_str = props
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!("   Properties: {}\n", props_str));
+            }
+            if req.include_body {
+                if let Some(body) = node.body() {
+                    output.push_str(&format!("   Body: {}\n", body));
+                }
+            }
+            output.push_str("   ---\n");
+        }
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            output,
         )]))
     }
 }

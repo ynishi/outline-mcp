@@ -262,7 +262,8 @@ impl ServerHandler for OutlineMcpServer {
                  `checklist` for task export. `init` for new book.\n\
                  History: `snapshot_create`/`snapshot_list`/`snapshot_restore` for versioning. \
                  `node_history` for change tracking. `dump` for full export.\n\
-                 Batch: `node_batch_move`/`node_batch_update` for bulk operations (UUID required)."
+                 Batch: `node_batch_move`/`node_batch_update` for bulk operations (UUID required). \
+                 Query: `node_query` for searching nodes by properties/status/type."
                     .to_string(),
             ),
         }
