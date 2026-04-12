@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Batch operations**: `node_batch_move` and `node_batch_update` for applying multiple mutations in a single call
+  - `node_batch_move` — move or delete multiple nodes atomically (all-or-nothing: saves only when all moves succeed)
+  - `node_batch_update` — update title/body/type/properties/status on multiple nodes atomically
+  - Both tools require UUID or UUID-prefix IDs (hierarchical toc IDs are intentionally unsupported to avoid positional drift)
+- **`node_query`** — search nodes by property values, status, or node type; optionally include body in results
+  - Supports `filter` (key-value property match), `status` (`active` / `draft`), `kind` (`section` / `content`)
+  - `include_body=true` returns full node body alongside title, UUID, and properties
+
 ## [0.5.0] - 2026-03-25
 
 ### Added
