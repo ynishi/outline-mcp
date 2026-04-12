@@ -279,6 +279,46 @@ pub(super) struct McpDumpRequest {
     pub filename: Option<String>,
 }
 
+// =============================================================================
+// Batch operation request types
+// =============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpBatchMoveItem {
+    #[schemars(description = "Node UUID (use node_query or dump to find UUIDs)")]
+    pub node_id: String,
+    #[schemars(description = "New parent UUID (null for root)")]
+    pub new_parent: Option<String>,
+    #[schemars(description = "Position among new siblings (0-based). Default: append at end.")]
+    pub position: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpBatchMoveRequest {
+    #[schemars(description = "List of move operations. All nodes are identified by UUID.")]
+    pub moves: Vec<McpBatchMoveItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpBatchUpdateItem {
+    #[schemars(description = "Node UUID")]
+    pub node_id: String,
+    #[schemars(description = "New title (omit to keep current)")]
+    pub title: Option<String>,
+    #[schemars(description = "New body (null to clear, omit to keep current)")]
+    pub body: Option<Option<String>>,
+    #[schemars(description = "Replace all properties (omit to keep current). Pass {} to clear.")]
+    pub properties: Option<HashMap<String, String>>,
+    #[schemars(description = "Node status: 'active' or 'draft'")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpBatchUpdateRequest {
+    #[schemars(description = "List of update operations. All nodes are identified by UUID.")]
+    pub updates: Vec<McpBatchUpdateItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(super) struct McpSelectBookRequest {
     #[schemars(
@@ -289,6 +329,23 @@ pub(super) struct McpSelectBookRequest {
     #[schemars(description = "Suppress TOC output (default: false)")]
     #[serde(default)]
     pub quiet: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpNodeQueryRequest {
+    #[schemars(
+        description = "Filter by properties (e.g. {\"added_by\": \"retrospector\"}). Only matching nodes shown."
+    )]
+    pub filter: Option<HashMap<String, String>>,
+    #[schemars(description = "Include node body in output (default: false)")]
+    #[serde(default)]
+    pub include_body: bool,
+    #[schemars(description = "Filter by node type: 'section' or 'content'")]
+    pub kind: Option<String>,
+    #[schemars(description = "Filter by status: 'active' or 'draft'")]
+    pub status: Option<String>,
+    #[schemars(description = "Subtree root ID (toc ID or UUID). Only search within this subtree.")]
+    pub subtree_root: Option<String>,
 }
 
 // =============================================================================
@@ -501,5 +558,116 @@ mod tests {
         .unwrap();
         assert_eq!(req.format.as_deref(), Some("json"));
         assert_eq!(req.filename.as_deref(), Some("book.json"));
+    }
+
+    // ---- batch request type tests ----
+
+    #[test]
+    fn batch_move_request_minimal() {
+        let req: McpBatchMoveRequest = serde_json::from_str(
+            r#"{"moves": [{"node_id": "00000000-0000-0000-0000-000000000001", "new_parent": null, "position": null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.moves.len(), 1);
+        assert_eq!(req.moves[0].node_id, "00000000-0000-0000-0000-000000000001");
+        assert!(req.moves[0].new_parent.is_none());
+        assert!(req.moves[0].position.is_none());
+    }
+
+    #[test]
+    fn batch_move_request_with_parent_and_position() {
+        let req: McpBatchMoveRequest = serde_json::from_str(
+            r#"{"moves": [{"node_id": "00000000-0000-0000-0000-000000000001",
+                           "new_parent": "00000000-0000-0000-0000-000000000002",
+                           "position": 3}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.moves[0].new_parent.as_deref(),
+            Some("00000000-0000-0000-0000-000000000002")
+        );
+        assert_eq!(req.moves[0].position, Some(3));
+    }
+
+    #[test]
+    fn batch_move_request_empty_moves() {
+        let req: McpBatchMoveRequest = serde_json::from_str(r#"{"moves": []}"#).unwrap();
+        assert!(req.moves.is_empty());
+    }
+
+    #[test]
+    fn batch_update_request_minimal() {
+        let req: McpBatchUpdateRequest = serde_json::from_str(
+            r#"{"updates": [{"node_id": "00000000-0000-0000-0000-000000000001"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.updates.len(), 1);
+        assert!(req.updates[0].title.is_none());
+        assert!(req.updates[0].body.is_none());
+        assert!(req.updates[0].properties.is_none());
+        assert!(req.updates[0].status.is_none());
+    }
+
+    #[test]
+    fn batch_update_request_full() {
+        let req: McpBatchUpdateRequest = serde_json::from_str(
+            r#"{"updates": [{"node_id": "00000000-0000-0000-0000-000000000001",
+                             "title": "New Title",
+                             "body": "content here",
+                             "properties": {"key": "val"},
+                             "status": "draft"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.updates[0].title.as_deref(), Some("New Title"));
+        assert_eq!(
+            req.updates[0].body.as_ref().and_then(|b| b.as_deref()),
+            Some("content here")
+        );
+        let props = req.updates[0].properties.as_ref().unwrap();
+        assert_eq!(props.get("key").map(String::as_str), Some("val"));
+        assert_eq!(req.updates[0].status.as_deref(), Some("draft"));
+    }
+
+    #[test]
+    fn batch_update_request_body_null_deserializes() {
+        // Without #[serde(default)] or custom deserializer, serde treats both
+        // `"body": null` and omitting `body` as None for Option<Option<T>>.
+        // This matches the existing McpNodeUpdateRequest behavior.
+        let req: McpBatchUpdateRequest = serde_json::from_str(
+            r#"{"updates": [{"node_id": "00000000-0000-0000-0000-000000000001", "body": null}]}"#,
+        )
+        .unwrap();
+        assert!(req.updates[0].body.is_none());
+    }
+
+    #[test]
+    fn node_query_request_minimal() {
+        let req: McpNodeQueryRequest = serde_json::from_str("{}").unwrap();
+        assert!(!req.include_body);
+        assert!(req.filter.is_none());
+        assert!(req.kind.is_none());
+        assert!(req.status.is_none());
+        assert!(req.subtree_root.is_none());
+    }
+
+    #[test]
+    fn node_query_request_full() {
+        let req: McpNodeQueryRequest = serde_json::from_str(
+            r#"{"filter": {"scope": "rust"}, "include_body": true, "kind": "content",
+                "status": "draft", "subtree_root": "2-3"}"#,
+        )
+        .unwrap();
+        assert!(req.include_body);
+        assert_eq!(
+            req.filter
+                .as_ref()
+                .unwrap()
+                .get("scope")
+                .map(String::as_str),
+            Some("rust")
+        );
+        assert_eq!(req.kind.as_deref(), Some("content"));
+        assert_eq!(req.status.as_deref(), Some("draft"));
+        assert_eq!(req.subtree_root.as_deref(), Some("2-3"));
     }
 }

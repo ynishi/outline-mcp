@@ -29,6 +29,7 @@ If the path argument is omitted, defaults to `outline-book.json` in the current 
 
 ```
 shelf  →  select_book  →  toc  →  node_create / node_update / node_move
+                                   node_batch_move / node_batch_update / node_query
                                    checklist / import / init / gen_routing
                                    snapshot_create / snapshot_list / snapshot_restore
                                    node_history / dump
@@ -41,11 +42,14 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 5. **`checklist`** — Export a section (or the whole book) as a Markdown checklist with checkboxes
 6. **`node_update`** — Edit title, body, type, placeholder, properties, or status (`active`/`draft`) of a node
 7. **`node_move`** — Relocate or delete nodes (with descendants)
-8. **`import`** — Import a book from a previously exported JSON file
-9. **`gen_routing`** — Generate a Markdown routing table from nodes with `routing` property across all books
-10. **`snapshot_create`** / **`snapshot_list`** / **`snapshot_restore`** — Full book versioning (create, list, restore)
-11. **`node_history`** — View per-node change log with before/after diffs
-12. **`dump`** — Export full book as JSON file
+8. **`node_batch_move`** — Move or delete multiple nodes in a single atomic call (requires UUID or UUID-prefix IDs)
+9. **`node_batch_update`** — Update title/body/type/properties/status on multiple nodes atomically
+10. **`node_query`** — Search nodes by property values, status (`active`/`draft`), or type (`section`/`content`); optionally include body in results
+11. **`import`** — Import a book from a previously exported JSON file
+12. **`gen_routing`** — Generate a Markdown routing table from nodes with `routing` property across all books
+13. **`snapshot_create`** / **`snapshot_list`** / **`snapshot_restore`** — Full book versioning (create, list, restore)
+14. **`node_history`** — View per-node change log with before/after diffs
+15. **`dump`** — Export full book as JSON file
 
 ### Node IDs
 
@@ -60,7 +64,9 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
   2-2. Integration Tests
 ```
 
-These IDs (`1`, `1-2`, `2-1`, etc.) work in all tools. Full UUIDs and title substring matching are also supported as fallbacks.
+These IDs (`1`, `1-2`, `2-1`, etc.) work in most tools. Full UUIDs and title substring matching are also supported as fallbacks.
+
+> **Note**: `node_batch_move` and `node_batch_update` require UUID or UUID-prefix IDs. Hierarchical toc IDs are intentionally rejected to prevent positional drift when the tree is modified mid-batch.
 
 ### Node Properties
 

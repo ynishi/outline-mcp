@@ -141,6 +141,106 @@ impl<R: BookRepository> BookService<R> {
         Ok(((), warning))
     }
 
+    /// 複数ノードをアトミックに移動する（C案: 全成功 or 全保存なし）。
+    ///
+    /// `moves` は `(NodeId, new_parent: Option<NodeId>, position: usize)` のリスト。
+    /// 戻り値: `(成功件数, changelog警告リスト)` — エラー時はErrを返しsaveしない。
+    pub fn batch_move(
+        &self,
+        moves: Vec<(NodeId, Option<NodeId>, usize)>,
+    ) -> Result<(usize, Vec<Option<String>>), AppError> {
+        let mut book = self.load_book()?;
+        let mut before_jsons: Vec<Option<String>> = Vec::with_capacity(moves.len());
+
+        for (id, new_parent, position) in &moves {
+            let before_json = book
+                .get_node(*id)
+                .and_then(|n| serde_json::to_string(n).ok());
+            before_jsons.push(before_json);
+            book.move_node(*id, *new_parent, *position)?;
+        }
+
+        self.persist(&book)?;
+
+        let mut warnings: Vec<Option<String>> = Vec::with_capacity(moves.len());
+        for (i, (id, _, _)) in moves.iter().enumerate() {
+            let before_json = before_jsons[i].clone();
+            let id = *id;
+            let warning = self.append_changelog(|| {
+                let after_json = book
+                    .get_node(id)
+                    .and_then(|n| serde_json::to_string(n).ok());
+                ChangeEntry::new(
+                    id,
+                    ChangeAction::Move,
+                    before_json,
+                    after_json,
+                    Timestamp::now(),
+                )
+            });
+            warnings.push(warning);
+        }
+
+        Ok((moves.len(), warnings))
+    }
+
+    /// 複数ノードをアトミックに更新する（C案: 全成功 or 全保存なし）。
+    ///
+    /// `updates` は `(NodeId, UpdateNodeRequest)` のリスト。
+    /// 戻り値: `(成功件数, changelog警告リスト)` — エラー時はErrを返しsaveしない。
+    pub fn batch_update(
+        &self,
+        updates: Vec<(NodeId, UpdateNodeRequest)>,
+    ) -> Result<(usize, Vec<Option<String>>), AppError> {
+        let mut book = self.load_book()?;
+
+        // before_jsonとnode_idを先に収集してからmutatbleな操作を実行する
+        let mut before_jsons: Vec<Option<String>> = Vec::with_capacity(updates.len());
+        let mut node_ids: Vec<NodeId> = Vec::with_capacity(updates.len());
+
+        for (id, req) in &updates {
+            let before_json = book
+                .get_node(*id)
+                .and_then(|n| serde_json::to_string(n).ok());
+            before_jsons.push(before_json);
+            node_ids.push(*id);
+            book.update_node(
+                *id,
+                UpdateNodeRequest {
+                    title: req.title.clone(),
+                    body: req.body.clone(),
+                    node_type: req.node_type.clone(),
+                    placeholder: req.placeholder.clone(),
+                    properties: req.properties.clone(),
+                    status: req.status,
+                },
+            )?;
+        }
+
+        self.persist(&book)?;
+
+        let mut warnings: Vec<Option<String>> = Vec::with_capacity(node_ids.len());
+        for (i, id) in node_ids.iter().enumerate() {
+            let before_json = before_jsons[i].clone();
+            let id = *id;
+            let warning = self.append_changelog(|| {
+                let after_json = book
+                    .get_node(id)
+                    .and_then(|n| serde_json::to_string(n).ok());
+                ChangeEntry::new(
+                    id,
+                    ChangeAction::Update,
+                    before_json,
+                    after_json,
+                    Timestamp::now(),
+                )
+            });
+            warnings.push(warning);
+        }
+
+        Ok((node_ids.len(), warnings))
+    }
+
     /// Tree全体または部分木を読み取る。
     pub fn read_tree(&self) -> Result<TemplateBook, AppError> {
         self.load_book()
@@ -444,6 +544,196 @@ mod tests {
         // NodeStatus は domain 層でテスト済みだが、service 経由で参照できることを確認
         let _ = NodeStatus::Draft;
         let _ = NodeStatus::Active;
+    }
+
+    // ---- batch_move tests ----
+
+    #[test]
+    fn test_batch_move_empty_succeeds() {
+        let book = TemplateBook::new("Test", 4);
+        let repo = InMemoryBookRepo::with_book(book);
+        let svc = BookService::new(repo);
+        let (count, warnings) = svc.batch_move(vec![]).expect("batch_move empty");
+        assert_eq!(count, 0);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_batch_move_single_node() {
+        let book = TemplateBook::new("Test", 4);
+        let repo = InMemoryBookRepo::with_book(book);
+        let svc = BookService::new(repo);
+
+        let (id_a, _) = svc.add_node(add_req("Node A")).expect("add_node A");
+        let (id_b, _) = svc.add_node(add_req("Node B")).expect("add_node B");
+
+        // Move A under B at position 0
+        let (count, warnings) = svc
+            .batch_move(vec![(id_a, Some(id_b), 0)])
+            .expect("batch_move");
+        assert_eq!(count, 1);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn test_batch_move_invalid_node_returns_error_no_save() {
+        let book = TemplateBook::new("Test", 4);
+        let repo = InMemoryBookRepo::with_book(book);
+        let svc = BookService::new(repo);
+
+        let (id_a, _) = svc.add_node(add_req("Node A")).expect("add_node A");
+
+        // fake NodeId that doesn't exist
+        let fake_id: NodeId = serde_json::from_value(serde_json::Value::String(
+            "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+        ))
+        .expect("parse fake id");
+
+        // Attempt to move A and then a nonexistent node — should fail
+        let result = svc.batch_move(vec![(id_a, None, 0), (fake_id, None, 0)]);
+        assert!(result.is_err(), "batch_move with invalid node should fail");
+    }
+
+    #[test]
+    fn test_batch_move_changelog_records_entries() {
+        let book = TemplateBook::new("Test", 4);
+        let repo = InMemoryBookRepo::with_book(book);
+        let cl = RecordingChangeLog::new();
+        let svc = BookService::new(repo).with_changelog(Box::new(cl));
+
+        let (id_a, _) = svc.add_node(add_req("Node A")).expect("add_node A");
+        let (id_b, _) = svc.add_node(add_req("Node B")).expect("add_node B");
+
+        let (count, _warnings) = svc
+            .batch_move(vec![(id_a, Some(id_b), 0)])
+            .expect("batch_move");
+        assert_eq!(count, 1);
+        // No warning expected for successful changelog
+    }
+
+    // ---- batch_update tests ----
+
+    #[test]
+    fn test_batch_update_empty_succeeds() {
+        let book = TemplateBook::new("Test", 4);
+        let repo = InMemoryBookRepo::with_book(book);
+        let svc = BookService::new(repo);
+        let (count, warnings) = svc.batch_update(vec![]).expect("batch_update empty");
+        assert_eq!(count, 0);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_batch_update_single_node_title() {
+        let book = TemplateBook::new("Test", 4);
+        let repo = InMemoryBookRepo::with_book(book);
+        let svc = BookService::new(repo);
+
+        let (id, _) = svc.add_node(add_req("Original")).expect("add_node");
+
+        let req = UpdateNodeRequest {
+            title: Some("Updated".to_string()),
+            body: None,
+            node_type: None,
+            placeholder: None,
+            properties: None,
+            status: None,
+        };
+        let (count, warnings) = svc.batch_update(vec![(id, req)]).expect("batch_update");
+        assert_eq!(count, 1);
+        assert_eq!(warnings.len(), 1);
+
+        let tree = svc.read_tree().expect("read_tree");
+        assert_eq!(tree.get_node(id).map(|n| n.title()), Some("Updated"));
+    }
+
+    #[test]
+    fn test_batch_update_multiple_nodes() {
+        let book = TemplateBook::new("Test", 4);
+        let repo = InMemoryBookRepo::with_book(book);
+        let svc = BookService::new(repo);
+
+        let (id_a, _) = svc.add_node(add_req("Alpha")).expect("add_node A");
+        let (id_b, _) = svc.add_node(add_req("Beta")).expect("add_node B");
+
+        let updates = vec![
+            (
+                id_a,
+                UpdateNodeRequest {
+                    title: Some("Alpha Updated".to_string()),
+                    body: None,
+                    node_type: None,
+                    placeholder: None,
+                    properties: None,
+                    status: None,
+                },
+            ),
+            (
+                id_b,
+                UpdateNodeRequest {
+                    title: Some("Beta Updated".to_string()),
+                    body: None,
+                    node_type: None,
+                    placeholder: None,
+                    properties: None,
+                    status: Some(NodeStatus::Draft),
+                },
+            ),
+        ];
+
+        let (count, warnings) = svc.batch_update(updates).expect("batch_update");
+        assert_eq!(count, 2);
+        assert_eq!(warnings.len(), 2);
+
+        let tree = svc.read_tree().expect("read_tree");
+        assert_eq!(
+            tree.get_node(id_a).map(|n| n.title()),
+            Some("Alpha Updated")
+        );
+        assert_eq!(tree.get_node(id_b).map(|n| n.title()), Some("Beta Updated"));
+    }
+
+    #[test]
+    fn test_batch_update_invalid_node_returns_error() {
+        let book = TemplateBook::new("Test", 4);
+        let repo = InMemoryBookRepo::with_book(book);
+        let svc = BookService::new(repo);
+
+        let (id_a, _) = svc.add_node(add_req("Node A")).expect("add_node A");
+
+        let fake_id: NodeId = serde_json::from_value(serde_json::Value::String(
+            "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+        ))
+        .expect("parse fake id");
+
+        let result = svc.batch_update(vec![
+            (
+                id_a,
+                UpdateNodeRequest {
+                    title: Some("A Updated".to_string()),
+                    body: None,
+                    node_type: None,
+                    placeholder: None,
+                    properties: None,
+                    status: None,
+                },
+            ),
+            (
+                fake_id,
+                UpdateNodeRequest {
+                    title: Some("Fake".to_string()),
+                    body: None,
+                    node_type: None,
+                    placeholder: None,
+                    properties: None,
+                    status: None,
+                },
+            ),
+        ]);
+        assert!(
+            result.is_err(),
+            "batch_update with invalid node should fail"
+        );
     }
 
     #[test]
