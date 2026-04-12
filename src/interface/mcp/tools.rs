@@ -10,12 +10,12 @@ use crate::application::eject::{EjectConfig, EjectFormat, EjectService, EjectTre
 
 use super::helpers::{build_hierarchical_ids, find_hierarchical_id, format_toc};
 use super::request::{
-    normalize_text, parse_node_status, parse_node_type, sanitize_for_filename, unescape_newlines,
-    validate_filename, validate_import_path, validate_slug, McpDumpRequest, McpEjectRequest,
-    McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpNodeCreateRequest,
-    McpNodeHistoryRequest, McpNodeMoveRequest, McpNodeUpdateRequest, McpSelectBookRequest,
-    McpShelfRequest, McpSnapshotCreateRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest,
-    McpTocRequest,
+    normalize_text, parse_node_id, parse_node_status, parse_node_type, sanitize_for_filename,
+    unescape_newlines, validate_filename, validate_import_path, validate_slug, McpBatchMoveRequest,
+    McpBatchUpdateRequest, McpDumpRequest, McpEjectRequest, McpGenRoutingRequest, McpImportRequest,
+    McpInitRequest, McpNodeCreateRequest, McpNodeHistoryRequest, McpNodeMoveRequest,
+    McpNodeUpdateRequest, McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest,
+    McpSnapshotListRequest, McpSnapshotRestoreRequest, McpTocRequest,
 };
 use super::OutlineMcpServer;
 
@@ -964,6 +964,173 @@ impl OutlineMcpServer {
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             format!("Book dumped to: {}", path.display()),
+        )]))
+    }
+
+    /// UUID文字列をNodeIdに解決する。フルUUIDまたは短縮プレフィックスを受け付ける。
+    /// 階層番号やタイトル一致は受け付けない（バッチ操作のtoc IDズレ問題回避）。
+    fn resolve_uuid(&self, s: &str) -> Result<crate::domain::model::id::NodeId, McpError> {
+        // 1. Full UUID
+        if let Ok(id) = parse_node_id(s) {
+            return Ok(id);
+        }
+        // 2. Short prefix in current book
+        let svc = self.service()?;
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+        let matches: Vec<crate::domain::model::id::NodeId> = book
+            .all_node_ids()
+            .filter(|id| id.to_string().starts_with(s))
+            .collect();
+        match matches.len() {
+            1 => Ok(matches[0]),
+            0 => Err(McpError::invalid_params(
+                format!("No node with UUID starting with '{s}'"),
+                None,
+            )),
+            n => Err(McpError::invalid_params(
+                format!("Ambiguous UUID prefix '{s}' matches {n} nodes"),
+                None,
+            )),
+        }
+    }
+
+    #[tool(
+        name = "node_batch_move",
+        description = "Move multiple nodes in a single atomic operation. All nodes must be specified by UUID (not toc ID). Use `node_query` or `dump` to find UUIDs. All moves succeed or none are saved.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn node_batch_move(
+        &self,
+        Parameters(req): Parameters<McpBatchMoveRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let total = req.moves.len();
+
+        // Resolve all UUIDs first, reporting the first failure with its index
+        let mut resolved: Vec<(
+            crate::domain::model::id::NodeId,
+            Option<crate::domain::model::id::NodeId>,
+            usize,
+        )> = Vec::with_capacity(total);
+
+        for (i, item) in req.moves.iter().enumerate() {
+            let id = self.resolve_uuid(&item.node_id).map_err(|e| {
+                McpError::invalid_params(
+                    format!(
+                        "Batch move failed at operation {}/{total} (node {}): {e}. No changes saved.",
+                        i + 1,
+                        item.node_id
+                    ),
+                    None,
+                )
+            })?;
+            let new_parent = item
+                .new_parent
+                .as_deref()
+                .map(|s| self.resolve_uuid(s))
+                .transpose()
+                .map_err(|e| {
+                    McpError::invalid_params(
+                        format!(
+                            "Batch move failed at operation {}/{total} (node {}): parent UUID: {e}. No changes saved.",
+                            i + 1,
+                            item.node_id
+                        ),
+                        None,
+                    )
+                })?;
+            let position = item.position.unwrap_or(usize::MAX);
+            resolved.push((id, new_parent, position));
+        }
+
+        let svc = self.service()?;
+        let (count, warnings) = svc.batch_move(resolved).map_err(|e| {
+            McpError::internal_error(format!("Batch move failed: {e}. No changes saved."), None)
+        })?;
+
+        let mut msg = format!("Batch move complete: {count}/{total} operations succeeded.");
+        for w in warnings.into_iter().flatten() {
+            msg.push_str(&format!("\n[WARNING] {w}"));
+        }
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            msg,
+        )]))
+    }
+
+    #[tool(
+        name = "node_batch_update",
+        description = "Update multiple nodes' properties, status, title, or body in a single atomic operation. All nodes must be specified by UUID.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn node_batch_update(
+        &self,
+        Parameters(req): Parameters<McpBatchUpdateRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let total = req.updates.len();
+
+        // Resolve all UUIDs first
+        let mut resolved: Vec<(
+            crate::domain::model::id::NodeId,
+            crate::domain::model::book::UpdateNodeRequest,
+        )> = Vec::with_capacity(total);
+
+        for (i, item) in req.updates.iter().enumerate() {
+            let id = self.resolve_uuid(&item.node_id).map_err(|e| {
+                McpError::invalid_params(
+                    format!(
+                        "Batch update failed at operation {}/{total} (node {}): {e}. No changes saved.",
+                        i + 1,
+                        item.node_id
+                    ),
+                    None,
+                )
+            })?;
+            let status = item
+                .status
+                .as_deref()
+                .map(parse_node_status)
+                .transpose()
+                .map_err(|e| {
+                    McpError::invalid_params(
+                        format!(
+                            "Batch update failed at operation {}/{total} (node {}): {e}. No changes saved.",
+                            i + 1,
+                            item.node_id
+                        ),
+                        None,
+                    )
+                })?;
+            let update_req = crate::domain::model::book::UpdateNodeRequest {
+                title: item.title.as_deref().map(unescape_newlines),
+                body: item.body.clone().map(|b| b.map(|s| unescape_newlines(&s))),
+                node_type: None,
+                placeholder: None,
+                properties: item.properties.clone(),
+                status,
+            };
+            resolved.push((id, update_req));
+        }
+
+        let svc = self.service()?;
+        let (count, warnings) = svc.batch_update(resolved).map_err(|e| {
+            McpError::internal_error(format!("Batch update failed: {e}. No changes saved."), None)
+        })?;
+
+        let mut msg = format!("Batch update complete: {count}/{total} operations succeeded.");
+        for w in warnings.into_iter().flatten() {
+            msg.push_str(&format!("\n[WARNING] {w}"));
+        }
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            msg,
         )]))
     }
 }
