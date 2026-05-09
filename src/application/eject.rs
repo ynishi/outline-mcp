@@ -255,13 +255,13 @@ impl EjectService {
         if let Some(body) = node.body() {
             for line in body.lines() {
                 let converted = Self::list_to_checkbox(line);
-                buf.push_str(&format!("{}  {}\n", indent, converted));
+                buf.push_str(&format!("{indent}  {converted}\n"));
             }
         }
 
         if include_placeholders {
             if let Some(ph) = node.placeholder() {
-                buf.push_str(&format!("{}  > {}: ___\n", indent, ph));
+                buf.push_str(&format!("{indent}  > {ph}: ___\n"));
             }
         }
 

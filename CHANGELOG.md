@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- Fix `uninlined_format_args` Clippy lint in `EjectService::render_node` (`src/application/eject.rs`): inline `indent`/`converted`/`ph` variables into format strings (no behavior change)
+
 ## [0.6.0] - 2026-04-12
 
 ### Added
