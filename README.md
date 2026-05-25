@@ -12,12 +12,32 @@ cargo install --path .
 
 ### Claude Code (`~/.claude.json`)
 
+#### Native binary (after `cargo install`)
+
 ```json
 {
   "mcpServers": {
     "outline": {
       "command": "outline-mcp",
       "args": ["/path/to/your-book.json"]
+    }
+  }
+}
+```
+
+#### Docker (no Rust toolchain required)
+
+```json
+{
+  "mcpServers": {
+    "outline": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "/path/to/data:/data",
+        "ghcr.io/ynishi/outline-mcp:latest",
+        "/data/your-book.json"
+      ]
     }
   }
 }
