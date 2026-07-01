@@ -7,6 +7,7 @@
 
 mod helpers;
 mod request;
+mod resources;
 mod tools;
 
 use std::path::PathBuf;
@@ -15,8 +16,9 @@ use std::sync::{Arc, RwLock};
 use rmcp::{
     handler::server::{tool::ToolCallContext, tool::ToolRouter},
     model::{
-        CallToolRequestParams, CallToolResult, Implementation, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResult, Implementation, ListResourcesResult,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+        ReadResourceResult, ServerCapabilities, ServerInfo,
     },
     service::{RequestContext, RoleServer},
     transport::stdio,
@@ -235,7 +237,10 @@ impl ServerHandler for OutlineMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2025_03_26,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
             server_info: Implementation {
                 name: "outline-mcp".to_string(),
                 title: Some("Outline MCP — Tree-Structured Knowledge Base".to_string()),
@@ -263,7 +268,8 @@ impl ServerHandler for OutlineMcpServer {
                  History: `snapshot_create`/`snapshot_list`/`snapshot_restore` for versioning. \
                  `node_history` for change tracking. `dump` for full export.\n\
                  Batch: `node_batch_move`/`node_batch_update` for bulk operations (UUID required). \
-                 Query: `node_query` for searching nodes by properties/status/type."
+                 Query: `node_query` for searching nodes by properties/status/type.\n\
+                 Resources: read guides via `outline://guides/<name>` (see `resources/list`)."
                     .to_string(),
             ),
         }
@@ -288,6 +294,30 @@ impl ServerHandler for OutlineMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let tool_ctx = ToolCallContext::new(self, request, context);
         self.tool_router.call(tool_ctx).await
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(resources::list_all())
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        resources::read(&request.uri).ok_or_else(|| {
+            McpError::invalid_params(
+                format!(
+                    "Unknown resource: '{}'. Use `resources/list` to see available URIs.",
+                    request.uri
+                ),
+                None,
+            )
+        })
     }
 }
 
