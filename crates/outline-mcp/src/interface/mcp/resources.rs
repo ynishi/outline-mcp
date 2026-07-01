@@ -23,7 +23,7 @@ const GUIDES: &[Guide] = &[Guide {
     name: "snapshot-workflow",
     title: "Snapshot Workflow — Versioning a Book",
     description: "How to version a book with snapshot_create / snapshot_tag / snapshot_diff / snapshot_dump / snapshot_dump_all, and how to see raw edit history with book_history.",
-    body: include_str!("../../../../../docs/guides/snapshot-workflow.md"),
+    body: include_str!("../../../docs/guides/snapshot-workflow.md"),
 }];
 
 /// Return the list of bundled guide resources.

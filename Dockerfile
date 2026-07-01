@@ -4,7 +4,6 @@ FROM rust:1.88-slim-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY docs ./docs
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim

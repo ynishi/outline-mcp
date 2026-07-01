@@ -16,6 +16,12 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
+## [0.8.1] - 2026-07-01
+
+### Fixed
+
+- **Publish tarball path resolution**: relocate `docs/guides/` from repo root into `crates/outline-mcp/docs/guides/` so the `include_str!` inside `resources.rs` resolves inside the published crate tarball. Previously `cargo publish -p outline-mcp` failed at the verify step because the workspace-root `docs/` directory was not part of the bin crate's package. Docker build simplified accordingly (`COPY docs ./docs` removed; `docs/` is now included via `COPY crates ./crates`).
+
 ## [0.8.0] - 2026-07-01
 
 ### Added
