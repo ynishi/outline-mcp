@@ -6,7 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`outline-mcp-core` SDK crate**: new `rmcp`-independent library crate exposing `domain` / `application` / `infra` for embedding the Outline tree / snapshot / changelog logic in downstream applications. Root crate `#![warn(missing_docs)]` with crate-root ArchDoc narrative.
+
 ### Changed
+
+- **Workspace layout**: repository split into a Cargo workspace with two members — `crates/outline-mcp-core` (SDK) and `crates/outline-mcp` (binary). Common metadata and dependencies unified under `[workspace.package]` / `[workspace.dependencies]`. The `outline-mcp` binary crate name and CLI entry point are unchanged.
+- **Dockerfile**: build context copies `crates/` instead of `src/` to match the new layout.
 
 ### Deprecated
 
@@ -15,6 +20,10 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 ### Security
+
+### Breaking
+
+- Library consumers previously importing types via the `outline_mcp` crate (e.g. `use outline_mcp::domain::model::TemplateBook`) must switch to `outline_mcp_core` (`use outline_mcp_core::domain::model::TemplateBook`). The binary CLI, `outline-mcp` crate name on crates.io, and MCP transport surface are unaffected.
 
 ## [0.7.0] - 2026-07-01
 

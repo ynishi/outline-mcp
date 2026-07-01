@@ -105,19 +105,35 @@ node_create  title="My Rule"  properties={"inject": "true", "scope": "rust"}
 
 ## Architecture
 
+The repository is a Cargo workspace with two crates: an rmcp-independent SDK (`outline-mcp-core`) and the MCP server binary (`outline-mcp`).
+
 ```
-src/
-├── domain/          # Core model (TemplateBook, TemplateNode, NodeId)
-│   ├── model/       # Aggregate root + value objects
-│   ├── error.rs     # Domain errors
-│   └── repository.rs # BookRepository trait
-├── application/     # Use cases
-│   ├── service.rs   # BookService (CRUD)
-│   └── eject.rs     # EjectService (Markdown/JSON export & import)
-├── infra/           # Persistence
-│   └── json_store.rs # JSON file repository (atomic write)
-└── interface/       # Transport
-    └── mcp.rs       # MCP server (rmcp, stdio)
+crates/
+├── outline-mcp-core/     # SDK crate (library, no rmcp dependency)
+│   └── src/
+│       ├── domain/       # Core model (TemplateBook, TemplateNode, NodeId)
+│       │   ├── model/    # Aggregate root + value objects
+│       │   ├── error.rs  # Domain errors
+│       │   └── repository.rs # BookRepository trait
+│       ├── application/  # Use cases
+│       │   ├── service.rs # BookService (CRUD)
+│       │   └── eject.rs  # EjectService (Markdown/JSON export & import)
+│       └── infra/        # Persistence
+│           ├── json_store.rs # JSON file repository (atomic write)
+│           ├── changelog_store.rs
+│           └── snapshot.rs
+└── outline-mcp/          # Binary crate (MCP server, depends on outline-mcp-core)
+    └── src/
+        ├── main.rs       # Entry point
+        └── interface/
+            └── mcp/      # MCP handlers (rmcp, stdio)
+```
+
+Downstream applications that want to embed the tree / snapshot / changelog logic without pulling `rmcp` can depend on `outline-mcp-core` directly:
+
+```toml
+[dependencies]
+outline-mcp-core = "0.7"
 ```
 
 ## Export Formats
