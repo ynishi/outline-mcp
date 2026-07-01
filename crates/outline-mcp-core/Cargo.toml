@@ -1,0 +1,21 @@
+[package]
+name = "outline-mcp-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Domain, application, and infrastructure logic for outline-mcp (pure SDK crate, no MCP transport dependency)"
+keywords = ["mcp", "outline", "checklist", "tree"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
+proptest = "1"
+tempfile = "3"

@@ -488,16 +488,25 @@ name = "outline-mcp"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "insta",
- "proptest",
+ "outline-mcp-core",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
  "similar",
+ "tokio",
+]
+
+[[package]]
+name = "outline-mcp-core"
+version = "0.7.0"
+dependencies = [
+ "insta",
+ "proptest",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
- "tokio",
  "uuid",
 ]
 
