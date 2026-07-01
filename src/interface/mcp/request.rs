@@ -318,6 +318,18 @@ pub(super) struct McpNodeHistoryRequest {
     pub node_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub(super) struct McpBookHistoryRequest {
+    #[schemars(
+        description = "Maximum number of entries to return (newest first; default 50). Use 0 for all."
+    )]
+    pub limit: Option<usize>,
+    #[schemars(description = "Include only entries with timestamp >= since (millis). Optional.")]
+    pub since: Option<String>,
+    #[schemars(description = "Include only entries with timestamp <= until (millis). Optional.")]
+    pub until: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(super) struct McpDumpRequest {
     #[schemars(description = "Output directory path")]

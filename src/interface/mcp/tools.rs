@@ -15,9 +15,9 @@ use super::request::{
     McpBatchUpdateRequest, McpDumpRequest, McpEjectRequest, McpGenRoutingRequest, McpImportRequest,
     McpInitRequest, McpNodeCreateRequest, McpNodeHistoryRequest, McpNodeMoveRequest,
     McpNodeQueryRequest, McpNodeUpdateRequest, McpSelectBookRequest, McpShelfRequest,
-    McpSnapshotCreateRequest, McpSnapshotDiffRequest, McpSnapshotDumpAllRequest,
-    McpSnapshotDumpRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest,
-    McpSnapshotTagRequest, McpTocRequest,
+    McpBookHistoryRequest, McpSnapshotCreateRequest, McpSnapshotDiffRequest,
+    McpSnapshotDumpAllRequest, McpSnapshotDumpRequest, McpSnapshotListRequest,
+    McpSnapshotRestoreRequest, McpSnapshotTagRequest, McpTocRequest,
 };
 use super::OutlineMcpServer;
 
@@ -1281,6 +1281,138 @@ impl OutlineMcpServer {
     }
 
     #[tool(
+        name = "book_history",
+        description = "List the full edit history of the selected book (all nodes, chronological). Each entry shows action / node hierarchical id / title. Snapshot labels are cross-referenced when the entry's timestamp matches a snapshot. Use `since` / `until` (millis) to bound a range — e.g. pair with two snapshot timestamps from `snapshot_list` to see what changed between them.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn book_history(
+        &self,
+        Parameters(req): Parameters<McpBookHistoryRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let slug = {
+            let guard = self
+                .selected
+                .read()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                        None,
+                    )
+                })?
+                .clone()
+        };
+
+        let since = parse_optional_millis(req.since.as_deref(), "since")?;
+        let until = parse_optional_millis(req.until.as_deref(), "until")?;
+        if let (Some(s), Some(u)) = (since, until) {
+            if s > u {
+                return Err(McpError::invalid_params(
+                    format!("since ({s}) must be <= until ({u})"),
+                    None,
+                ));
+            }
+        }
+        let limit = req.limit.unwrap_or(50);
+
+        let svc = self.service()?;
+        let book = svc.read_tree().map_err(Self::to_mcp_error)?;
+
+        let cl_repo = JsonChangeLogRepository::new(&self.shelf_dir, &slug);
+        let mut entries = crate::domain::repository::ChangeLogRepository::load_all(&cl_repo)
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to load history: {e}"), None)
+            })?;
+
+        // 時系列降順 (最新が先頭) — 後で range 絞り + limit
+        entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
+
+        if let Some(s) = since {
+            entries.retain(|e| e.timestamp.as_millis() >= s);
+        }
+        if let Some(u) = until {
+            entries.retain(|e| e.timestamp.as_millis() <= u);
+        }
+
+        let total_in_range = entries.len();
+        if limit > 0 && entries.len() > limit {
+            entries.truncate(limit);
+        }
+
+        // snapshot label cross-ref
+        let snap_infos = SnapshotService::list(&self.shelf_dir, &slug).unwrap_or_default();
+        let snap_label_by_millis: HashMap<i64, String> = snap_infos
+            .iter()
+            .filter_map(|i| {
+                i.label
+                    .as_ref()
+                    .map(|l| (i.timestamp.as_millis(), l.clone()))
+            })
+            .collect();
+
+        if entries.is_empty() {
+            return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                format!("No history for \"{}\" in the requested range.", book.title()),
+            )]));
+        }
+
+        let showing_note = if limit > 0 && total_in_range > limit {
+            format!(
+                " (showing newest {} of {} in range)",
+                entries.len(),
+                total_in_range
+            )
+        } else {
+            format!(" ({} entries)", entries.len())
+        };
+
+        let mut output = format!(
+            "# History for \"{}\"{}\n\n",
+            book.title(),
+            showing_note
+        );
+
+        for (i, entry) in entries.iter().enumerate() {
+            let action_str = match entry.action {
+                ChangeAction::Create => "create",
+                ChangeAction::Update => "update",
+                ChangeAction::Delete => "delete",
+                ChangeAction::Move => "move",
+                ChangeAction::Restore => "restore",
+            };
+            let hier = find_hierarchical_id(&book, entry.node_id)
+                .unwrap_or_else(|| entry.node_id.short().to_string());
+            let title = book
+                .get_node(entry.node_id)
+                .map(|n| n.title().to_string())
+                .unwrap_or_else(|| "(deleted)".to_string());
+            let label_note = snap_label_by_millis
+                .get(&entry.timestamp.as_millis())
+                .map(|l| format!(" [snapshot: {l}]"))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "{}. [{}] {} node={} title=\"{}\"{}\n",
+                i + 1,
+                entry.timestamp.to_iso8601(),
+                action_str,
+                hier,
+                title,
+                label_note
+            ));
+        }
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            output,
+        )]))
+    }
+
+    #[tool(
         name = "dump",
         description = "Export the entire selected book to a file. Unlike `checklist`, this always exports the full book (no subtree). Supports markdown (default) and json formats.",
         annotations(
@@ -1638,6 +1770,19 @@ fn validate_snapshot_label(raw: &str) -> Result<String, McpError> {
 }
 
 
+/// optional millis 文字列を i64 に parse する。None は None を返す。
+fn parse_optional_millis(s: Option<&str>, field: &str) -> Result<Option<i64>, McpError> {
+    match s {
+        None => Ok(None),
+        Some(v) => v.parse::<i64>().map(Some).map_err(|_| {
+            McpError::invalid_params(
+                format!("Invalid {field}: '{v}'. Must be a millis integer."),
+                None,
+            )
+        }),
+    }
+}
+
 /// diff header の名前部分を決める。label があれば label、なければ timestamp 文字列。
 fn diff_header_name(label: Option<&str>, millis: i64) -> String {
     match label {
@@ -1757,6 +1902,16 @@ mod dump_helpers_tests {
         let res = prepare_dump_dir(&dir, false);
         assert!(res.is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_optional_millis_handles_none_some_bad() {
+        assert!(matches!(parse_optional_millis(None, "since"), Ok(None)));
+        assert!(matches!(
+            parse_optional_millis(Some("1782885148593"), "since"),
+            Ok(Some(1782885148593))
+        ));
+        assert!(parse_optional_millis(Some("abc"), "since").is_err());
     }
 
     #[test]
