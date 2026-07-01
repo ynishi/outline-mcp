@@ -18,6 +18,7 @@ rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }
 schemars = "1.2"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+similar = "2"
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }

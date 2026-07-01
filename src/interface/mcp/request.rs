@@ -251,8 +251,35 @@ pub(super) struct McpShelfRequest {}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(super) struct McpGenRoutingRequest {}
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub(super) struct McpSnapshotCreateRequest {
+    #[schemars(
+        description = "Optional label (max 64 chars; letters/digits/spaces/'-_.:,()' only). Stored in a sidecar '.meta.json'; snapshot body is unchanged."
+    )]
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpSnapshotCreateRequest {}
+pub(super) struct McpSnapshotDiffRequest {
+    #[schemars(description = "Older snapshot timestamp (millis). Must be strictly less than to_ts.")]
+    pub from_ts: String,
+    #[schemars(description = "Newer snapshot timestamp (millis). Must be strictly greater than from_ts.")]
+    pub to_ts: String,
+    #[schemars(
+        description = "Unified diff context lines around each change (default: 3)"
+    )]
+    pub context_lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpSnapshotTagRequest {
+    #[schemars(description = "Timestamp (millis) from snapshot_list output")]
+    pub timestamp: String,
+    #[schemars(
+        description = "Label to attach (max 64 chars; letters/digits/spaces/'-_.:,()' only). Overwrites existing label if any."
+    )]
+    pub label: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(super) struct McpSnapshotListRequest {}
@@ -261,6 +288,28 @@ pub(super) struct McpSnapshotListRequest {}
 pub(super) struct McpSnapshotRestoreRequest {
     #[schemars(description = "Timestamp (millis) from snapshot_list output")]
     pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpSnapshotDumpRequest {
+    #[schemars(description = "Timestamp (millis) from snapshot_list output")]
+    pub timestamp: String,
+    #[schemars(description = "Output directory path")]
+    pub output_dir: String,
+    #[schemars(description = "Output format: 'markdown' (default) or 'json'")]
+    pub format: Option<String>,
+    #[schemars(description = "Overwrite existing subdirectory if present (default: false)")]
+    pub overwrite: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(super) struct McpSnapshotDumpAllRequest {
+    #[schemars(description = "Output directory path (subdirs 'v01_<millis>' .. 'vNN_<millis>' will be created inside; 01 = oldest)")]
+    pub output_dir: String,
+    #[schemars(description = "Output format: 'markdown' (default) or 'json'")]
+    pub format: Option<String>,
+    #[schemars(description = "Overwrite existing subdirectories if present (default: false)")]
+    pub overwrite: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

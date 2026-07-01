@@ -15,7 +15,9 @@ use super::request::{
     McpBatchUpdateRequest, McpDumpRequest, McpEjectRequest, McpGenRoutingRequest, McpImportRequest,
     McpInitRequest, McpNodeCreateRequest, McpNodeHistoryRequest, McpNodeMoveRequest,
     McpNodeQueryRequest, McpNodeUpdateRequest, McpSelectBookRequest, McpShelfRequest,
-    McpSnapshotCreateRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest, McpTocRequest,
+    McpSnapshotCreateRequest, McpSnapshotDiffRequest, McpSnapshotDumpAllRequest,
+    McpSnapshotDumpRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest,
+    McpSnapshotTagRequest, McpTocRequest,
 };
 use super::OutlineMcpServer;
 
@@ -641,7 +643,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "snapshot_create",
-        description = "Create a snapshot of the current book state. Use `snapshot_list` to view saved snapshots and `snapshot_restore` to revert.",
+        description = "Create a snapshot of the current book state. Optionally attach a label (sidecar '.meta.json'; snapshot body schema is unchanged). Use `snapshot_list` to view saved snapshots and `snapshot_restore` to revert.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -651,7 +653,7 @@ impl OutlineMcpServer {
     )]
     async fn snapshot_create(
         &self,
-        #[allow(unused_variables)] Parameters(_req): Parameters<McpSnapshotCreateRequest>,
+        Parameters(req): Parameters<McpSnapshotCreateRequest>,
     ) -> Result<CallToolResult, McpError> {
         let svc = self.service()?;
         let book = svc.read_tree().map_err(Self::to_mcp_error)?;
@@ -672,9 +674,15 @@ impl OutlineMcpServer {
                 .clone()
         };
 
-        let path = SnapshotService::create(&self.shelf_dir, &slug, &book).map_err(|e| {
-            McpError::internal_error(format!("Failed to create snapshot: {e}"), None)
-        })?;
+        let label = match req.label.as_deref() {
+            Some(s) => Some(validate_snapshot_label(s)?),
+            None => None,
+        };
+
+        let path = SnapshotService::create(&self.shelf_dir, &slug, &book, label.as_deref())
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to create snapshot: {e}"), None)
+            })?;
 
         let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
@@ -682,8 +690,16 @@ impl OutlineMcpServer {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let millis_str = stem.rsplit('.').next().unwrap_or("");
 
+        let label_note = label
+            .as_deref()
+            .map(|l| format!(" [label: {l}]"))
+            .unwrap_or_default();
+
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            format!("Snapshot created: {} ({} bytes)", millis_str, size_bytes),
+            format!(
+                "Snapshot created: {} ({} bytes){}",
+                millis_str, size_bytes, label_note
+            ),
         )]))
     }
 
@@ -736,12 +752,18 @@ impl OutlineMcpServer {
         );
         for (i, info) in infos.iter().enumerate() {
             let size_kb = info.size_bytes as f64 / 1024.0;
+            let label_note = info
+                .label
+                .as_deref()
+                .map(|l| format!(" [{}]", l))
+                .unwrap_or_default();
             output.push_str(&format!(
-                "{}. {} — {} ({:.1} KB)\n",
+                "{}. {} — {} ({:.1} KB){}\n",
                 i + 1,
                 info.timestamp.to_iso8601(),
                 info.timestamp.as_millis(),
-                size_kb
+                size_kb,
+                label_note
             ));
         }
 
@@ -826,6 +848,353 @@ impl OutlineMcpServer {
     }
 
     #[tool(
+        name = "snapshot_tag",
+        description = "Attach or overwrite a label on an existing snapshot. Writes only the sidecar '.meta.json'; the snapshot body is not touched. Use `snapshot_list` to find timestamps.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn snapshot_tag(
+        &self,
+        Parameters(req): Parameters<McpSnapshotTagRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let millis: i64 = req.timestamp.parse().map_err(|_| {
+            McpError::invalid_params(
+                format!(
+                    "Invalid timestamp: '{}'. Must be a millis integer.",
+                    req.timestamp
+                ),
+                None,
+            )
+        })?;
+
+        let label = validate_snapshot_label(&req.label)?;
+
+        let slug = {
+            let guard = self
+                .selected
+                .read()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                        None,
+                    )
+                })?
+                .clone()
+        };
+
+        let meta_path =
+            SnapshotService::tag(&self.shelf_dir, &slug, millis, &label).map_err(|e| {
+                McpError::internal_error(format!("Failed to tag snapshot: {e}"), None)
+            })?;
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            format!(
+                "Snapshot {} tagged as '{}' (meta: {})",
+                millis,
+                label,
+                meta_path.display()
+            ),
+        )]))
+    }
+
+    #[tool(
+        name = "snapshot_diff",
+        description = "Unified diff between two snapshots (from_ts must be strictly less than to_ts). Both snapshots are rendered as Markdown and compared with the `similar` crate. Response is a JSON object with 'from' / 'to' metadata (timestamp / label / iso) and a unified-diff 'diff' string; the diff header uses the label when present, otherwise the timestamp.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn snapshot_diff(
+        &self,
+        Parameters(req): Parameters<McpSnapshotDiffRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let from_ms: i64 = req.from_ts.parse().map_err(|_| {
+            McpError::invalid_params(
+                format!("Invalid from_ts: '{}'. Must be a millis integer.", req.from_ts),
+                None,
+            )
+        })?;
+        let to_ms: i64 = req.to_ts.parse().map_err(|_| {
+            McpError::invalid_params(
+                format!("Invalid to_ts: '{}'. Must be a millis integer.", req.to_ts),
+                None,
+            )
+        })?;
+        if from_ms >= to_ms {
+            return Err(McpError::invalid_params(
+                format!(
+                    "from_ts ({from_ms}) must be strictly less than to_ts ({to_ms})"
+                ),
+                None,
+            ));
+        }
+        let context_lines = req.context_lines.unwrap_or(3);
+
+        let slug = {
+            let guard = self
+                .selected
+                .read()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                        None,
+                    )
+                })?
+                .clone()
+        };
+
+        // 両 snapshot の meta (label) を取りに行くために list を舐める
+        let infos = SnapshotService::list(&self.shelf_dir, &slug).map_err(|e| {
+            McpError::internal_error(format!("Failed to list snapshots: {e}"), None)
+        })?;
+        let find_label = |ms: i64| -> Option<String> {
+            infos
+                .iter()
+                .find(|i| i.timestamp.as_millis() == ms)
+                .and_then(|i| i.label.clone())
+        };
+
+        let from_book = SnapshotService::restore(&self.shelf_dir, &slug, from_ms).map_err(|e| {
+            McpError::internal_error(format!("Failed to load from snapshot: {e}"), None)
+        })?;
+        let to_book = SnapshotService::restore(&self.shelf_dir, &slug, to_ms).map_err(|e| {
+            McpError::internal_error(format!("Failed to load to snapshot: {e}"), None)
+        })?;
+
+        let from_md = EjectService::render_markdown(&from_book, true, None);
+        let to_md = EjectService::render_markdown(&to_book, true, None);
+
+        let from_ts = Timestamp::from_millis(from_ms);
+        let to_ts = Timestamp::from_millis(to_ms);
+        let from_label = find_label(from_ms);
+        let to_label = find_label(to_ms);
+        let from_header = diff_header_name(from_label.as_deref(), from_ms);
+        let to_header = diff_header_name(to_label.as_deref(), to_ms);
+
+        let diff = similar::TextDiff::from_lines(&from_md, &to_md);
+        let mut diff_out = String::new();
+        diff_out.push_str(&format!(
+            "--- {} ({} / {})\n",
+            from_header,
+            from_ms,
+            from_ts.to_iso8601()
+        ));
+        diff_out.push_str(&format!(
+            "+++ {} ({} / {})\n",
+            to_header,
+            to_ms,
+            to_ts.to_iso8601()
+        ));
+        for hunk in diff.unified_diff().context_radius(context_lines).iter_hunks() {
+            diff_out.push_str(&hunk.to_string());
+        }
+
+        let response = serde_json::json!({
+            "from": {
+                "timestamp": from_ms,
+                "label": from_label,
+                "iso": from_ts.to_iso8601(),
+            },
+            "to": {
+                "timestamp": to_ms,
+                "label": to_label,
+                "iso": to_ts.to_iso8601(),
+            },
+            "diff": diff_out,
+        });
+
+        let text = serde_json::to_string_pretty(&response).map_err(|e| {
+            McpError::internal_error(format!("Failed to serialize diff response: {e}"), None)
+        })?;
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            text,
+        )]))
+    }
+
+    #[tool(
+        name = "snapshot_dump",
+        description = "Dump a single snapshot to a subdirectory as 'book.md' (or 'book.json'). The live book on the shelf is NOT touched. After running, use `Bash(diff -u <dir1>/book.md <dir2>/book.md)` for unified diff between snapshots.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn snapshot_dump(
+        &self,
+        Parameters(req): Parameters<McpSnapshotDumpRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let millis: i64 = req.timestamp.parse().map_err(|_| {
+            McpError::invalid_params(
+                format!(
+                    "Invalid timestamp: '{}'. Must be a millis integer.",
+                    req.timestamp
+                ),
+                None,
+            )
+        })?;
+
+        let slug = {
+            let guard = self
+                .selected
+                .read()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                        None,
+                    )
+                })?
+                .clone()
+        };
+
+        let format = parse_dump_format(req.format.as_deref())?;
+        let overwrite = req.overwrite.unwrap_or(false);
+
+        // list を舐めて index を確定 (01 = 最古)
+        let mut infos = SnapshotService::list(&self.shelf_dir, &slug).map_err(|e| {
+            McpError::internal_error(format!("Failed to list snapshots: {e}"), None)
+        })?;
+        infos.reverse(); // 昇順 (最古が先頭)
+        let total = infos.len();
+        let (idx, info) = infos
+            .iter()
+            .enumerate()
+            .find(|(_, i)| i.timestamp.as_millis() == millis)
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("Snapshot not found for timestamp {millis}"),
+                    None,
+                )
+            })?;
+
+        let book = SnapshotService::restore(&self.shelf_dir, &slug, millis).map_err(|e| {
+            McpError::internal_error(format!("Failed to load snapshot: {e}"), None)
+        })?;
+
+        let root = PathBuf::from(&req.output_dir);
+        let subdir = subdir_name(idx + 1, total, info.timestamp.as_millis());
+        let out_dir = root.join(&subdir);
+        prepare_dump_dir(&out_dir, overwrite)?;
+
+        let filename = dump_filename(&format);
+        let config = EjectConfig {
+            output_dir: out_dir.clone(),
+            filename: filename.to_string(),
+            include_placeholders: true,
+            format,
+            subtree_root: None,
+        };
+        let path = EjectService::eject(&book, &config).map_err(Self::to_mcp_error)?;
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            format!("Snapshot dumped to: {}", path.display()),
+        )]))
+    }
+
+    #[tool(
+        name = "snapshot_dump_all",
+        description = "Dump every snapshot for the selected book into 'vNN_<millis>' subdirectories (01 = oldest). Each subdir contains 'book.md' (or 'book.json'). The live book on the shelf is NOT touched. After running, use `Bash(diff -u <dir>/v03_*/book.md <dir>/v04_*/book.md)` for unified diff between consecutive snapshots.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn snapshot_dump_all(
+        &self,
+        Parameters(req): Parameters<McpSnapshotDumpAllRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let slug = {
+            let guard = self
+                .selected
+                .read()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                        None,
+                    )
+                })?
+                .clone()
+        };
+
+        let format = parse_dump_format(req.format.as_deref())?;
+        let overwrite = req.overwrite.unwrap_or(false);
+
+        let mut infos = SnapshotService::list(&self.shelf_dir, &slug).map_err(|e| {
+            McpError::internal_error(format!("Failed to list snapshots: {e}"), None)
+        })?;
+        if infos.is_empty() {
+            return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                "No snapshots to dump.".to_string(),
+            )]));
+        }
+        infos.reverse(); // 01 = 最古
+
+        let root = PathBuf::from(&req.output_dir);
+        let total = infos.len();
+        let filename = dump_filename(&format);
+        let mut written: Vec<String> = Vec::with_capacity(total);
+
+        for (idx, info) in infos.iter().enumerate() {
+            let millis = info.timestamp.as_millis();
+            let book = SnapshotService::restore(&self.shelf_dir, &slug, millis).map_err(|e| {
+                McpError::internal_error(
+                    format!("Failed to load snapshot {millis}: {e}"),
+                    None,
+                )
+            })?;
+
+            let subdir = subdir_name(idx + 1, total, millis);
+            let out_dir = root.join(&subdir);
+            prepare_dump_dir(&out_dir, overwrite)?;
+
+            let config = EjectConfig {
+                output_dir: out_dir.clone(),
+                filename: filename.to_string(),
+                include_placeholders: true,
+                format: format.clone(),
+                subtree_root: None,
+            };
+            let path = EjectService::eject(&book, &config).map_err(Self::to_mcp_error)?;
+            written.push(path.display().to_string());
+        }
+
+        let mut output = format!(
+            "Dumped {} snapshots to: {}\n\n",
+            written.len(),
+            root.display()
+        );
+        for line in &written {
+            output.push_str(&format!("- {line}\n"));
+        }
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            output,
+        )]))
+    }
+
+    #[tool(
         name = "node_history",
         description = "Show the change history for a specific node. Returns entries in chronological order (oldest first).",
         annotations(
@@ -871,7 +1240,7 @@ impl OutlineMcpServer {
         .map_err(|e| McpError::internal_error(format!("Failed to load history: {e}"), None))?;
 
         // 時系列順（古い順）
-        entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        entries.sort_by_key(|a| a.timestamp);
 
         if entries.is_empty() {
             return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
@@ -1229,5 +1598,228 @@ impl OutlineMcpServer {
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             output,
         )]))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// snapshot label / dump helpers
+// ---------------------------------------------------------------------------
+
+/// snapshot label の validation。
+///
+/// - 空 / 前後空白のみは拒否
+/// - 64 文字上限
+/// - 許可文字: 英数字 / space / `-_.:,()`  (path traversal 防止 & filename 化しないので厳格すぎない範囲)
+/// - trim した form を返す
+fn validate_snapshot_label(raw: &str) -> Result<String, McpError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(McpError::invalid_params(
+            "label must not be empty or whitespace only",
+            None,
+        ));
+    }
+    if trimmed.chars().count() > 64 {
+        return Err(McpError::invalid_params(
+            "label must be 64 characters or fewer",
+            None,
+        ));
+    }
+    let ok = trimmed
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | ':' | ',' | '(' | ')'));
+    if !ok {
+        return Err(McpError::invalid_params(
+            "label may only contain letters, digits, spaces, and '-_.:,()'",
+            None,
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+
+/// diff header の名前部分を決める。label があれば label、なければ timestamp 文字列。
+fn diff_header_name(label: Option<&str>, millis: i64) -> String {
+    match label {
+        Some(l) if !l.is_empty() => l.to_string(),
+        _ => millis.to_string(),
+    }
+}
+
+fn parse_dump_format(s: Option<&str>) -> Result<EjectFormat, McpError> {
+    match s {
+        Some("json") => Ok(EjectFormat::Json),
+        Some("markdown") | None => Ok(EjectFormat::Markdown),
+        Some(other) => Err(McpError::invalid_params(
+            format!("Unknown format: '{other}'. Use: markdown, json"),
+            None,
+        )),
+    }
+}
+
+fn dump_filename(format: &EjectFormat) -> &'static str {
+    match format {
+        EjectFormat::Markdown => "book.md",
+        EjectFormat::Json => "book.json",
+    }
+}
+
+fn subdir_name(index: usize, total: usize, millis: i64) -> String {
+    let width = if total >= 100 { 3 } else { 2 };
+    format!("v{:0width$}_{}", index, millis, width = width)
+}
+
+fn prepare_dump_dir(dir: &std::path::Path, overwrite: bool) -> Result<(), McpError> {
+    if dir.exists() {
+        if !overwrite {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Output subdir already exists: {}. Pass overwrite=true to allow.",
+                    dir.display()
+                ),
+                None,
+            ));
+        }
+        std::fs::remove_dir_all(dir).map_err(|e| {
+            McpError::internal_error(
+                format!("Failed to remove existing dir {}: {}", dir.display(), e),
+                None,
+            )
+        })?;
+    }
+    std::fs::create_dir_all(dir).map_err(|e| {
+        McpError::internal_error(
+            format!("Failed to create dir {}: {}", dir.display(), e),
+            None,
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod dump_helpers_tests {
+    use super::*;
+
+    #[test]
+    fn subdir_name_pads_two_digits() {
+        assert_eq!(subdir_name(1, 5, 12345), "v01_12345");
+        assert_eq!(subdir_name(9, 12, 999), "v09_999");
+        assert_eq!(subdir_name(12, 12, 100), "v12_100");
+    }
+
+    #[test]
+    fn subdir_name_uses_three_digits_when_needed() {
+        assert_eq!(subdir_name(1, 150, 7), "v001_7");
+        assert_eq!(subdir_name(150, 150, 7), "v150_7");
+    }
+
+    #[test]
+    fn parse_dump_format_default_markdown() {
+        assert!(matches!(
+            parse_dump_format(None).unwrap(),
+            EjectFormat::Markdown
+        ));
+        assert!(matches!(
+            parse_dump_format(Some("markdown")).unwrap(),
+            EjectFormat::Markdown
+        ));
+        assert!(matches!(
+            parse_dump_format(Some("json")).unwrap(),
+            EjectFormat::Json
+        ));
+    }
+
+    #[test]
+    fn parse_dump_format_rejects_unknown() {
+        assert!(parse_dump_format(Some("yaml")).is_err());
+    }
+
+    #[test]
+    fn dump_filename_by_format() {
+        assert_eq!(dump_filename(&EjectFormat::Markdown), "book.md");
+        assert_eq!(dump_filename(&EjectFormat::Json), "book.json");
+    }
+
+    #[test]
+    fn prepare_dump_dir_creates_new() {
+        let dir = std::env::temp_dir().join("outline-mcp-dump-helper-new");
+        let _ = std::fs::remove_dir_all(&dir);
+        prepare_dump_dir(&dir, false).expect("create");
+        assert!(dir.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_dump_dir_errors_when_exists_without_overwrite() {
+        let dir = std::env::temp_dir().join("outline-mcp-dump-helper-existing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let res = prepare_dump_dir(&dir, false);
+        assert!(res.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_header_prefers_label() {
+        assert_eq!(diff_header_name(Some("v03_rating"), 12345), "v03_rating");
+    }
+
+    #[test]
+    fn diff_header_falls_back_to_millis_when_label_absent() {
+        assert_eq!(diff_header_name(None, 12345), "12345");
+    }
+
+    #[test]
+    fn diff_header_falls_back_to_millis_when_label_empty() {
+        assert_eq!(diff_header_name(Some(""), 999), "999");
+    }
+
+    #[test]
+    fn validate_label_accepts_normal_input() {
+        assert_eq!(
+            validate_snapshot_label(" rating-pass ").unwrap(),
+            "rating-pass"
+        );
+        assert_eq!(
+            validate_snapshot_label("v03 L3 sketch").unwrap(),
+            "v03 L3 sketch"
+        );
+        assert_eq!(
+            validate_snapshot_label("Milestone (1.0): draft").unwrap(),
+            "Milestone (1.0): draft"
+        );
+    }
+
+    #[test]
+    fn validate_label_rejects_empty() {
+        assert!(validate_snapshot_label("").is_err());
+        assert!(validate_snapshot_label("   ").is_err());
+    }
+
+    #[test]
+    fn validate_label_rejects_too_long() {
+        let long: String = "a".repeat(65);
+        assert!(validate_snapshot_label(&long).is_err());
+        let ok: String = "a".repeat(64);
+        assert!(validate_snapshot_label(&ok).is_ok());
+    }
+
+    #[test]
+    fn validate_label_rejects_disallowed_chars() {
+        assert!(validate_snapshot_label("bad/slash").is_err());
+        assert!(validate_snapshot_label("back\\slash").is_err());
+        assert!(validate_snapshot_label("nl\nne").is_err());
+    }
+
+    #[test]
+    fn prepare_dump_dir_overwrites_when_flag_set() {
+        let dir = std::env::temp_dir().join("outline-mcp-dump-helper-overwrite");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stale.txt"), "old").unwrap();
+        prepare_dump_dir(&dir, true).expect("overwrite");
+        assert!(dir.exists());
+        assert!(!dir.join("stale.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
