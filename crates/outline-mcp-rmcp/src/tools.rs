@@ -8,8 +8,8 @@ use rmcp::{
 
 use outline_mcp_core::application::eject::{EjectConfig, EjectFormat, EjectService, EjectTree};
 
-use super::helpers::{build_hierarchical_ids, find_hierarchical_id, format_toc};
-use super::request::{
+use crate::helpers::{build_hierarchical_ids, find_hierarchical_id, format_toc};
+use crate::request::{
     normalize_text, parse_node_id, parse_node_status, parse_node_type, sanitize_for_filename,
     unescape_newlines, validate_filename, validate_import_path, validate_slug, McpBatchMoveRequest,
     McpBatchUpdateRequest, McpBookHistoryRequest, McpDumpRequest, McpEjectRequest,
@@ -19,7 +19,7 @@ use super::request::{
     McpSnapshotDumpAllRequest, McpSnapshotDumpRequest, McpSnapshotListRequest,
     McpSnapshotRestoreRequest, McpSnapshotTagRequest, McpTocRequest,
 };
-use super::OutlineMcpServer;
+use crate::server::OutlineMcpServer;
 
 use outline_mcp_core::domain::model::book::AddNodeRequest;
 use outline_mcp_core::domain::model::book::UpdateNodeRequest;
@@ -28,7 +28,7 @@ use outline_mcp_core::domain::model::timestamp::Timestamp;
 use outline_mcp_core::infra::changelog_store::JsonChangeLogRepository;
 use outline_mcp_core::infra::snapshot::SnapshotService;
 
-#[tool_router(vis = "pub(super)")]
+#[tool_router(vis = "pub(crate)")]
 impl OutlineMcpServer {
     #[tool(
         name = "node_create",

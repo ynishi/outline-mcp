@@ -2,8 +2,8 @@
 //!
 //! Guides are baked into the binary at compile time via `include_str!`
 //! so that `outline://guides/<slug>` returns the exact markdown that
-//! ships with the crate. Sources live under `docs/guides/` at the
-//! workspace root.
+//! ships with the crate. Sources live under `docs/guides/` at this
+//! crate's root.
 
 use rmcp::model::{
     ListResourcesResult, RawResource, ReadResourceResult, Resource, ResourceContents,
@@ -23,11 +23,11 @@ const GUIDES: &[Guide] = &[Guide {
     name: "snapshot-workflow",
     title: "Snapshot Workflow — Versioning a Book",
     description: "How to version a book with snapshot_create / snapshot_tag / snapshot_diff / snapshot_dump / snapshot_dump_all, and how to see raw edit history with book_history.",
-    body: include_str!("../../../docs/guides/snapshot-workflow.md"),
+    body: include_str!("../docs/guides/snapshot-workflow.md"),
 }];
 
 /// Return the list of bundled guide resources.
-pub(super) fn list_all() -> ListResourcesResult {
+pub(crate) fn list_all() -> ListResourcesResult {
     use rmcp::model::Annotated;
     let resources: Vec<Resource> = GUIDES
         .iter()
@@ -53,7 +53,7 @@ pub(super) fn list_all() -> ListResourcesResult {
 }
 
 /// Read a guide by URI. Returns None if no bundled guide matches.
-pub(super) fn read(uri: &str) -> Option<ReadResourceResult> {
+pub(crate) fn read(uri: &str) -> Option<ReadResourceResult> {
     let guide = GUIDES.iter().find(|g| g.uri == uri)?;
     Some(ReadResourceResult {
         contents: vec![ResourceContents::TextResourceContents {

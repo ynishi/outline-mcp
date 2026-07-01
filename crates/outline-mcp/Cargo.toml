@@ -10,11 +10,6 @@ keywords = ["mcp", "outline", "checklist", "tree"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-outline-mcp-core = { path = "../outline-mcp-core", version = "0.8.1" }
-serde = { workspace = true }
-serde_json = { workspace = true }
+outline-mcp-rmcp = { path = "../outline-mcp-rmcp", version = "0.8.1" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-schemars = { workspace = true }
-rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }
-similar = "2"

@@ -3,7 +3,7 @@ use outline_mcp_core::domain::model::id::NodeId;
 use outline_mcp_core::domain::model::node::TemplateNode;
 
 /// Boolean property をタグ表示用に整形する。
-pub(super) fn format_property_tags(node: &TemplateNode) -> String {
+pub(crate) fn format_property_tags(node: &TemplateNode) -> String {
     let props = node.properties();
     if props.is_empty() {
         return String::new();
@@ -21,7 +21,7 @@ pub(super) fn format_property_tags(node: &TemplateNode) -> String {
 }
 
 /// Book の全ノードを TOC 形式にフォーマットする。
-pub(super) fn format_toc(book: &TemplateBook, nodes: &[&TemplateNode]) -> String {
+pub(crate) fn format_toc(book: &TemplateBook, nodes: &[&TemplateNode]) -> String {
     let id_map = build_hierarchical_ids(book);
     let mut output = format!("# {} ({} nodes)\n\n", book.title(), book.node_count());
     for node in nodes {
@@ -45,14 +45,14 @@ pub(super) fn format_toc(book: &TemplateBook, nodes: &[&TemplateNode]) -> String
 }
 
 /// 階層番号かどうか判定（`1`, `2-3`, `1-2-1` 等）
-pub(super) fn is_hierarchical_id(s: &str) -> bool {
+pub(crate) fn is_hierarchical_id(s: &str) -> bool {
     !s.is_empty()
         && s.split('-')
             .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Book全体の (階層番号, NodeId) マッピングをDFS順で構築する。
-pub(super) fn build_hierarchical_ids(book: &TemplateBook) -> Vec<(String, NodeId)> {
+pub(crate) fn build_hierarchical_ids(book: &TemplateBook) -> Vec<(String, NodeId)> {
     let mut result = Vec::new();
     for (i, &root_id) in book.root_nodes().iter().enumerate() {
         let num = format!("{}", i + 1);
@@ -78,7 +78,7 @@ fn collect_children_ids(
 }
 
 /// 指定NodeIdの階層番号を逆引きする。
-pub(super) fn find_hierarchical_id(book: &TemplateBook, target: NodeId) -> Option<String> {
+pub(crate) fn find_hierarchical_id(book: &TemplateBook, target: NodeId) -> Option<String> {
     build_hierarchical_ids(book)
         .into_iter()
         .find(|(_, id)| *id == target)

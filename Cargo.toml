@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/outline-mcp-core", "crates/outline-mcp"]
+members = ["crates/outline-mcp-core", "crates/outline-mcp-rmcp", "crates/outline-mcp"]
 
 [workspace.package]
 version = "0.8.1"

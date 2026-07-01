@@ -6,7 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`outline-mcp-rmcp` crate**: new library crate holding the rmcp (MCP) interface layer — `OutlineMcpServer` (`ServerHandler` impl), the 21 `#[tool]` handlers, MCP request DTOs, and bundled `outline://guides/*` resources. Consumers that want to embed the outline-mcp server directly (e.g. as part of a larger MCP host) can depend on `outline-mcp-rmcp` and construct `OutlineMcpServer` without going through the `outline-mcp` binary.
+
 ### Changed
+
+- **`outline-mcp` binary crate**: reduced to a thin entry point (~20 lines) that resolves the shelf directory from argv/env and calls `outline_mcp_rmcp::run`. The previous `interface::mcp` module (struct, tool_router, request/helpers/resources) moved to `outline-mcp-rmcp`. CLI arguments and the stdio JSON-RPC protocol are unchanged.
+- **`docs/guides/`**: relocated from `crates/outline-mcp/docs/guides/` to `crates/outline-mcp-rmcp/docs/guides/`, alongside the `resources.rs` module that bundles them via `include_str!`.
 
 ### Deprecated
 

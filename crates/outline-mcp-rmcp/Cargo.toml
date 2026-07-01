@@ -1,0 +1,19 @@
+[package]
+name = "outline-mcp-rmcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rmcp (MCP) interface layer for outline-mcp: ServerHandler, tool_router, and stdio transport wiring over outline-mcp-core"
+keywords = ["mcp", "outline", "checklist", "tree"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+outline-mcp-core = { path = "../outline-mcp-core", version = "0.8.1" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+anyhow = { workspace = true }
+rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }
+similar = "2"

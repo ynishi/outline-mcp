@@ -1,14 +1,8 @@
 // SMARTLINT: Status::InReview (1774100840)
-//! MCP Server for outline-mcp
+//! [`OutlineMcpServer`]: the `ServerHandler` implementation and its
+//! `shelf_dir` / `selected` state.
 //!
 //! MCP Protocol (stdio) <-> application::BookService / EjectService
-//!
-//! 8 tools: init, node_create, node_update, node_move, toc, checklist, import, gen_routing
-
-mod helpers;
-mod request;
-mod resources;
-mod tools;
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -31,8 +25,9 @@ use outline_mcp_core::domain::model::id::NodeId;
 use outline_mcp_core::infra::changelog_store::JsonChangeLogRepository;
 use outline_mcp_core::infra::json_store::JsonBookRepository;
 
-use helpers::{build_hierarchical_ids, find_hierarchical_id, is_hierarchical_id};
-use request::parse_node_id;
+use crate::helpers::{build_hierarchical_ids, find_hierarchical_id, is_hierarchical_id};
+use crate::request::parse_node_id;
+use crate::resources;
 
 // =============================================================================
 // Public entry point
@@ -50,15 +45,24 @@ pub async fn run(shelf_dir: PathBuf) -> anyhow::Result<()> {
 // MCP Server
 // =============================================================================
 
+/// The outline-mcp MCP server.
+///
+/// Holds the shelf directory (the directory containing one JSON file per
+/// book) and the currently selected book, and implements `ServerHandler` by
+/// dispatching MCP tool calls onto
+/// `outline_mcp_core::application::service::BookService`.
 #[derive(Clone)]
-pub(super) struct OutlineMcpServer {
-    pub(super) shelf_dir: PathBuf,
-    pub(super) selected: Arc<RwLock<Option<String>>>,
+pub struct OutlineMcpServer {
+    pub(crate) shelf_dir: PathBuf,
+    pub(crate) selected: Arc<RwLock<Option<String>>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl OutlineMcpServer {
-    pub(super) fn new(shelf_dir: PathBuf) -> Self {
+    /// Construct a new server rooted at `shelf_dir` (the directory
+    /// containing one JSON file per book). No book is selected until
+    /// `select_book` (or `init`) is called.
+    pub fn new(shelf_dir: PathBuf) -> Self {
         Self {
             shelf_dir,
             selected: Arc::new(RwLock::new(None)),
@@ -67,12 +71,12 @@ impl OutlineMcpServer {
     }
 
     /// slug からBookファイルパスを返す。
-    pub(super) fn book_path(&self, slug: &str) -> PathBuf {
+    pub(crate) fn book_path(&self, slug: &str) -> PathBuf {
         self.shelf_dir.join(format!("{slug}.json"))
     }
 
     /// 選択中BookのServiceを返す。未選択ならエラー。
-    pub(super) fn service(&self) -> Result<BookService<JsonBookRepository>, McpError> {
+    pub(crate) fn service(&self) -> Result<BookService<JsonBookRepository>, McpError> {
         let guard = self
             .selected
             .read()
@@ -89,14 +93,14 @@ impl OutlineMcpServer {
     }
 
     /// 指定slugのServiceを返す（選択状態不要）。
-    pub(super) fn service_for(&self, slug: &str) -> BookService<JsonBookRepository> {
+    pub(crate) fn service_for(&self, slug: &str) -> BookService<JsonBookRepository> {
         let repo = JsonBookRepository::new(self.book_path(slug));
         let changelog = Box::new(JsonChangeLogRepository::new(&self.shelf_dir, slug));
         BookService::new(repo).with_changelog(changelog)
     }
 
     /// Shelf内のslug一覧をソート順で返す。
-    pub(super) fn list_book_slugs(&self) -> Result<Vec<String>, McpError> {
+    pub(crate) fn list_book_slugs(&self) -> Result<Vec<String>, McpError> {
         if !self.shelf_dir.exists() {
             return Ok(Vec::new());
         }
@@ -126,7 +130,7 @@ impl OutlineMcpServer {
     }
 
     /// 番号 or slug → slug に解決する。
-    pub(super) fn resolve_book_ref(&self, book_ref: &str) -> Result<String, McpError> {
+    pub(crate) fn resolve_book_ref(&self, book_ref: &str) -> Result<String, McpError> {
         if let Ok(num) = book_ref.parse::<usize>() {
             let slugs = self.list_book_slugs()?;
             if num == 0 || num > slugs.len() {
@@ -144,7 +148,7 @@ impl OutlineMcpServer {
         Ok(book_ref.to_string())
     }
 
-    pub(super) fn to_mcp_error(e: AppError) -> McpError {
+    pub(crate) fn to_mcp_error(e: AppError) -> McpError {
         McpError::internal_error(format!("{e}"), None)
     }
 
@@ -155,7 +159,7 @@ impl OutlineMcpServer {
     /// 2. Full UUID
     /// 3. 短縮UUIDプレフィックス
     /// 4. タイトル部分一致（フォールバック）
-    pub(super) fn resolve_id(&self, s: &str) -> Result<NodeId, McpError> {
+    pub(crate) fn resolve_id(&self, s: &str) -> Result<NodeId, McpError> {
         // 1. 階層番号（"1", "2-3", "1-2-1" 等）
         if is_hierarchical_id(s) {
             let svc = self.service()?;

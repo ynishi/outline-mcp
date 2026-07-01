@@ -14,7 +14,7 @@ use outline_mcp_core::domain::model::node::NodeType;
 // =============================================================================
 
 /// slugが安全なファイル名であることを検証する。
-pub(super) fn validate_slug(slug: &str) -> Result<(), McpError> {
+pub(crate) fn validate_slug(slug: &str) -> Result<(), McpError> {
     if slug.is_empty() {
         return Err(McpError::invalid_params("slug must not be empty", None));
     }
@@ -32,7 +32,7 @@ pub(super) fn validate_slug(slug: &str) -> Result<(), McpError> {
 
 /// タイトルをファイル名に安全な文字列に変換する。
 /// 英数字・`-_.()`以外を`_`に置換し、連続`_`を圧縮、先頭末尾の`_`を除去する。
-pub(super) fn sanitize_for_filename(title: &str) -> String {
+pub(crate) fn sanitize_for_filename(title: &str) -> String {
     let sanitized: String = title
         .chars()
         .map(|c| {
@@ -77,7 +77,7 @@ pub(super) fn sanitize_for_filename(title: &str) -> String {
 }
 
 /// filenameにパス区切り文字や".."が含まれていないことを検証する。
-pub(super) fn validate_filename(filename: &str) -> Result<(), McpError> {
+pub(crate) fn validate_filename(filename: &str) -> Result<(), McpError> {
     if filename.contains('/')
         || filename.contains('\\')
         || filename.contains("..")
@@ -92,7 +92,7 @@ pub(super) fn validate_filename(filename: &str) -> Result<(), McpError> {
 }
 
 /// importパスの拡張子を検証する。
-pub(super) fn validate_import_path(file_path: &str) -> Result<PathBuf, McpError> {
+pub(crate) fn validate_import_path(file_path: &str) -> Result<PathBuf, McpError> {
     let path = PathBuf::from(file_path);
     match path.extension().and_then(|e| e.to_str()) {
         Some("json") => Ok(path),
@@ -103,7 +103,7 @@ pub(super) fn validate_import_path(file_path: &str) -> Result<PathBuf, McpError>
     }
 }
 
-pub(super) fn parse_node_type(s: &str) -> Result<NodeType, McpError> {
+pub(crate) fn parse_node_type(s: &str) -> Result<NodeType, McpError> {
     match s {
         "section" => Ok(NodeType::Section),
         "content" => Ok(NodeType::Content),
@@ -114,7 +114,7 @@ pub(super) fn parse_node_type(s: &str) -> Result<NodeType, McpError> {
     }
 }
 
-pub(super) fn parse_node_status(s: &str) -> Result<NodeStatus, McpError> {
+pub(crate) fn parse_node_status(s: &str) -> Result<NodeStatus, McpError> {
     match s {
         "active" => Ok(NodeStatus::Active),
         "draft" => Ok(NodeStatus::Draft),
@@ -126,15 +126,15 @@ pub(super) fn parse_node_status(s: &str) -> Result<NodeStatus, McpError> {
 }
 
 /// MCP経由のテキストに含まれるリテラル `\n` を実際の改行に変換する。
-pub(super) fn unescape_newlines(s: &str) -> String {
+pub(crate) fn unescape_newlines(s: &str) -> String {
     s.replace("\\n", "\n")
 }
 
-pub(super) fn normalize_text(s: Option<String>) -> Option<String> {
+pub(crate) fn normalize_text(s: Option<String>) -> Option<String> {
     s.map(|v| unescape_newlines(&v))
 }
 
-pub(super) fn parse_node_id(s: &str) -> Result<NodeId, McpError> {
+pub(crate) fn parse_node_id(s: &str) -> Result<NodeId, McpError> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|_| McpError::invalid_params(format!("Invalid node_id: '{s}'"), None))
 }
@@ -144,7 +144,7 @@ pub(super) fn parse_node_id(s: &str) -> Result<NodeId, McpError> {
 // =============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpNodeCreateRequest {
+pub(crate) struct McpNodeCreateRequest {
     #[schemars(
         description = "Parent ID from `toc` output (e.g. '1', '2-3'). Omit for root-level node. UUID also accepted."
     )]
@@ -168,7 +168,7 @@ pub(super) struct McpNodeCreateRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpNodeUpdateRequest {
+pub(crate) struct McpNodeUpdateRequest {
     #[schemars(description = "Node ID from `toc` output (e.g. '2-3'). UUID also accepted.")]
     pub node_id: String,
     #[schemars(description = "New title (omit to keep current)")]
@@ -188,7 +188,7 @@ pub(super) struct McpNodeUpdateRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpNodeMoveRequest {
+pub(crate) struct McpNodeMoveRequest {
     #[schemars(description = "Node ID from `toc` output (e.g. '2-3'). UUID also accepted.")]
     pub node_id: String,
     #[schemars(description = "Action: 'move' to relocate, 'remove' to delete (with descendants)")]
@@ -202,7 +202,7 @@ pub(super) struct McpNodeMoveRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpTocRequest {
+pub(crate) struct McpTocRequest {
     #[schemars(description = "Section ID from `toc` output (e.g. '2'). Omit to show entire book.")]
     pub subtree_root: Option<String>,
     #[schemars(
@@ -212,7 +212,7 @@ pub(super) struct McpTocRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpEjectRequest {
+pub(crate) struct McpEjectRequest {
     #[schemars(description = "Output directory path (default: current directory)")]
     pub output_dir: Option<String>,
     #[schemars(description = "Output filename (default: '<book-title>.md')")]
@@ -228,13 +228,13 @@ pub(super) struct McpEjectRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpImportRequest {
+pub(crate) struct McpImportRequest {
     #[schemars(description = "Path to JSON file exported by eject (format: json)")]
     pub file_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpInitRequest {
+pub(crate) struct McpInitRequest {
     #[schemars(description = "Book title")]
     pub title: String,
     #[schemars(
@@ -246,13 +246,13 @@ pub(super) struct McpInitRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpShelfRequest {}
+pub(crate) struct McpShelfRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpGenRoutingRequest {}
+pub(crate) struct McpGenRoutingRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub(super) struct McpSnapshotCreateRequest {
+pub(crate) struct McpSnapshotCreateRequest {
     #[schemars(
         description = "Optional label (max 64 chars; letters/digits/spaces/'-_.:,()' only). Stored in a sidecar '.meta.json'; snapshot body is unchanged."
     )]
@@ -260,7 +260,7 @@ pub(super) struct McpSnapshotCreateRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpSnapshotDiffRequest {
+pub(crate) struct McpSnapshotDiffRequest {
     #[schemars(
         description = "Older snapshot timestamp (millis). Must be strictly less than to_ts."
     )]
@@ -274,7 +274,7 @@ pub(super) struct McpSnapshotDiffRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpSnapshotTagRequest {
+pub(crate) struct McpSnapshotTagRequest {
     #[schemars(description = "Timestamp (millis) from snapshot_list output")]
     pub timestamp: String,
     #[schemars(
@@ -284,16 +284,16 @@ pub(super) struct McpSnapshotTagRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpSnapshotListRequest {}
+pub(crate) struct McpSnapshotListRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpSnapshotRestoreRequest {
+pub(crate) struct McpSnapshotRestoreRequest {
     #[schemars(description = "Timestamp (millis) from snapshot_list output")]
     pub timestamp: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpSnapshotDumpRequest {
+pub(crate) struct McpSnapshotDumpRequest {
     #[schemars(description = "Timestamp (millis) from snapshot_list output")]
     pub timestamp: String,
     #[schemars(description = "Output directory path")]
@@ -305,7 +305,7 @@ pub(super) struct McpSnapshotDumpRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpSnapshotDumpAllRequest {
+pub(crate) struct McpSnapshotDumpAllRequest {
     #[schemars(
         description = "Output directory path (subdirs 'v01_<millis>' .. 'vNN_<millis>' will be created inside; 01 = oldest)"
     )]
@@ -317,13 +317,13 @@ pub(super) struct McpSnapshotDumpAllRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpNodeHistoryRequest {
+pub(crate) struct McpNodeHistoryRequest {
     #[schemars(description = "Node ID from `toc` output (e.g. '2-3'). UUID also accepted.")]
     pub node_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub(super) struct McpBookHistoryRequest {
+pub(crate) struct McpBookHistoryRequest {
     #[schemars(
         description = "Maximum number of entries to return (newest first; default 50). Use 0 for all."
     )]
@@ -335,7 +335,7 @@ pub(super) struct McpBookHistoryRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpDumpRequest {
+pub(crate) struct McpDumpRequest {
     #[schemars(description = "Output directory path")]
     pub output_dir: String,
     #[schemars(description = "Output format: 'markdown' (default) or 'json'")]
@@ -349,7 +349,7 @@ pub(super) struct McpDumpRequest {
 // =============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpBatchMoveItem {
+pub(crate) struct McpBatchMoveItem {
     #[schemars(description = "Node UUID (use node_query or dump to find UUIDs)")]
     pub node_id: String,
     #[schemars(description = "New parent UUID (null for root)")]
@@ -359,13 +359,13 @@ pub(super) struct McpBatchMoveItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpBatchMoveRequest {
+pub(crate) struct McpBatchMoveRequest {
     #[schemars(description = "List of move operations. All nodes are identified by UUID.")]
     pub moves: Vec<McpBatchMoveItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpBatchUpdateItem {
+pub(crate) struct McpBatchUpdateItem {
     #[schemars(description = "Node UUID")]
     pub node_id: String,
     #[schemars(description = "New title (omit to keep current)")]
@@ -379,13 +379,13 @@ pub(super) struct McpBatchUpdateItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpBatchUpdateRequest {
+pub(crate) struct McpBatchUpdateRequest {
     #[schemars(description = "List of update operations. All nodes are identified by UUID.")]
     pub updates: Vec<McpBatchUpdateItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpSelectBookRequest {
+pub(crate) struct McpSelectBookRequest {
     #[schemars(
         description = "Book to select: number from `shelf` output (e.g. '1') or book slug (e.g. 'rust')"
     )]
@@ -397,7 +397,7 @@ pub(super) struct McpSelectBookRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct McpNodeQueryRequest {
+pub(crate) struct McpNodeQueryRequest {
     #[schemars(
         description = "Filter by properties (e.g. {\"added_by\": \"retrospector\"}). Only matching nodes shown."
     )]

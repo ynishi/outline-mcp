@@ -488,12 +488,7 @@ name = "outline-mcp"
 version = "0.8.1"
 dependencies = [
  "anyhow",
- "outline-mcp-core",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "similar",
+ "outline-mcp-rmcp",
  "tokio",
 ]
 
@@ -508,6 +503,19 @@ dependencies = [
  "tempfile",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "outline-mcp-rmcp"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "outline-mcp-core",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "similar",
 ]
 
 [[package]]
