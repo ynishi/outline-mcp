@@ -4,9 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.7.0] - 2026-07-01
+
+### Added
+
+- **Snapshot inspection tools**: `snapshot_dump` / `snapshot_dump_all` / `snapshot_tag` for reading and labeling snapshot contents without restoring
+- **`book_history`**: whole-book edit timeline aggregating per-node history into a single chronological view
+- **Snapshot workflow guide as MCP Resource**: expose the snapshot operational guide via `outline://guides/snapshot` so clients can discover the recommended flow
+
 ### Changed
 
 - Fix `uninlined_format_args` Clippy lint in `EjectService::render_node` (`src/application/eject.rs`): inline `indent`/`converted`/`ph` variables into format strings (no behavior change)
+
+### Fixed
+
+- Encode OCI package version in identifier per MCP Registry schema
 
 ## [0.6.0] - 2026-04-12
 
