@@ -10,6 +10,6 @@ keywords = ["mcp", "outline", "checklist", "tree"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-outline-mcp-rmcp = { path = "../outline-mcp-rmcp", version = "0.9.0" }
+outline-mcp-rmcp = { path = "../outline-mcp-rmcp", version = "0.9.1" }
 tokio = { workspace = true }
 anyhow = { workspace = true }

@@ -16,6 +16,12 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
+## [0.9.1] - 2026-07-02
+
+### Changed
+
+- **`rmcp` dependency**: bump `0.15` → `1.7` (Cargo resolves to `1.8.0`). Adapt to `#[non_exhaustive]` API in rmcp 1.x by switching `ServerInfo` / `Implementation` / `ReadResourceResult` construction from struct literals to their `new()` + `with_*()` builders (`crates/outline-mcp-rmcp/src/{server,resources}.rs`). No behavior change; MCP protocol version and stdio JSON-RPC surface are unchanged.
+
 ## [0.9.0] - 2026-07-02
 
 ### Added
