@@ -55,14 +55,14 @@ pub(crate) fn list_all() -> ListResourcesResult {
 /// Read a guide by URI. Returns None if no bundled guide matches.
 pub(crate) fn read(uri: &str) -> Option<ReadResourceResult> {
     let guide = GUIDES.iter().find(|g| g.uri == uri)?;
-    Some(ReadResourceResult {
-        contents: vec![ResourceContents::TextResourceContents {
+    Some(ReadResourceResult::new(vec![
+        ResourceContents::TextResourceContents {
             uri: guide.uri.to_string(),
             mime_type: Some("text/markdown".to_string()),
             text: guide.body.to_string(),
             meta: None,
-        }],
-    })
+        },
+    ]))
 }
 
 #[cfg(test)]

@@ -239,25 +239,20 @@ impl OutlineMcpServer {
 
 impl ServerHandler for OutlineMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_03_26,
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .build(),
-            server_info: Implementation {
-                name: "outline-mcp".to_string(),
-                title: Some("Outline MCP — Tree-Structured Knowledge Base".to_string()),
-                description: Some(
-                    "Persistent tree-structured notes with numbered IDs and property-based context injection. \
-                     Workflow: `shelf` → `select_book` → `toc` → create/update nodes."
-                        .to_string(),
-                ),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some(
+        let server_info = Implementation::new("outline-mcp", env!("CARGO_PKG_VERSION"))
+            .with_title("Outline MCP — Tree-Structured Knowledge Base")
+            .with_description(
+                "Persistent tree-structured notes with numbered IDs and property-based context injection. \
+                 Workflow: `shelf` → `select_book` → `toc` → create/update nodes.",
+            );
+        let capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
+        ServerInfo::new(capabilities)
+            .with_protocol_version(ProtocolVersion::V_2025_03_26)
+            .with_server_info(server_info)
+            .with_instructions(
                 "Create and manage tree-structured knowledge notes.\n\
                  \n\
                  Intended flow: organize knowledge as tree nodes (sections and content), \
@@ -273,10 +268,8 @@ impl ServerHandler for OutlineMcpServer {
                  `node_history` for change tracking. `dump` for full export.\n\
                  Batch: `node_batch_move`/`node_batch_update` for bulk operations (UUID required). \
                  Query: `node_query` for searching nodes by properties/status/type.\n\
-                 Resources: read guides via `outline://guides/<name>` (see `resources/list`)."
-                    .to_string(),
-            ),
-        }
+                 Resources: read guides via `outline://guides/<name>` (see `resources/list`).",
+            )
     }
 
     async fn list_tools(
