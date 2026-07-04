@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.10.0] - 2026-07-04
+
+### Added
+
 - **ai-store integration for the snapshot subsystem.** `SnapshotService` now persists change history to an `ai-store` `Store` (backed by `ai-store-sqlite`) on a dedicated per-book stream, with `SnapshotDumpSink` maintaining the same `{slug}.snap.{millis}.json` (+ optional `.meta.json` sidecar) disk layout as before. A new SQLite file per book (`{shelf_dir}/{slug}.events.db`) holds the event log; the pre-existing on-disk `.snap.*.json` files stay in place and remain interoperable.
 - **`outline-mcp migrate-snapshots --shelf <path> [--slug <slug>]`** CLI sub-command to backfill pre-integration disk snapshots into the new event log with their original timestamps preserved (via `Store::import_event`). Idempotent (safe to re-run), refuses to touch a stream that already carries events from a different clock (mixed-clock stream risk). See "Upgrading from 0.9.1 or earlier" in the README.
 - **Startup orphan-snapshot warning.** On first access to a slug, the server emits `tracing::warn!` if disk snapshots exist that are not yet in the event log, pointing at the `migrate-snapshots` command. Note: this warning goes to `stderr`; MCP clients that swallow server stderr (Claude Code included) will not surface it — the migration command is the reliable way to check.
