@@ -17,9 +17,9 @@ schemars = { workspace = true }
 anyhow = { workspace = true }
 rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
 similar = "2"
-ai-store-core = "0.4"
-ai-store-sqlite = "0.4"
-ai-store-sync = "0.4"
+ai-store-core = "0.7"
+ai-store-sqlite = "0.7"
+ai-store-sync = "0.7"
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
