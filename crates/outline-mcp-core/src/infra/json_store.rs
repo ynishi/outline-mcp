@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use async_trait::async_trait;
+
 use crate::domain::model::book::TemplateBook;
 use crate::domain::repository::BookRepository;
 
@@ -27,26 +29,28 @@ impl JsonBookRepository {
     }
 }
 
+#[async_trait]
 impl BookRepository for JsonBookRepository {
     type Error = JsonStoreError;
 
-    fn load(&self) -> Result<Option<TemplateBook>, Self::Error> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let content = std::fs::read_to_string(&self.path)?;
+    async fn load(&self) -> Result<Option<TemplateBook>, Self::Error> {
+        let content = match tokio::fs::read_to_string(&self.path).await {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         let book: TemplateBook = serde_json::from_str(&content)?;
         Ok(Some(book))
     }
 
-    fn save(&self, book: &TemplateBook) -> Result<(), Self::Error> {
+    async fn save(&self, book: &TemplateBook) -> Result<(), Self::Error> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
         let content = serde_json::to_string_pretty(book)?;
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &content)?;
-        std::fs::rename(&tmp, &self.path)?;
+        tokio::fs::write(&tmp, &content).await?;
+        tokio::fs::rename(&tmp, &self.path).await?;
         Ok(())
     }
 }
@@ -57,8 +61,8 @@ mod tests {
     use crate::domain::model::book::AddNodeRequest;
     use crate::domain::model::node::NodeType;
 
-    #[test]
-    fn roundtrip_save_load() {
+    #[tokio::test]
+    async fn roundtrip_save_load() {
         let dir = std::env::temp_dir().join("outline-mcp-test");
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("test-book.json");
@@ -66,7 +70,7 @@ mod tests {
         let repo = JsonBookRepository::new(&path);
 
         // 初回loadはNone
-        assert!(repo.load().unwrap().is_none());
+        assert!(repo.load().await.unwrap().is_none());
 
         // Book作成→保存→読み込み
         let mut book = TemplateBook::new("Roundtrip Test", 3);
@@ -81,9 +85,9 @@ mod tests {
         })
         .unwrap();
 
-        repo.save(&book).unwrap();
+        repo.save(&book).await.unwrap();
 
-        let loaded = repo.load().unwrap().unwrap();
+        let loaded = repo.load().await.unwrap().unwrap();
         assert_eq!(loaded.title(), "Roundtrip Test");
         assert_eq!(loaded.node_count(), 1);
         assert_eq!(loaded.root_nodes().len(), 1);

@@ -14,16 +14,16 @@ use outline_mcp_core::infra::json_store::JsonBookRepository;
 // BookService CRUD (with InMemoryRepo)
 // =============================================================================
 
-#[test]
-fn service_create_and_read() {
+#[tokio::test]
+async fn service_create_and_read() {
     let svc = TestBook::service_with_book(&TemplateBook::new("Empty", 4));
-    let book = svc.read_tree().unwrap();
+    let book = svc.read_tree().await.unwrap();
     assert_eq!(book.title(), "Empty");
     assert_eq!(book.node_count(), 0);
 }
 
-#[test]
-fn service_add_node() {
+#[tokio::test]
+async fn service_add_node() {
     let tb = TestBook::standard();
     let svc = TestBook::service_with_book(&tb.book);
 
@@ -37,15 +37,16 @@ fn service_add_node() {
             position: usize::MAX,
             properties: std::collections::HashMap::new(),
         })
+        .await
         .unwrap();
 
-    let book = svc.read_tree().unwrap();
+    let book = svc.read_tree().await.unwrap();
     assert_eq!(book.node_count(), tb.book.node_count() + 1);
     assert_eq!(book.get_node(id).unwrap().title(), "New Section");
 }
 
-#[test]
-fn service_update_node() {
+#[tokio::test]
+async fn service_update_node() {
     let tb = TestBook::standard();
     let svc = TestBook::service_with_book(&tb.book);
     let design_id = tb.ids["design"];
@@ -61,17 +62,18 @@ fn service_update_node() {
             status: None,
         },
     )
+    .await
     .map(|((), _warning)| ())
     .unwrap();
 
-    let book = svc.read_tree().unwrap();
+    let book = svc.read_tree().await.unwrap();
     let node = book.get_node(design_id).unwrap();
     assert_eq!(node.title(), "Architecture");
     assert_eq!(node.body(), Some("Updated body"));
 }
 
-#[test]
-fn service_move_node() {
+#[tokio::test]
+async fn service_move_node() {
     let tb = TestBook::standard();
     let svc = TestBook::service_with_book(&tb.book);
     let code_id = tb.ids["code"];
@@ -79,35 +81,37 @@ fn service_move_node() {
 
     // Implementation配下のcodeをDesign配下に移動
     svc.move_node(code_id, Some(design_id), 0)
+        .await
         .map(|((), _warning)| ())
         .unwrap();
 
-    let book = svc.read_tree().unwrap();
+    let book = svc.read_tree().await.unwrap();
     let design = book.get_node(design_id).unwrap();
     assert!(design.children().contains(&code_id));
     assert_eq!(book.get_node(code_id).unwrap().parent(), Some(design_id));
 }
 
-#[test]
-fn service_remove_node() {
+#[tokio::test]
+async fn service_remove_node() {
     let tb = TestBook::standard();
     let original_count = tb.book.node_count();
     let svc = TestBook::service_with_book(&tb.book);
 
     // Design (+ 2 children) を削除 → 3ノード減
     svc.remove_node(tb.ids["design"])
+        .await
         .map(|((), _warning)| ())
         .unwrap();
 
-    let book = svc.read_tree().unwrap();
+    let book = svc.read_tree().await.unwrap();
     assert_eq!(book.node_count(), original_count - 3);
 }
 
-#[test]
-fn service_read_nonexistent_book_errors() {
+#[tokio::test]
+async fn service_read_nonexistent_book_errors() {
     let repo = common::InMemoryRepo::new();
     let svc = BookService::new(repo);
-    let result = svc.read_tree();
+    let result = svc.read_tree().await;
     assert_error_contains(result, "book not found");
 }
 
@@ -182,21 +186,21 @@ fn eject_subtree_only() {
 // BookService with JsonBookRepository (file-backed)
 // =============================================================================
 
-#[test]
-fn service_json_repo_roundtrip() {
+#[tokio::test]
+async fn service_json_repo_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("book.json");
 
     let repo = JsonBookRepository::new(&path);
     let svc = BookService::new(repo);
 
-    let book = svc.create_book("File Test", 3).unwrap();
+    let book = svc.create_book("File Test", 3).await.unwrap();
     assert_eq!(book.title(), "File Test");
 
     // 新たなServiceインスタンスで読み直す
     let repo2 = JsonBookRepository::new(&path);
     let svc2 = BookService::new(repo2);
-    let loaded = svc2.read_tree().unwrap();
+    let loaded = svc2.read_tree().await.unwrap();
     assert_eq!(loaded.title(), "File Test");
 }
 

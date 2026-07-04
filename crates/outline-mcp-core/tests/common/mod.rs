@@ -2,9 +2,10 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
+use async_trait::async_trait;
 use outline_mcp_core::application::service::BookService;
 use outline_mcp_core::domain::model::book::{AddNodeRequest, TemplateBook};
 use outline_mcp_core::domain::model::id::NodeId;
@@ -20,23 +21,35 @@ use outline_mcp_core::domain::repository::BookRepository;
 pub struct InMemoryError;
 
 /// ファイルI/O不要のインメモリリポジトリ。
+///
+/// `BookRepository` は `#[async_trait]` 経由の async trait で `Self: Sync` を要求する
+/// (future が `Send` であるために `&Self: Send` が必要)。`RefCell` は `!Sync` のため、
+/// 段2 async化に伴い `Mutex` へ切替えた。
 pub struct InMemoryRepo {
-    store: RefCell<HashMap<String, String>>,
+    store: Mutex<HashMap<String, String>>,
 }
 
 impl InMemoryRepo {
     pub fn new() -> Self {
         Self {
-            store: RefCell::new(HashMap::new()),
+            store: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// テスト用の同期シード投入。`BookRepository::save` (async) を介さず
+    /// テストセットアップを同期のまま完結させるためのヘルパー。
+    fn seed(&self, book: &TemplateBook) {
+        let json = serde_json::to_string(book).unwrap();
+        self.store.lock().unwrap().insert("book".to_string(), json);
     }
 }
 
+#[async_trait]
 impl BookRepository for InMemoryRepo {
     type Error = InMemoryError;
 
-    fn load(&self) -> Result<Option<TemplateBook>, Self::Error> {
-        let store = self.store.borrow();
+    async fn load(&self) -> Result<Option<TemplateBook>, Self::Error> {
+        let store = self.store.lock().unwrap();
         match store.get("book") {
             Some(json) => {
                 let book: TemplateBook = serde_json::from_str(json).unwrap();
@@ -46,9 +59,8 @@ impl BookRepository for InMemoryRepo {
         }
     }
 
-    fn save(&self, book: &TemplateBook) -> Result<(), Self::Error> {
-        let json = serde_json::to_string(book).unwrap();
-        self.store.borrow_mut().insert("book".to_string(), json);
+    async fn save(&self, book: &TemplateBook) -> Result<(), Self::Error> {
+        self.seed(book);
         Ok(())
     }
 }
@@ -161,7 +173,7 @@ impl TestBook {
     /// InMemoryRepoにBookを保存してBookServiceを返す。
     pub fn service_with_book(book: &TemplateBook) -> BookService<InMemoryRepo> {
         let repo = InMemoryRepo::new();
-        repo.save(book).unwrap();
+        repo.seed(book);
         BookService::new(repo)
     }
 }

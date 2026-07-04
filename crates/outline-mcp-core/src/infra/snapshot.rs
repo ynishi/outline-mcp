@@ -1,11 +1,65 @@
-use std::path::{Path, PathBuf};
+//! Snapshot creation / listing / restore / tag / delete, backed by an
+//! ai-store [`Store`].
+//!
+//! # Architecture
+//!
+//! `SnapshotService` owns a **dedicated event stream per book**, distinct
+//! from the fine-grained per-node changelog stream used by
+//! `crate::infra::ai_store_changelog::AiStoreChangeLogRepository`. The two
+//! streams share the same `Store` (and therefore the same backend / SQLite
+//! file), but a snapshot's stream carries whole-book-state diffs
+//! (`current book JSON` -> `next book JSON`), never per-node diffs. This
+//! separation is deliberate:
+//!
+//! - `AiStoreChangeLogRepository::append` computes an RFC 6902 diff between
+//!   a single node's before/after JSON (see that module's doc comment for
+//!   why this is only a per-entry approximation). Replaying that stream's
+//!   patches would not reconstruct a valid `TemplateBook` — the patch
+//!   operations reference paths inside a *node* object, not the *book* tree.
+//! - By giving snapshots their own stream, `Store::state` / `Store::state_at`
+//!   on *that* stream are always a faithful whole-book reconstruction,
+//!   because every event appended to it is, by construction, a
+//!   `serde_json::to_value(&TemplateBook)` diff produced by this module.
+//!
+//! The stream naming convention is `"{slug}::snapshots"` (see
+//! [`snapshot_stream_key`]), so it never collides with the changelog's
+//! `StreamId::new(slug)`.
+//!
+//! File artifacts keep the pre-existing naming convention
+//! (`{slug}.snap.{millis}.json` + sidecar `{slug}.snap.{millis}.meta.json`)
+//! and are written by `crate::infra::snapshot_sink::SnapshotDumpSink`,
+//! registered as a `Store` sink. See that module's doc comment for why the
+//! sink filters dispatch by stream identity instead of an `auto_commit`
+//! toggle.
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ai_store_core::{Label, Seq, Store, StreamId, Timestamp as StoreTimestamp};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::domain::model::book::TemplateBook;
 use crate::domain::model::timestamp::Timestamp;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Event kind used for whole-book-state snapshot appends.
+const KIND_SNAPSHOT: &str = "book_snapshot";
+
+/// Derives the dedicated snapshot [`StreamId`] key for a book slug.
+///
+/// Shared by [`SnapshotService`] (which appends to it) and
+/// `crate::infra::snapshot_sink::SnapshotDumpSink` (which filters `commit`
+/// dispatch by it), so the two stay in lockstep without either module
+/// depending on the other's internals.
+pub(crate) fn snapshot_stream_key(slug: &str) -> String {
+    format!("{slug}::snapshots")
+}
+
+fn box_store_err(e: ai_store_core::StoreError) -> BoxError {
+    Box::new(e)
+}
 
 /// スナップショットのメタ情報。
 pub struct SnapshotInfo {
@@ -34,158 +88,270 @@ pub struct SnapshotMeta {
     pub created_at: Option<i64>,
 }
 
-/// スナップショットの作成・一覧・復元を行うサービス。
-///
-/// ファイル命名: `{slug}.snap.{millis}.json`
-/// millis は Timestamp の Unix ミリ秒値（数値）。
-///
-/// sidecar (label): `{slug}.snap.{millis}.meta.json` — 本体 schema は不変、
-/// meta は独立 file で扱う (旧 snapshot 混在で壊さない)。
-pub struct SnapshotService;
+// ---------------------------------------------------------------------------
+// File I/O helpers (shared with `crate::infra::snapshot_sink::SnapshotDumpSink`)
+// ---------------------------------------------------------------------------
+
+/// Path to a snapshot body file. Existence is not checked.
+pub(crate) fn snapshot_path(shelf_dir: &Path, slug: &str, millis: i64) -> PathBuf {
+    shelf_dir.join(format!("{slug}.snap.{millis}.json"))
+}
+
+/// Path to a snapshot's sidecar `.meta.json`. Existence is not checked.
+pub(crate) fn meta_path(shelf_dir: &Path, slug: &str, millis: i64) -> PathBuf {
+    shelf_dir.join(format!("{slug}.snap.{millis}.meta.json"))
+}
+
+/// Atomically writes a snapshot's body (`state` materialized JSON).
+pub(crate) fn write_snapshot_body(
+    shelf_dir: &Path,
+    slug: &str,
+    millis: i64,
+    state: &Value,
+) -> Result<PathBuf, BoxError> {
+    std::fs::create_dir_all(shelf_dir)?;
+    let path = snapshot_path(shelf_dir, slug, millis);
+    let content = serde_json::to_string_pretty(state)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &content)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Atomically writes a snapshot's sidecar `.meta.json`.
+pub(crate) fn write_meta(
+    shelf_dir: &Path,
+    slug: &str,
+    millis: i64,
+    meta: &SnapshotMeta,
+) -> Result<PathBuf, BoxError> {
+    std::fs::create_dir_all(shelf_dir)?;
+    let path = meta_path(shelf_dir, slug, millis);
+    let content = serde_json::to_string_pretty(meta)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &content)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Reads a snapshot's sidecar `.meta.json`. Missing / unparsable sidecars
+/// fall back to `None` (pre-existing snapshots without a sidecar are valid).
+pub(crate) fn read_meta(shelf_dir: &Path, slug: &str, millis: i64) -> Option<SnapshotMeta> {
+    let path = meta_path(shelf_dir, slug, millis);
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Lists snapshot files for `slug`, newest first.
+pub(crate) fn list_snapshots(shelf_dir: &Path, slug: &str) -> Result<Vec<SnapshotInfo>, BoxError> {
+    if !shelf_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let prefix = format!("{slug}.snap.");
+    let suffix = ".json";
+
+    let mut infos: Vec<SnapshotInfo> = std::fs::read_dir(shelf_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_str()?.to_string();
+            if !file_name.starts_with(&prefix) || !file_name.ends_with(suffix) {
+                return None;
+            }
+            // sidecar `.meta.json` は snapshot 本体ではないので除外
+            if file_name.ends_with(".meta.json") {
+                return None;
+            }
+            // stem = "{slug}.snap.{millis}" → 最後の . 以降を millis としてパース
+            let stem = path.file_stem()?.to_str()?;
+            let millis_str = stem.rsplit('.').next()?;
+            let millis: i64 = millis_str.parse().ok()?;
+            let timestamp = Timestamp::from_millis(millis);
+            let size_bytes = entry.metadata().ok()?.len();
+            let label = read_meta(shelf_dir, slug, millis).and_then(|m| m.label);
+            Some(SnapshotInfo {
+                timestamp,
+                path: path.clone(),
+                size_bytes,
+                label,
+            })
+        })
+        .collect();
+
+    // タイムスタンプ降順でソート（最新が先頭）
+    infos.sort_by_key(|i| std::cmp::Reverse(i.timestamp));
+
+    Ok(infos)
+}
+
+// ---------------------------------------------------------------------------
+// SnapshotService
+// ---------------------------------------------------------------------------
+
+/// Creates, lists, restores, tags, and deletes book-level snapshots, backed
+/// by a dedicated ai-store [`Store`] stream (see module docs).
+pub struct SnapshotService {
+    store: Arc<Store>,
+    shelf_dir: PathBuf,
+    slug: String,
+    stream: StreamId,
+}
 
 impl SnapshotService {
-    /// 現在の Book のスナップショットを作成する。
+    /// Constructs a service over `store` for the given book `slug`. `store`
+    /// must have a `crate::infra::snapshot_sink::SnapshotDumpSink` sink
+    /// registered for this to have any observable effect on disk.
+    pub fn new(store: Arc<Store>, shelf_dir: PathBuf, slug: impl Into<String>) -> Self {
+        let slug = slug.into();
+        let stream = StreamId::new(snapshot_stream_key(&slug));
+        Self {
+            store,
+            shelf_dir,
+            slug,
+            stream,
+        }
+    }
+
+    /// Takes a snapshot of `book`'s current state. `label` is carried in the
+    /// appended event's `meta` so the registered sink can write the sidecar
+    /// without a second round trip.
     ///
-    /// 作成したファイルのパスを返す。`label` を指定すると sidecar `.meta.json` も同時に書く。
-    pub fn create(
-        shelf_dir: &Path,
-        slug: &str,
+    /// Returns the path of the written snapshot body file.
+    pub async fn create(
+        &self,
         book: &TemplateBook,
         label: Option<&str>,
     ) -> Result<PathBuf, BoxError> {
-        std::fs::create_dir_all(shelf_dir).map_err(|e| -> BoxError { Box::new(e) })?;
-
-        let millis = Timestamp::now().as_millis();
-        let path = shelf_dir.join(format!("{slug}.snap.{millis}.json"));
-
-        let content =
-            serde_json::to_string_pretty(book).map_err(|e| -> BoxError { Box::new(e) })?;
-
-        // atomic write: tmp → rename
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &content).map_err(|e| -> BoxError { Box::new(e) })?;
-        std::fs::rename(&tmp, &path).map_err(|e| -> BoxError { Box::new(e) })?;
-
-        if let Some(label) = label {
-            let meta = SnapshotMeta {
-                label: Some(label.to_string()),
-                created_at: Some(millis),
-            };
-            Self::write_meta(shelf_dir, slug, millis, &meta)?;
-        }
-
-        Ok(path)
+        let current = self
+            .store
+            .state(&self.stream)
+            .await
+            .map_err(box_store_err)?;
+        let next = serde_json::to_value(book)?;
+        let patch = json_patch::diff(&current, &next);
+        let meta = serde_json::json!({ "label": label });
+        let seq = self
+            .store
+            .append(&self.stream, KIND_SNAPSHOT, patch, meta)
+            .await
+            .map_err(box_store_err)?;
+        let millis = self.event_millis(seq).await?;
+        Ok(snapshot_path(&self.shelf_dir, &self.slug, millis))
     }
 
-    /// sidecar `.meta.json` の path を返す (存在検査は行わない)。
-    pub fn meta_path(shelf_dir: &Path, slug: &str, timestamp_millis: i64) -> PathBuf {
-        shelf_dir.join(format!("{slug}.snap.{timestamp_millis}.meta.json"))
-    }
-
-    /// sidecar `.meta.json` を atomic write する。
-    fn write_meta(
-        shelf_dir: &Path,
-        slug: &str,
-        timestamp_millis: i64,
-        meta: &SnapshotMeta,
-    ) -> Result<PathBuf, BoxError> {
-        std::fs::create_dir_all(shelf_dir).map_err(|e| -> BoxError { Box::new(e) })?;
-        let path = Self::meta_path(shelf_dir, slug, timestamp_millis);
-        let content =
-            serde_json::to_string_pretty(meta).map_err(|e| -> BoxError { Box::new(e) })?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &content).map_err(|e| -> BoxError { Box::new(e) })?;
-        std::fs::rename(&tmp, &path).map_err(|e| -> BoxError { Box::new(e) })?;
-        Ok(path)
-    }
-
-    /// sidecar `.meta.json` を読む。存在しない / parse 失敗は `None` を返す (silent fallback)。
-    fn read_meta(shelf_dir: &Path, slug: &str, timestamp_millis: i64) -> Option<SnapshotMeta> {
-        let path = Self::meta_path(shelf_dir, slug, timestamp_millis);
-        let content = std::fs::read_to_string(&path).ok()?;
-        serde_json::from_str(&content).ok()
-    }
-
-    /// 既存の snapshot に label を事後追記 (sidecar のみ書く、本体 snapshot は触らない)。
+    /// Attaches (or overwrites) a label on an existing snapshot. Only the
+    /// sidecar `.meta.json` is written; the snapshot body is untouched.
     ///
-    /// snapshot 本体が存在しない場合は error を返す。
-    pub fn tag(
-        shelf_dir: &Path,
-        slug: &str,
-        timestamp_millis: i64,
-        label: &str,
-    ) -> Result<PathBuf, BoxError> {
-        let snapshot_path = shelf_dir.join(format!("{slug}.snap.{timestamp_millis}.json"));
-        if !snapshot_path.exists() {
-            return Err(format!("snapshot not found: {slug} at millis {timestamp_millis}").into());
+    /// Also best-effort mirrors the label into the ai-store label registry
+    /// (`Store::label_set`) for consumers that introspect it directly. This
+    /// step is intentionally non-fatal: a snapshot created before this
+    /// service existed (or the registry entry not resolving for any other
+    /// reason) must not block attaching a label to its file, since the
+    /// sidecar file is this service's source of truth for `list` / `tag`.
+    pub async fn tag(&self, timestamp_millis: i64, label: &str) -> Result<PathBuf, BoxError> {
+        let path = snapshot_path(&self.shelf_dir, &self.slug, timestamp_millis);
+        if !path.exists() {
+            return Err(format!(
+                "snapshot not found: {} at millis {timestamp_millis}",
+                self.slug
+            )
+            .into());
         }
-        let existing = Self::read_meta(shelf_dir, slug, timestamp_millis).unwrap_or_default();
-        let created_at = existing.created_at.or(Some(Timestamp::now().as_millis()));
+
+        let existing = read_meta(&self.shelf_dir, &self.slug, timestamp_millis).unwrap_or_default();
+        let created_at = existing.created_at.or(Some(timestamp_millis));
         let meta = SnapshotMeta {
             label: Some(label.to_string()),
             created_at,
         };
-        Self::write_meta(shelf_dir, slug, timestamp_millis, &meta)
-    }
+        let meta_path = write_meta(&self.shelf_dir, &self.slug, timestamp_millis, &meta)?;
 
-    /// slug に対応するスナップショット一覧を返す（タイムスタンプ降順）。
-    pub fn list(shelf_dir: &Path, slug: &str) -> Result<Vec<SnapshotInfo>, BoxError> {
-        if !shelf_dir.exists() {
-            return Ok(Vec::new());
+        if let Ok(Some(seq)) = self
+            .store
+            .seq_at_time(&self.stream, StoreTimestamp(timestamp_millis))
+            .await
+        {
+            let _ = self
+                .store
+                .label_set(&self.stream, &Label::new(label), seq)
+                .await;
         }
 
-        let prefix = format!("{slug}.snap.");
-        let suffix = ".json";
-
-        let mut infos: Vec<SnapshotInfo> = std::fs::read_dir(shelf_dir)
-            .map_err(|e| -> BoxError { Box::new(e) })?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let path = entry.path();
-                let file_name = path.file_name()?.to_str()?.to_string();
-                if !file_name.starts_with(&prefix) || !file_name.ends_with(suffix) {
-                    return None;
-                }
-                // sidecar `.meta.json` は snapshot 本体ではないので除外
-                if file_name.ends_with(".meta.json") {
-                    return None;
-                }
-                // stem = "{slug}.snap.{millis}" → 最後の . 以降を millis としてパース
-                let stem = path.file_stem()?.to_str()?;
-                let millis_str = stem.rsplit('.').next()?;
-                let millis: i64 = millis_str.parse().ok()?;
-                let timestamp = Timestamp::from_millis(millis);
-                let size_bytes = entry.metadata().ok()?.len();
-                let label = Self::read_meta(shelf_dir, slug, millis).and_then(|m| m.label);
-                Some(SnapshotInfo {
-                    timestamp,
-                    path: path.clone(),
-                    size_bytes,
-                    label,
-                })
-            })
-            .collect();
-
-        // タイムスタンプ降順でソート（最新が先頭）
-        infos.sort_by_key(|i| std::cmp::Reverse(i.timestamp));
-
-        Ok(infos)
+        Ok(meta_path)
     }
 
-    /// 指定 millis のスナップショットから Book を復元する。
-    pub fn restore(
-        shelf_dir: &Path,
-        slug: &str,
-        timestamp_millis: i64,
-    ) -> Result<TemplateBook, BoxError> {
-        let path = shelf_dir.join(format!("{slug}.snap.{timestamp_millis}.json"));
-        if !path.exists() {
-            return Err(format!("snapshot not found: {slug} at millis {timestamp_millis}").into());
-        }
-        let content = std::fs::read_to_string(&path).map_err(|e| -> BoxError { Box::new(e) })?;
-        let book: TemplateBook =
-            serde_json::from_str(&content).map_err(|e| -> BoxError { Box::new(e) })?;
+    /// Lists snapshots for this book, newest first.
+    pub async fn list(&self) -> Result<Vec<SnapshotInfo>, BoxError> {
+        list_snapshots(&self.shelf_dir, &self.slug)
+    }
+
+    /// Restores the `TemplateBook` recorded at `timestamp_millis`.
+    pub async fn restore(&self, timestamp_millis: i64) -> Result<TemplateBook, BoxError> {
+        let seq = self
+            .store
+            .seq_at_time(&self.stream, StoreTimestamp(timestamp_millis))
+            .await
+            .map_err(box_store_err)?
+            .ok_or_else(|| -> BoxError {
+                format!(
+                    "snapshot not found: {} at millis {timestamp_millis}",
+                    self.slug
+                )
+                .into()
+            })?;
+        let state = self
+            .store
+            .state_at(&self.stream, seq)
+            .await
+            .map_err(box_store_err)?;
+        let book: TemplateBook = serde_json::from_value(state)?;
         Ok(book)
+    }
+
+    /// Deletes the snapshot's file artifacts (body + sidecar). This does
+    /// **not** erase the underlying ai-store event — the store is
+    /// append-only by design, so `restore` for this same `timestamp_millis`
+    /// remains possible via history replay. Deleting only removes the
+    /// derived file dump, mirroring the "projections are re-derivable"
+    /// contract sinks operate under.
+    pub async fn delete(&self, timestamp_millis: i64) -> Result<(), BoxError> {
+        let path = snapshot_path(&self.shelf_dir, &self.slug, timestamp_millis);
+        if !path.exists() {
+            return Err(format!(
+                "snapshot not found: {} at millis {timestamp_millis}",
+                self.slug
+            )
+            .into());
+        }
+
+        if let Some(label) =
+            read_meta(&self.shelf_dir, &self.slug, timestamp_millis).and_then(|m| m.label)
+        {
+            let _ = self
+                .store
+                .label_delete(&self.stream, &Label::new(label))
+                .await;
+        }
+
+        std::fs::remove_file(&path)?;
+        let meta_path = meta_path(&self.shelf_dir, &self.slug, timestamp_millis);
+        let _ = std::fs::remove_file(&meta_path);
+        Ok(())
+    }
+
+    /// Resolves the wall-clock millis assigned to `seq` by the backend.
+    async fn event_millis(&self, seq: Seq) -> Result<i64, BoxError> {
+        let events = self
+            .store
+            .read(&self.stream, seq, 1)
+            .await
+            .map_err(box_store_err)?;
+        let event = events
+            .into_iter()
+            .next()
+            .ok_or_else(|| -> BoxError { "snapshot event not found after append".into() })?;
+        Ok(event.at.0)
     }
 }
 
@@ -198,7 +364,12 @@ mod tests {
     use super::*;
     use crate::domain::model::book::{AddNodeRequest, TemplateBook};
     use crate::domain::model::node::NodeType;
+    use ai_store_core::{CacheBackend, EventBackend, StoreConfig};
+    use ai_store_mem::{MemCacheBackend, MemEventBackend};
+    use ai_store_sync::BlockingSink;
     use std::collections::HashMap;
+
+    use crate::infra::snapshot_sink::SnapshotDumpSink;
 
     fn temp_dir(suffix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("outline-mcp-snapshot-test-{suffix}"));
@@ -222,31 +393,45 @@ mod tests {
         book
     }
 
-    #[test]
-    fn test_create_returns_path_that_exists() {
+    fn make_service(shelf_dir: &Path, slug: &str) -> SnapshotService {
+        let events: Arc<dyn EventBackend> = Arc::new(MemEventBackend::new());
+        let cache: Arc<dyn CacheBackend> = Arc::new(MemCacheBackend::new());
+        let sink = SnapshotDumpSink::new(shelf_dir.to_path_buf(), slug.to_string());
+        let store = Arc::new(Store::new(
+            events,
+            cache,
+            Vec::new(),
+            vec![Arc::new(BlockingSink::new(sink))],
+            StoreConfig::default(),
+        ));
+        SnapshotService::new(store, shelf_dir.to_path_buf(), slug)
+    }
+
+    #[tokio::test]
+    async fn test_create_returns_path_that_exists() {
         let dir = temp_dir("create");
+        let svc = make_service(&dir, "my-book");
         let book = make_book("Snapshot Test");
-        let path = SnapshotService::create(&dir, "my-book", &book, None).expect("create snapshot");
+        let path = svc.create(&book, None).await.expect("create snapshot");
         assert!(path.exists(), "snapshot file should exist at {path:?}");
-        // ファイル名が期待するパターンに一致するか
         let fname = path.file_name().unwrap().to_str().unwrap();
         assert!(fname.starts_with("my-book.snap."), "file name: {fname}");
         assert!(fname.ends_with(".json"), "file name: {fname}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_list_returns_created_snapshots() {
+    #[tokio::test]
+    async fn test_list_returns_created_snapshots() {
         let dir = temp_dir("list");
+        let svc = make_service(&dir, "list-book");
         let book = make_book("List Test");
-        SnapshotService::create(&dir, "list-book", &book, None).expect("create 1");
+        svc.create(&book, None).await.expect("create 1");
         // 同一ミリ秒衝突を避けるため少し待つ（テスト用途のみ）
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        SnapshotService::create(&dir, "list-book", &book, None).expect("create 2");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        svc.create(&book, None).await.expect("create 2");
 
-        let infos = SnapshotService::list(&dir, "list-book").expect("list");
+        let infos = svc.list().await.expect("list");
         assert_eq!(infos.len(), 2, "should have 2 snapshots");
-        // 降順チェック
         assert!(
             infos[0].timestamp >= infos[1].timestamp,
             "should be sorted descending"
@@ -254,22 +439,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_list_empty_when_no_snapshots() {
+    #[tokio::test]
+    async fn test_list_empty_when_no_snapshots() {
         let dir = temp_dir("list-empty");
-        let infos = SnapshotService::list(&dir, "no-snaps").expect("list empty");
+        let svc = make_service(&dir, "no-snaps");
+        let infos = svc.list().await.expect("list empty");
         assert!(infos.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_restore_roundtrip() {
+    #[tokio::test]
+    async fn test_restore_roundtrip() {
         let dir = temp_dir("restore");
+        let svc = make_service(&dir, "restore-book");
         let book = make_book("Restore Test");
-        let path = SnapshotService::create(&dir, "restore-book", &book, None).expect("create");
+        let path = svc.create(&book, None).await.expect("create");
 
-        // ファイル名からmillisを取得
-        // "restore-book.snap.{millis}.json" → stemは "restore-book.snap.{millis}"
         let stem = path.file_stem().unwrap().to_str().unwrap();
         let millis: i64 = stem
             .rsplit('.')
@@ -278,114 +463,213 @@ mod tests {
             .parse()
             .expect("parse millis");
 
-        let restored = SnapshotService::restore(&dir, "restore-book", millis).expect("restore");
+        let restored = svc.restore(millis).await.expect("restore");
         assert_eq!(restored.title(), "Restore Test");
         assert_eq!(restored.node_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_restore_nonexistent_returns_error() {
+    #[tokio::test]
+    async fn test_restore_nonexistent_returns_error() {
         let dir = temp_dir("restore-err");
-        let result = SnapshotService::restore(&dir, "no-book", 999_999_999);
+        let svc = make_service(&dir, "no-book");
+        let result = svc.restore(999_999_999).await;
         assert!(result.is_err(), "should return error for missing snapshot");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_create_with_label_writes_sidecar() {
+    #[tokio::test]
+    async fn test_create_with_label_writes_sidecar() {
         let dir = temp_dir("create-label");
+        let svc = make_service(&dir, "lb");
         let book = make_book("Labeled Snap");
-        let path = SnapshotService::create(&dir, "lb", &book, Some("rating-pass"))
+        let path = svc
+            .create(&book, Some("rating-pass"))
+            .await
             .expect("create with label");
         assert!(path.exists());
 
-        // sidecar が存在する
         let stem = path.file_stem().unwrap().to_str().unwrap();
         let millis: i64 = stem.rsplit('.').next().unwrap().parse().unwrap();
-        let meta_path = SnapshotService::meta_path(&dir, "lb", millis);
+        let meta_path = meta_path(&dir, "lb", millis);
         assert!(meta_path.exists(), "sidecar meta.json should exist");
 
-        // list に label が乗る
-        let infos = SnapshotService::list(&dir, "lb").expect("list");
+        let infos = svc.list().await.expect("list");
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].label.as_deref(), Some("rating-pass"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_list_label_none_when_no_sidecar() {
+    #[tokio::test]
+    async fn test_list_label_none_when_no_sidecar() {
         let dir = temp_dir("create-no-label");
+        let svc = make_service(&dir, "nl");
         let book = make_book("NoLabel");
-        SnapshotService::create(&dir, "nl", &book, None).expect("create");
-        let infos = SnapshotService::list(&dir, "nl").expect("list");
+        svc.create(&book, None).await.expect("create");
+        let infos = svc.list().await.expect("list");
         assert_eq!(infos.len(), 1);
         assert!(infos[0].label.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_tag_writes_sidecar_after_creation() {
+    #[tokio::test]
+    async fn test_tag_writes_sidecar_after_creation() {
         let dir = temp_dir("tag");
+        let svc = make_service(&dir, "tg");
         let book = make_book("TagLater");
-        let path = SnapshotService::create(&dir, "tg", &book, None).expect("create");
+        let path = svc.create(&book, None).await.expect("create");
         let stem = path.file_stem().unwrap().to_str().unwrap();
         let millis: i64 = stem.rsplit('.').next().unwrap().parse().unwrap();
 
-        SnapshotService::tag(&dir, "tg", millis, "post-hoc").expect("tag");
+        svc.tag(millis, "post-hoc").await.expect("tag");
 
-        let infos = SnapshotService::list(&dir, "tg").expect("list");
+        let infos = svc.list().await.expect("list");
         assert_eq!(infos[0].label.as_deref(), Some("post-hoc"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_tag_overwrites_existing_label() {
+    #[tokio::test]
+    async fn test_tag_overwrites_existing_label() {
         let dir = temp_dir("tag-overwrite");
+        let svc = make_service(&dir, "ow");
         let book = make_book("Overwrite");
-        let path = SnapshotService::create(&dir, "ow", &book, Some("initial")).expect("create");
+        let path = svc.create(&book, Some("initial")).await.expect("create");
         let stem = path.file_stem().unwrap().to_str().unwrap();
         let millis: i64 = stem.rsplit('.').next().unwrap().parse().unwrap();
 
-        SnapshotService::tag(&dir, "ow", millis, "updated").expect("tag overwrite");
+        svc.tag(millis, "updated").await.expect("tag overwrite");
 
-        let infos = SnapshotService::list(&dir, "ow").expect("list");
+        let infos = svc.list().await.expect("list");
         assert_eq!(infos[0].label.as_deref(), Some("updated"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_tag_errors_when_snapshot_missing() {
+    #[tokio::test]
+    async fn test_tag_errors_when_snapshot_missing() {
         let dir = temp_dir("tag-missing");
-        let res = SnapshotService::tag(&dir, "nope", 999_999_999, "x");
+        let svc = make_service(&dir, "nope");
+        let res = svc.tag(999_999_999, "x").await;
         assert!(res.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_list_ignores_meta_sidecar_files() {
+    #[tokio::test]
+    async fn test_list_ignores_meta_sidecar_files() {
         let dir = temp_dir("list-meta-ignore");
+        let svc = make_service(&dir, "mi");
         let book = make_book("MetaIgnore");
-        SnapshotService::create(&dir, "mi", &book, Some("with-meta")).expect("create");
-        // list は 1 件だけ (meta を snapshot として拾わない)
-        let infos = SnapshotService::list(&dir, "mi").expect("list");
+        svc.create(&book, Some("with-meta")).await.expect("create");
+        let infos = svc.list().await.expect("list");
         assert_eq!(infos.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn test_list_does_not_include_non_snapshot_files() {
+    #[tokio::test]
+    async fn test_list_does_not_include_non_snapshot_files() {
         let dir = temp_dir("list-filter");
-        // 通常のbookファイルを作成
         std::fs::write(dir.join("my-book.json"), "{}").expect("write book");
-        // changelogファイルを作成
         std::fs::write(dir.join("my-book.changelog.json"), "[]").expect("write changelog");
 
-        let infos = SnapshotService::list(&dir, "my-book").expect("list");
+        let infos = list_snapshots(&dir, "my-book").expect("list");
         assert!(
             infos.is_empty(),
             "non-snapshot files should not be listed as snapshots"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_delete_removes_body_and_sidecar() {
+        let dir = temp_dir("delete");
+        let svc = make_service(&dir, "del");
+        let book = make_book("Delete Test");
+        let path = svc.create(&book, Some("to-delete")).await.expect("create");
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        let millis: i64 = stem.rsplit('.').next().unwrap().parse().unwrap();
+        let meta = meta_path(&dir, "del", millis);
+        assert!(path.exists());
+        assert!(meta.exists());
+
+        svc.delete(millis).await.expect("delete");
+
+        assert!(!path.exists(), "body should be removed");
+        assert!(!meta.exists(), "sidecar should be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_returns_error() {
+        let dir = temp_dir("delete-missing");
+        let svc = make_service(&dir, "no-such");
+        let res = svc.delete(999_999_999).await;
+        assert!(res.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_restore_after_delete_still_reconstructs_from_history() {
+        // ai-store is append-only: deleting a snapshot's file artifacts does
+        // not erase the underlying event, so restore still works via replay.
+        let dir = temp_dir("restore-after-delete");
+        let svc = make_service(&dir, "hist");
+        let book = make_book("History Survives");
+        let path = svc.create(&book, None).await.expect("create");
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        let millis: i64 = stem.rsplit('.').next().unwrap().parse().unwrap();
+
+        svc.delete(millis).await.expect("delete");
+        let restored = svc.restore(millis).await.expect("restore after delete");
+        assert_eq!(restored.title(), "History Survives");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_creates_reconstruct_correct_book_per_seq() {
+        let dir = temp_dir("multi-create");
+        let svc = make_service(&dir, "multi");
+        let book_v1 = make_book("Version 1");
+        let mut book_v2 = book_v1.clone();
+        book_v2
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "Node 2".into(),
+                node_type: NodeType::Content,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+                properties: HashMap::new(),
+            })
+            .expect("add second node");
+
+        let path1 = svc.create(&book_v1, None).await.expect("create v1");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        let path2 = svc.create(&book_v2, None).await.expect("create v2");
+
+        let millis1: i64 = path1
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .rsplit('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let millis2: i64 = path2
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .rsplit('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let restored1 = svc.restore(millis1).await.expect("restore v1");
+        let restored2 = svc.restore(millis2).await.expect("restore v2");
+        assert_eq!(restored1.node_count(), 1);
+        assert_eq!(restored2.node_count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
