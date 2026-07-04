@@ -6,7 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **ai-store integration for the snapshot subsystem.** `SnapshotService` now persists change history to an `ai-store` `Store` (backed by `ai-store-sqlite`) on a dedicated per-book stream, with `SnapshotDumpSink` maintaining the same `{slug}.snap.{millis}.json` (+ optional `.meta.json` sidecar) disk layout as before. A new SQLite file per book (`{shelf_dir}/{slug}.events.db`) holds the event log; the pre-existing on-disk `.snap.*.json` files stay in place and remain interoperable.
+- **`outline-mcp migrate-snapshots --shelf <path> [--slug <slug>]`** CLI sub-command to backfill pre-integration disk snapshots into the new event log with their original timestamps preserved (via `Store::import_event`). Idempotent (safe to re-run), refuses to touch a stream that already carries events from a different clock (mixed-clock stream risk). See "Upgrading from 0.9.1 or earlier" in the README.
+- **Startup orphan-snapshot warning.** On first access to a slug, the server emits `tracing::warn!` if disk snapshots exist that are not yet in the event log, pointing at the `migrate-snapshots` command. Note: this warning goes to `stderr`; MCP clients that swallow server stderr (Claude Code included) will not surface it — the migration command is the reliable way to check.
+- **`AiStoreChangeLogRepository`** as a sibling `ChangeLogRepository` implementation over `ai-store` (not yet live in the production wiring — see "Not wired" below).
+
 ### Changed
+
+- **`BookRepository` and `ChangeLogRepository` are now `#[async_trait]`.** The full handler → service → repository chain runs on `tokio` end-to-end; the previous sync/async bridge is gone. All infra implementations (`JsonBookRepository`, `JsonChangeLogRepository`, `AiStoreChangeLogRepository`) migrate to `async fn` with `tokio::fs` for file I/O. Fixed an incidental `RwLockReadGuard`-across-`.await` `Send` bug in `shelf()` surfaced by the migration.
+- **`AiStoreChangeLogRepository::load_by_node`** uses `Store::read_by_meta("node_id", ...)` for sub-linear lookups on backends that index meta (SQLite); mem/fileproj remain linear scan with no regression.
+- **New dependencies**: `ai-store-core = "0.4"`, `ai-store-sqlite = "0.4"`, `ai-store-sync = "0.4"`, `async-trait = "0.1"`, `json-patch = "4"`, `tracing`, `tracing-subscriber` (stderr-only; MCP stdout stays clean). `tokio` gains the `fs` feature.
+
+### Migration
+
+Consumers with existing on-disk snapshots (`.snap.{millis}.json` files) must run the migrator once after upgrading:
+
+```
+outline-mcp migrate-snapshots --shelf <path-to-shelf-directory>
+```
+
+Snapshots that have not been migrated remain on disk but are invisible to `snapshot_list` / `snapshot_restore` until the migrator has folded them into the event log. Back up the shelf directory before upgrading. See README §Upgrading.
+
+### Known limitations
+
+- Post-hoc labeled snapshots (labels attached via `snapshot_tag` after `snapshot_create`) lose the "time the label was attached" value in the sidecar `.meta.json`'s `created_at` field; on migration this collapses to the snapshot's own timestamp. The label text itself is preserved, and `created_at` is not exposed through any MCP tool — this is an internal-metadata cosmetic drift.
+- `AiStoreChangeLogRepository` is not yet wired into `server.rs`; `JsonChangeLogRepository` remains the live changelog writer. Live swap requires async DI across ~20 unrelated handlers and is deferred.
 
 ### Deprecated
 

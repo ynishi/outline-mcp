@@ -169,6 +169,48 @@ Tree-structured format that can be re-imported:
 }
 ```
 
+## Upgrading
+
+### From 0.9.1 or earlier
+
+The snapshot subsystem now persists to a per-book SQLite event log (`{shelf_dir}/{slug}.events.db`) in addition to the existing on-disk `.snap.{millis}.json` files. Existing installs must run the migrator once to fold pre-existing on-disk snapshots into the event log — until they do, those snapshots stay on disk but are not visible to `snapshot_list` / `snapshot_restore`.
+
+**1. Back up the shelf directory.** The migrator is idempotent and does not delete files, but the shelf directory is the source of truth for your books; a copy is cheap insurance.
+
+```
+cp -a <shelf-dir> <shelf-dir>.bak
+```
+
+**2. Run the migrator.**
+
+```
+outline-mcp migrate-snapshots --shelf <shelf-dir>
+```
+
+The migrator scans every `{slug}.snap.{millis}.json` file under `<shelf-dir>`, imports each into `{shelf-dir}/{slug}.events.db` with its original timestamp preserved, and leaves the source `.json` file in place. Output looks like:
+
+```
+== rust ==
+  scanned:  3
+  imported: 3
+  skipped:  0
+  failed:   0
+```
+
+Pass `--slug <slug>` to migrate one book at a time.
+
+**3. Verify (optional).** Re-running the migrator is a no-op — every file will report as `skipped`.
+
+### What the migrator does not do
+
+- It does not delete the source `.snap.*.json` files. Keep them for a while as a second layer of backup.
+- It will refuse a stream that already carries events from a different clock (e.g. a book that has been actively edited via `snapshot_create` between the upgrade and the migrator run). Run the migrator before doing new writes.
+- The startup warning that steers you here is emitted via `tracing::warn!` on `stderr`. MCP clients that swallow server stderr (Claude Code included) will not surface it — treat the migrator command as the canonical way to check.
+
+### Known limitations
+
+- Snapshots that were **post-hoc labeled** via `snapshot_tag` (as opposed to labeled at `snapshot_create` time) lose the "time the label was attached" value in their sidecar `.meta.json`'s internal `created_at` field. The label text itself is preserved, and `created_at` is never exposed through the MCP surface — this is an internal-metadata drift, not user-visible.
+
 ## License
 
 Licensed under either of
