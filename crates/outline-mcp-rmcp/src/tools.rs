@@ -25,7 +25,6 @@ use outline_mcp_core::domain::model::book::AddNodeRequest;
 use outline_mcp_core::domain::model::book::UpdateNodeRequest;
 use outline_mcp_core::domain::model::changelog::{ChangeAction, ChangeEntry, NodeStatus};
 use outline_mcp_core::domain::model::timestamp::Timestamp;
-use outline_mcp_core::infra::changelog_store::JsonChangeLogRepository;
 
 #[tool_router(vis = "pub(crate)")]
 impl OutlineMcpServer {
@@ -43,7 +42,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpNodeCreateRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let node_type = parse_node_type(&req.node_type)?;
         let parent = match req.parent.as_deref() {
             Some(s) => Some(self.resolve_id(s).await?),
@@ -93,7 +92,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpNodeUpdateRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let id = self.resolve_id(&req.node_id).await?;
         let node_type = req.node_type.as_deref().map(parse_node_type).transpose()?;
 
@@ -143,7 +142,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpNodeMoveRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let id = self.resolve_id(&req.node_id).await?;
 
         match req.action.as_str() {
@@ -212,7 +211,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpTocRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
         let subtree_id = match req.subtree_root.as_deref() {
@@ -262,7 +261,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpEjectRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
         let include_placeholders = req.include_placeholders.unwrap_or(true);
@@ -338,7 +337,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpImportRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let import_path = validate_import_path(&req.file_path)?;
         let content = std::fs::read_to_string(&import_path)
             .map_err(|e| McpError::internal_error(format!("Failed to read file: {e}"), None))?;
@@ -385,7 +384,7 @@ impl OutlineMcpServer {
             McpError::internal_error(format!("Failed to create shelf directory: {e}"), None)
         })?;
 
-        let svc = self.service_for(&req.slug);
+        let svc = self.service_for(&req.slug).await?;
         let max_depth = req.max_depth.unwrap_or(4);
         let book = svc
             .create_book(&req.title, max_depth)
@@ -442,11 +441,15 @@ impl OutlineMcpServer {
 
         let mut entries: Vec<(String, String, usize)> = Vec::new();
         for slug in &slugs {
-            let svc = self.service_for(slug);
-            match svc.read_tree().await {
-                Ok(book) => {
-                    entries.push((slug.clone(), book.title().to_string(), book.node_count()));
-                }
+            match self.service_for(slug).await {
+                Ok(svc) => match svc.read_tree().await {
+                    Ok(book) => {
+                        entries.push((slug.clone(), book.title().to_string(), book.node_count()));
+                    }
+                    Err(_) => {
+                        entries.push((slug.clone(), "(failed to load)".to_string(), 0));
+                    }
+                },
                 Err(_) => {
                     entries.push((slug.clone(), "(failed to load)".to_string(), 0));
                 }
@@ -502,7 +505,7 @@ impl OutlineMcpServer {
             ));
         }
 
-        let svc = self.service_for(&slug);
+        let svc = self.service_for(&slug).await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
         let mut guard = self
@@ -581,7 +584,10 @@ impl OutlineMcpServer {
         let mut entries: Vec<(String, String, String)> = Vec::new();
 
         for slug in &slugs {
-            let svc = self.service_for(slug);
+            let svc = match self.service_for(slug).await {
+                Ok(svc) => svc,
+                Err(_) => continue,
+            };
             let book = match svc.read_tree().await {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -658,7 +664,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpSnapshotCreateRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
         let slug = {
@@ -722,7 +728,7 @@ impl OutlineMcpServer {
         &self,
         #[allow(unused_variables)] Parameters(_req): Parameters<McpSnapshotListRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
         let slug = {
@@ -827,7 +833,7 @@ impl OutlineMcpServer {
         let node_count = restored.node_count();
 
         // changelog に Restore エントリを記録（ベストエフォート）
-        let cl_repo = JsonChangeLogRepository::new(&self.shelf_dir, &slug);
+        let cl_repo = self.changelog_for(&slug).await?;
         let ts = Timestamp::now();
         let mut warning: Option<String> = None;
         for id in restored.all_node_ids() {
@@ -841,7 +847,7 @@ impl OutlineMcpServer {
             }
         }
 
-        let svc = self.service()?;
+        let svc = self.service().await?;
         svc.save_book(&restored).await.map_err(Self::to_mcp_error)?;
 
         let mut msg = format!(
@@ -1241,7 +1247,7 @@ impl OutlineMcpServer {
                 .clone()
         };
 
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
         let title = book
@@ -1249,7 +1255,7 @@ impl OutlineMcpServer {
             .map(|n| n.title().to_string())
             .unwrap_or_else(|| id.short().to_string());
 
-        let cl_repo = JsonChangeLogRepository::new(&self.shelf_dir, &slug);
+        let cl_repo = self.changelog_for(&slug).await?;
         let mut entries =
             outline_mcp_core::domain::repository::ChangeLogRepository::load_by_node(&cl_repo, id)
                 .await
@@ -1339,10 +1345,10 @@ impl OutlineMcpServer {
         }
         let limit = req.limit.unwrap_or(50);
 
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
-        let cl_repo = JsonChangeLogRepository::new(&self.shelf_dir, &slug);
+        let cl_repo = self.changelog_for(&slug).await?;
         let mut entries =
             outline_mcp_core::domain::repository::ChangeLogRepository::load_all(&cl_repo)
                 .await
@@ -1449,7 +1455,7 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpDumpRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
         let format = match req.format.as_deref() {
@@ -1502,7 +1508,7 @@ impl OutlineMcpServer {
             return Ok(id);
         }
         // 2. Short prefix in current book
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
         let matches: Vec<outline_mcp_core::domain::model::id::NodeId> = book
             .all_node_ids()
@@ -1572,7 +1578,7 @@ impl OutlineMcpServer {
             resolved.push((id, new_parent, position));
         }
 
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let (count, warnings) = svc.batch_move(resolved).await.map_err(|e| {
             McpError::internal_error(format!("Batch move failed: {e}. No changes saved."), None)
         })?;
@@ -1645,7 +1651,7 @@ impl OutlineMcpServer {
             resolved.push((id, update_req));
         }
 
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let (count, warnings) = svc.batch_update(resolved).await.map_err(|e| {
             McpError::internal_error(format!("Batch update failed: {e}. No changes saved."), None)
         })?;
@@ -1673,7 +1679,7 @@ impl OutlineMcpServer {
     ) -> Result<CallToolResult, McpError> {
         use outline_mcp_core::domain::model::node::NodeType;
 
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
         let root_id = match req.subtree_root.as_deref() {

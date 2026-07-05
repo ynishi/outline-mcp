@@ -14,9 +14,9 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-ai-store-core = "0.7"
-ai-store-sqlite = "0.7"
-ai-store-sync = "0.7"
+ai-store-core = "0.9"
+ai-store-sqlite = "0.9"
+ai-store-sync = "0.9"
 json-patch = "4"
 tokio = { version = "1", features = ["rt", "sync", "fs"] }
 async-trait = "0.1"
@@ -25,4 +25,4 @@ async-trait = "0.1"
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 tempfile = "3"
-ai-store-mem = "0.7"
+ai-store-mem = "0.9"

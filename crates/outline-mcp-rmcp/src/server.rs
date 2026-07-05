@@ -8,9 +8,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use ai_store_core::{CacheBackend, EventBackend, Store, StoreConfig};
-use ai_store_sqlite::{SqliteBackendDriver, SqliteBackends};
-use ai_store_sync::BlockingSink;
+use ai_store_core::Store;
+use ai_store_sqlite::SqliteStore;
 use rmcp::{
     handler::server::{tool::ToolCallContext, tool::ToolRouter},
     model::{
@@ -27,28 +26,15 @@ use tokio::sync::Mutex as AsyncMutex;
 use outline_mcp_core::application::error::AppError;
 use outline_mcp_core::application::service::BookService;
 use outline_mcp_core::domain::model::id::NodeId;
-use outline_mcp_core::infra::changelog_store::JsonChangeLogRepository;
+use outline_mcp_core::infra::changelog_bridge::HistoryPreservingChangeLogRepository;
 use outline_mcp_core::infra::json_store::JsonBookRepository;
 use outline_mcp_core::infra::snapshot::SnapshotService;
 use outline_mcp_core::infra::snapshot_migrator::count_orphan_snapshots;
-use outline_mcp_core::infra::snapshot_sink::SnapshotDumpSink;
+use outline_mcp_core::infra::snapshot_sink::SnapshotOnlySink;
 
 use crate::helpers::{build_hierarchical_ids, find_hierarchical_id, is_hierarchical_id};
 use crate::request::parse_node_id;
 use crate::resources;
-
-/// A book's ai-store `Store` handle plus the SQLite driver that keeps its
-/// backing thread alive. Kept together so the driver is never dropped while
-/// the `Store` is still reachable through `OutlineMcpServer::store_for`.
-struct SnapshotStoreEntry {
-    store: Arc<Store>,
-    /// Held only for lifetime; graceful `.shutdown().await` is not wired
-    /// into this server's lifecycle (stdio transport has no explicit
-    /// shutdown hook today). Dropping without `shutdown` is documented as
-    /// safe by `ai-store-sqlite` — the backing thread exits once every
-    /// handle (including this driver) is gone.
-    _driver: SqliteBackendDriver,
-}
 
 // =============================================================================
 // Public entry point
@@ -88,12 +74,14 @@ pub struct OutlineMcpServer {
     pub(crate) shelf_dir: PathBuf,
     pub(crate) selected: Arc<RwLock<Option<String>>>,
     tool_router: ToolRouter<Self>,
-    /// Lazily constructed, slug-keyed ai-store `Store` handles backing
-    /// `snapshot_service_for`. One SQLite file per slug
+    /// Lazily constructed, slug-keyed `ai_store_sqlite::SqliteStore` handles
+    /// (bundles the `Store`, its SQLite backend driver, and the shared
+    /// `AsyncIsle` in one type — see `Self::store_for`) backing both
+    /// `snapshot_service_for` and `changelog_for`. One SQLite file per slug
     /// (`{shelf_dir}/{slug}.events.db`), opened on first access and reused
     /// thereafter — opening spawns a dedicated backend thread
     /// (`ai-store-sqlite`), so this must not happen on every tool call.
-    snapshot_stores: Arc<AsyncMutex<HashMap<String, SnapshotStoreEntry>>>,
+    snapshot_stores: Arc<AsyncMutex<HashMap<String, SqliteStore>>>,
 }
 
 impl OutlineMcpServer {
@@ -109,14 +97,33 @@ impl OutlineMcpServer {
         }
     }
 
-    /// Returns the (lazily constructed, cached) ai-store `Store` for
-    /// `slug`'s dedicated snapshot stream, with a
-    /// `SnapshotDumpSink` registered so snapshot dumps land on disk.
+    /// Returns the (lazily constructed, cached) ai-store `Store` for `slug`,
+    /// with a `SnapshotOnlySink` registered so snapshot dumps land on disk.
+    /// Shared by both the snapshot subsystem (`Self::snapshot_service_for`)
+    /// and the per-node changelog (`Self::changelog_for`).
+    ///
+    /// Built via `SqliteStore::open_with` — the one-call assembly
+    /// `ai-store-sqlite` provides over hand-wiring `SqliteBackends` +
+    /// `Store::new` (which this used to do, ignoring `SqliteBackends`'
+    /// checkpoint backend entirely). `SqliteStore` bundles the `Store`, its
+    /// SQLite backend driver, and the shared `AsyncIsle` in one cached
+    /// value, and derives durable (SQLite-persisted) sink checkpoints along
+    /// the way; nothing in this server currently calls `Store::catch_up` /
+    /// `Store::rebuild` (the only consumers of that checkpoint), so this is
+    /// presently inert but strictly more correct than the in-memory-only
+    /// checkpoints the hand-wired construction had.
+    ///
+    /// `Store` is cheap to clone (every field is `Arc`-backed internally —
+    /// see `ai_store_core::Store`'s doc comment), so returning a fresh
+    /// `Arc::new(..)` around a `.clone()` of the cached `SqliteStore`'s
+    /// `Store` on every call is equivalent to sharing one `Arc<Store>`: the
+    /// per-stream write locks, checkpoint map, and registered sinks are the
+    /// same underlying instances either way.
     pub(crate) async fn store_for(&self, slug: &str) -> Result<Arc<Store>, McpError> {
         {
             let cache = self.snapshot_stores.lock().await;
             if let Some(entry) = cache.get(slug) {
-                return Ok(Arc::clone(&entry.store));
+                return Ok(Arc::new(entry.store().clone()));
             }
         }
 
@@ -124,22 +131,19 @@ impl OutlineMcpServer {
             McpError::internal_error(format!("Failed to create shelf directory: {e}"), None)
         })?;
         let db_path = self.shelf_dir.join(format!("{slug}.events.db"));
-        let backends = SqliteBackends::open(&db_path).await.map_err(|e| {
+        let sink_shelf_dir = self.shelf_dir.clone();
+        let sink_slug = slug.to_string();
+        let sqlite_store = SqliteStore::open_with(&db_path, move |builder| {
+            builder.sink(Arc::new(SnapshotOnlySink::new(sink_shelf_dir, sink_slug)))
+        })
+        .await
+        .map_err(|e| {
             McpError::internal_error(
                 format!("Failed to open event store for '{slug}': {e}"),
                 None,
             )
         })?;
-        let events: Arc<dyn EventBackend> = Arc::new(backends.events);
-        let cache_backend: Arc<dyn CacheBackend> = Arc::new(backends.cache);
-        let sink = SnapshotDumpSink::new(self.shelf_dir.clone(), slug.to_string());
-        let store = Arc::new(Store::new(
-            events,
-            cache_backend,
-            Vec::new(),
-            vec![Arc::new(BlockingSink::new(sink))],
-            StoreConfig::default(),
-        ));
+        let store = Arc::new(sqlite_store.store().clone());
 
         // Best-effort: warn about un-migrated legacy `.snap.*.json` files
         // for this slug now that its `Store` has been freshly constructed
@@ -160,11 +164,8 @@ impl OutlineMcpServer {
         }
 
         let mut cache = self.snapshot_stores.lock().await;
-        let entry = cache.entry(slug.to_string()).or_insert(SnapshotStoreEntry {
-            store,
-            _driver: backends.driver,
-        });
-        Ok(Arc::clone(&entry.store))
+        let entry = cache.entry(slug.to_string()).or_insert(sqlite_store);
+        Ok(Arc::new(entry.store().clone()))
     }
 
     /// Convenience wrapper: `SnapshotService` bound to `slug`'s `Store`.
@@ -185,28 +186,55 @@ impl OutlineMcpServer {
         self.shelf_dir.join(format!("{slug}.json"))
     }
 
+    /// Constructs the (ai-store-backed, JSON-history-preserving) changelog
+    /// repository for `slug`, sharing `slug`'s `Store` with the snapshot
+    /// subsystem (see `Self::store_for`). Single construction point used by
+    /// `Self::service_for` and by tool handlers that query/append changelog
+    /// entries outside of a `BookService` (e.g. `book_history`,
+    /// `node_history`, the `Restore` entries `snapshot_restore` records).
+    pub(crate) async fn changelog_for(
+        &self,
+        slug: &str,
+    ) -> Result<HistoryPreservingChangeLogRepository, McpError> {
+        let store = self.store_for(slug).await?;
+        HistoryPreservingChangeLogRepository::new(store, self.shelf_dir.clone(), slug).map_err(
+            |e| {
+                McpError::internal_error(
+                    format!("Failed to construct changelog for slug '{slug}': {e}"),
+                    None,
+                )
+            },
+        )
+    }
+
     /// 選択中BookのServiceを返す。未選択ならエラー。
-    pub(crate) fn service(&self) -> Result<BookService<JsonBookRepository>, McpError> {
-        let guard = self
-            .selected
-            .read()
-            .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
-        let slug = guard.as_ref().ok_or_else(|| {
-            McpError::invalid_params(
-                "No book selected. Use `shelf` to list books and `select_book` to choose one.",
-                None,
-            )
-        })?;
-        let repo = JsonBookRepository::new(self.book_path(slug));
-        let changelog = Box::new(JsonChangeLogRepository::new(&self.shelf_dir, slug.as_str()));
-        Ok(BookService::new(repo).with_changelog(changelog))
+    pub(crate) async fn service(&self) -> Result<BookService<JsonBookRepository>, McpError> {
+        let slug = {
+            let guard = self
+                .selected
+                .read()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
+                        None,
+                    )
+                })?
+                .clone()
+        };
+        self.service_for(&slug).await
     }
 
     /// 指定slugのServiceを返す（選択状態不要）。
-    pub(crate) fn service_for(&self, slug: &str) -> BookService<JsonBookRepository> {
+    pub(crate) async fn service_for(
+        &self,
+        slug: &str,
+    ) -> Result<BookService<JsonBookRepository>, McpError> {
         let repo = JsonBookRepository::new(self.book_path(slug));
-        let changelog = Box::new(JsonChangeLogRepository::new(&self.shelf_dir, slug));
-        BookService::new(repo).with_changelog(changelog)
+        let changelog = Box::new(self.changelog_for(slug).await?);
+        Ok(BookService::new(repo).with_changelog(changelog))
     }
 
     /// Shelf内のslug一覧をソート順で返す。
@@ -272,7 +300,7 @@ impl OutlineMcpServer {
     pub(crate) async fn resolve_id(&self, s: &str) -> Result<NodeId, McpError> {
         // 1. 階層番号（"1", "2-3", "1-2-1" 等）
         if is_hierarchical_id(s) {
-            let svc = self.service()?;
+            let svc = self.service().await?;
             let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
             let mapping = build_hierarchical_ids(&book);
             if let Some((_, id)) = mapping.iter().find(|(num, _)| num == s) {
@@ -289,7 +317,7 @@ impl OutlineMcpServer {
             return Ok(id);
         }
 
-        let svc = self.service()?;
+        let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
         // 3. 短縮プレフィックスでBook内を検索
@@ -442,5 +470,56 @@ mod tests {
         let info = server.get_info();
         assert_eq!(info.server_info.name, "outline-mcp");
         assert!(!info.server_info.version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_service_for_and_changelog_for_share_slug_history() {
+        use outline_mcp_core::domain::model::book::AddNodeRequest;
+        use outline_mcp_core::domain::model::node::NodeType;
+        use outline_mcp_core::domain::repository::ChangeLogRepository;
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join("outline-mcp-server-changelog-wiring-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp shelf dir");
+
+        let server = OutlineMcpServer::new(dir.clone());
+        let slug = "wiring-book";
+
+        // `service_for` now backs its changelog with `changelog_for`'s
+        // ai-store-shared `Store` (Task B wiring) instead of a standalone
+        // `JsonChangeLogRepository` — this exercises that path end to end.
+        let svc = server.service_for(slug).await.expect("service_for");
+        svc.create_book("Wiring Test", 4)
+            .await
+            .expect("create_book");
+        let (id, warning) = svc
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "Node".to_string(),
+                node_type: NodeType::Content,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+                properties: HashMap::new(),
+            })
+            .await
+            .expect("add_node");
+        assert!(
+            warning.is_none(),
+            "changelog append should succeed: {warning:?}"
+        );
+
+        // `changelog_for` shares `slug`'s `Store` with `service_for` (both
+        // go through `Self::store_for`) — querying it directly must see
+        // the entry `service_for`'s `BookService` just wrote.
+        let cl_repo = server.changelog_for(slug).await.expect("changelog_for");
+        let entries = ChangeLogRepository::load_all(&cl_repo)
+            .await
+            .expect("load_all");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].node_id, id);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

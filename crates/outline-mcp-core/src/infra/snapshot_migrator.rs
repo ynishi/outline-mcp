@@ -89,13 +89,12 @@ use ai_store_core::{
     CacheBackend, EventBackend, Label, Seq, Store, StoreConfig, StoreError,
     Timestamp as StoreTimestamp,
 };
-use ai_store_sync::BlockingSink;
 use serde_json::Value;
 
 use crate::domain::model::book::TemplateBook;
 use crate::domain::model::timestamp::Timestamp;
 use crate::infra::snapshot::{list_snapshots, snapshot_path, snapshot_stream_key, SnapshotInfo};
-use crate::infra::snapshot_sink::SnapshotDumpSink;
+use crate::infra::snapshot_sink::SnapshotOnlySink;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -302,7 +301,7 @@ async fn import_one(
         Value::from(Timestamp::now().as_millis()),
     );
 
-    let seq = store
+    let committed = store
         .import_event(
             stream,
             KIND_SNAPSHOT_IMPORTED,
@@ -323,7 +322,9 @@ async fn import_one(
     // service's source of truth for `list`/`tag`, so a `label_set` failure
     // here must not roll back the import itself.
     if let Some(label) = label {
-        let _ = store.label_set(stream, &Label::new(label), seq).await;
+        let _ = store
+            .label_set(stream, &Label::new(label), committed.seq)
+            .await;
     }
 
     Ok(())
@@ -378,12 +379,12 @@ pub async fn migrate_slug(shelf_dir: &Path, slug: &str) -> Result<MigrationRepor
         .map_err(box_store_err)?;
     let events: Arc<dyn EventBackend> = Arc::new(backends.events);
     let cache: Arc<dyn CacheBackend> = Arc::new(backends.cache);
-    let sink = SnapshotDumpSink::new(shelf_dir.to_path_buf(), slug.to_string());
+    let sink = SnapshotOnlySink::new(shelf_dir.to_path_buf(), slug.to_string());
     let store = Arc::new(Store::new(
         events,
         cache,
         Vec::new(),
-        vec![Arc::new(BlockingSink::new(sink))],
+        vec![Arc::new(sink)],
         StoreConfig::default(),
     ));
 
@@ -408,8 +409,10 @@ mod tests {
     use crate::domain::model::book::AddNodeRequest;
     use crate::domain::model::node::NodeType;
     use crate::infra::snapshot::{write_meta, write_snapshot_body, SnapshotMeta, SnapshotService};
-    use ai_store_core::{Event, NewEvent, StreamId};
+    use crate::infra::snapshot_sink::SnapshotDumpSink;
+    use ai_store_core::{Committed, Event, NewEvent, StreamId};
     use ai_store_mem::{MemCacheBackend, MemEventBackend};
+    use ai_store_sync::BlockingSink;
     use async_trait::async_trait;
     use std::collections::HashMap;
 
@@ -457,7 +460,7 @@ mod tests {
 
     #[async_trait]
     impl EventBackend for NoImportEventBackend {
-        async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Seq, StoreError> {
+        async fn append(&self, stream: &StreamId, rec: NewEvent) -> Result<Committed, StoreError> {
             self.0.append(stream, rec).await
         }
         async fn read(

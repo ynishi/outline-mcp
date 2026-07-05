@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "ai-store-core"
-version = "0.7.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdf868dbe8c8cf11b8c41346d1e16e845704ffe555e414f0d7f3f902eb171093"
+checksum = "00be50415ed06c99a5317f56f1d98fa44cacd571489b6beb1ad0a10c37f81637"
 dependencies = [
  "async-trait",
  "json-patch",
@@ -20,9 +20,9 @@ dependencies = [
 
 [[package]]
 name = "ai-store-mem"
-version = "0.7.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2748f3bb18be4dec82e9feb49d3435bd0f6fd840c4ee740ca77dbf167ad1a253"
+checksum = "e59bd4ca3467bd7b427dbdfdfb29696565b11bf20c3503ae77e2a6735bb90207"
 dependencies = [
  "ai-store-core",
  "async-trait",
@@ -32,9 +32,9 @@ dependencies = [
 
 [[package]]
 name = "ai-store-sqlite"
-version = "0.7.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc47b49758fe42b71dd8245e50d443d577eae1428c0d3400aa84c6ff29fc14e2"
+checksum = "3dbf8ab6e599f757caf2c9e63332cf2fdb12165b8c74cd372a116e50f6ad7131"
 dependencies = [
  "ai-store-core",
  "async-trait",
@@ -48,9 +48,9 @@ dependencies = [
 
 [[package]]
 name = "ai-store-sync"
-version = "0.7.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a70ba5fe0adf3f55ade9824b6fd66b030ca3077c1a23d04e26ad7413b04759c9"
+checksum = "603cb267346f0903dd70db266d1acf3734c8abc4a221e2bc941f805af32a0df7"
 dependencies = [
  "ai-store-core",
  "async-trait",

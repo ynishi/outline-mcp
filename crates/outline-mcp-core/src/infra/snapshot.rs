@@ -35,7 +35,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ai_store_core::{Label, Seq, Store, StreamId, Timestamp as StoreTimestamp};
+use ai_store_core::{Label, Store, StreamId, Timestamp as StoreTimestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -231,13 +231,12 @@ impl SnapshotService {
         let next = serde_json::to_value(book)?;
         let patch = json_patch::diff(&current, &next);
         let meta = serde_json::json!({ "label": label });
-        let seq = self
+        let committed = self
             .store
             .append(&self.stream, KIND_SNAPSHOT, patch, meta)
             .await
             .map_err(box_store_err)?;
-        let millis = self.event_millis(seq).await?;
-        Ok(snapshot_path(&self.shelf_dir, &self.slug, millis))
+        Ok(snapshot_path(&self.shelf_dir, &self.slug, committed.at.0))
     }
 
     /// Attaches (or overwrites) a label on an existing snapshot. Only the
@@ -338,20 +337,6 @@ impl SnapshotService {
         let meta_path = meta_path(&self.shelf_dir, &self.slug, timestamp_millis);
         let _ = std::fs::remove_file(&meta_path);
         Ok(())
-    }
-
-    /// Resolves the wall-clock millis assigned to `seq` by the backend.
-    async fn event_millis(&self, seq: Seq) -> Result<i64, BoxError> {
-        let events = self
-            .store
-            .read(&self.stream, seq, 1)
-            .await
-            .map_err(box_store_err)?;
-        let event = events
-            .into_iter()
-            .next()
-            .ok_or_else(|| -> BoxError { "snapshot event not found after append".into() })?;
-        Ok(event.at.0)
     }
 }
 
