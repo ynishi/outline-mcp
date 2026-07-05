@@ -16,6 +16,12 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
+## [0.10.1] - 2026-07-05
+
+### Changed
+
+- **Bump `ai-store` 0.4 → 0.7** (`ai-store-core` / `ai-store-sqlite` / `ai-store-sync` / `ai-store-mem`). API is unchanged across 0.5/0.6/0.7 per the ai-store CHANGELOG (the new `SqliteBackend` trait in 0.7 is purely additive; the existing inherent `new` constructors and `SqliteBackends::open` signature are preserved). Transitively bumps `rusqlite` 0.31 → 0.37 and `libsqlite3-sys` 0.28 → 0.35; outline-mcp holds no direct `rusqlite` dependency so no band conflict for downstream. No code changes required in `outline-mcp-core` / `outline-mcp-rmcp`; all 194 workspace tests continue to pass.
+
 ## [0.10.0] - 2026-07-04
 
 ### Added
