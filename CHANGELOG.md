@@ -8,6 +8,18 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.11.0] - 2026-07-05
+
+### Changed
+
 - **Bump `ai-store` 0.7 → 0.9** (`ai-store-core` / `ai-store-sqlite` / `ai-store-sync`, dev-only `ai-store-mem`). `Store::append` / `Store::import_event` / `Store::revert` now return `Committed { seq, at }` instead of a bare `Seq`; `SnapshotService::create` and the snapshot migrator use the returned `at` directly instead of a follow-up `Store::read` round trip. `ProjectionSink::accepts` is now honored by the facade's automatic dispatch; a new `SnapshotOnlySink` (wrapping `SnapshotDumpSink` in a `BlockingSink`) filters dispatch to the dedicated snapshot stream, so per-node changelog appends on a `Store` shared with the snapshot subsystem no longer trigger a no-op `spawn_blocking` call. `OutlineMcpServer::store_for` now builds its per-slug `Store` via `ai_store_sqlite::SqliteStore::open_with` instead of hand-wiring `SqliteBackends` + `Store::new`, which also switches sink checkpoints from in-memory-only to SQLite-persisted (unexercised today — nothing in this server calls `Store::catch_up` / `Store::rebuild`).
 - **`AiStoreChangeLogRepository` is now wired into `server.rs`.** The changelog writer for `node_create` / `node_update` / `node_move` / `node_batch_move` / `node_batch_update` / `remove_node` / the restore trail recorded by `snapshot_restore` is now ai-store-backed rather than the JSON-file `JsonChangeLogRepository` (resolves the "not yet wired" limitation noted in 0.10.0). A new `HistoryPreservingChangeLogRepository` (`outline-mcp-core::infra::changelog_bridge`) bridges pre-existing `{slug}.changelog.json` history: new appends land in ai-store only, while `load_all` / `load_by_node` (used by `node_history` / `book_history`) concatenate the frozen legacy entries ahead of the ai-store ones, so upgrading consumers keep their full changelog history with no dedicated migration step.
 
