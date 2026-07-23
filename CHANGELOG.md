@@ -12,6 +12,8 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **Drop `smithery.yaml`** (added in `0.11.1`). Smithery has moved to a Streamable HTTP-only publish model — the web submit form now rejects stdio servers and requires a hosted HTTPS endpoint. `smithery.yaml` declared `startCommand.type: stdio`, which is no longer a valid publish target. Since outline-mcp is a stdio-only MCP server (spawned via `docker run -i --rm` or as a native binary), Smithery listing is not applicable without adding an HTTP transport + hosting layer, which is out of scope for the distribution surface. The file is removed to avoid signaling a distribution channel that does not work.
+
 ### Fixed
 
 ### Security
