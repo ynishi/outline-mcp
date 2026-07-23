@@ -1,0 +1,27 @@
+# Config for 'cargo dist' (https://opensource.axo.dev/cargo-dist/)
+#
+# NOTE: cargo-dist-version is a TODO — cargo-dist CLI was not installed at setup time.
+# After `cargo install cargo-dist`, run `cargo dist --version` and update this pin.
+[dist]
+cargo-dist-version = "0.28.0"
+ci = ["github"]
+installers = ["shell", "powershell", "homebrew"]
+tap = "ynishi/homebrew-outline-mcp"
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]
+
+# The archive format that packages the binary (default = zip on Windows, tar.xz elsewhere).
+# unix-archive = "tar.xz"
+# windows-archive = "zip"
+
+# Publish jobs to run in CI. GitHub Releases is default; additional installer
+# targets (homebrew tap push, APT repo, Docker image) are driven by the installers
+# array above + tap field.
+publish-jobs = ["homebrew"]
+
+# The bin target we want to distribute (workspace has a single bin crate).
+# cargo-dist auto-detects [[bin]] from workspace members with `src/main.rs`.
