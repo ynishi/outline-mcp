@@ -1,0 +1,10 @@
+# smithery.yaml
+startCommand:
+  type: stdio
+  command: outline-mcp
+  args: []
+configSchema:
+  type: object
+  properties: {}
+  required: []
+exampleConfig: {}
