@@ -1,0 +1,26 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]
+# Homebrew tap repo for the Formula (Human must create this empty repo)
+tap = "ynishi/homebrew-outline-mcp"
+# Additional publish jobs (homebrew tap push)
+publish-jobs = ["homebrew"]
+# The CI file is hand-merged with existing GHCR + MCP Registry publish jobs;
+# do not treat manual edits as drift.
+allow-dirty = ["ci"]
