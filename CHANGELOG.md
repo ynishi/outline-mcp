@@ -8,6 +8,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Crate metadata gains `homepage` and `documentation`** (`Cargo.toml` `[workspace.package]`, inherited by all three member crates). Their absence made every release run warn `The Homebrew publish job is enabled but no homepage was specified`, and left the generated Formula without a homepage.
+- **`outline-mcp-rmcp`'s description now names both transports.** It read "... and stdio transport wiring over outline-mcp-core", which stopped being accurate when the streamable HTTP transport landed in 0.12.0. crates.io showed the stale wording for that release.
+
 ### Deprecated
 
 ### Removed

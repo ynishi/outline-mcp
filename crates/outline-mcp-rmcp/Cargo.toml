@@ -5,7 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "rmcp (MCP) interface layer for outline-mcp: ServerHandler, tool_router, and stdio transport wiring over outline-mcp-core"
+homepage.workspace = true
+documentation.workspace = true
+description = "rmcp (MCP) interface layer for outline-mcp: ServerHandler, tool_router, and stdio / streamable HTTP transport wiring over outline-mcp-core"
 keywords = ["mcp", "outline", "checklist", "tree"]
 categories = ["command-line-utilities"]
 

@@ -83,7 +83,7 @@ pub async fn run_http(shelf_dir: PathBuf, bind: &str) -> anyhow::Result<()> {
     use std::sync::Arc;
 
     use rmcp::transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
 
     // Unlike the stdio path, stdout is not a protocol channel here, but the
