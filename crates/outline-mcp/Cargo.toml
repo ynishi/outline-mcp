@@ -17,7 +17,7 @@ categories = ["command-line-utilities"]
 formula = "outline-mcp"
 
 [dependencies]
-outline-mcp-rmcp = { path = "../outline-mcp-rmcp", version = "0.12.0" }
-outline-mcp-core = { path = "../outline-mcp-core", version = "0.12.0" }
+outline-mcp-rmcp = { path = "../outline-mcp-rmcp", version = "0.13.0" }
+outline-mcp-core = { path = "../outline-mcp-core", version = "0.13.0" }
 tokio = { workspace = true }
 anyhow = { workspace = true }

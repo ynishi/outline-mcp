@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.13.0] - 2026-08-15
+
+### Added
+
 - **`properties_patch` on `node_update` and `node_batch_update`** (`crates/outline-mcp-rmcp/src/request.rs`, `crates/outline-mcp-core/src/domain/model/{book,node}.rs`). Merges the listed keys into a node's existing properties and leaves the rest alone, where `properties` replaces the whole map. Until now a caller that wanted to change one key had to read every other key back and resend it, and there was no way to read them back reliably from another host: `dump` writes its JSON on the *server's* filesystem, and `node_query` renders properties as `k=v, k=v` text whose values legitimately contain both `", "` and `"="`. A caller that got that round-trip wrong destroyed the properties it failed to parse. The two fields are mutually exclusive — supplying both is rejected as `DomainError::ConflictingPropertyUpdate` before any field is written, since applying replace and merge in one call would make the result depend on which ran last. Removal still goes through `properties`; a patch has no way to say "absent".
 
 ### Changed
