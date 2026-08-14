@@ -59,6 +59,107 @@ pub async fn run(shelf_dir: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Serve over streamable HTTP transport (multi-device / SSOT-daemon mode).
+///
+/// One central daemon owns the shelf directory (book JSON files + per-slug
+/// `.events.db` SQLite); remote devices connect as MCP clients to
+/// `http://<bind>/mcp`. Because every device talks to the same single
+/// process, the existing single-writer storage model is preserved and no
+/// cross-device sync/conflict handling is needed.
+///
+/// # Security model
+///
+/// - Loopback bind (default `127.0.0.1:8486`): token optional. rmcp's default
+///   `Host` header validation (loopback-only) guards against DNS rebinding.
+/// - Non-loopback bind: `OUTLINE_MCP_HTTP_TOKEN` **must** be set or startup is
+///   refused. When a token is set, every request must carry
+///   `Authorization: Bearer <token>`. Host validation is disabled in this
+///   case (the bearer token replaces it); TLS termination, if desired, is a
+///   reverse-proxy concern.
+pub async fn run_http(shelf_dir: PathBuf, bind: &str) -> anyhow::Result<()> {
+    use std::sync::Arc;
+
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+
+    // Unlike the stdio path, stdout is not a protocol channel here, but the
+    // subscriber still targets stderr so daemon logs behave identically in
+    // both transports (and under systemd, both land in the journal).
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let server = OutlineMcpServer::new(shelf_dir);
+
+    let addr: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --bind address {bind:?}: {e}"))?;
+    let token = std::env::var("OUTLINE_MCP_HTTP_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(Arc::<str>::from);
+    let loopback = addr.ip().is_loopback();
+    if !loopback && token.is_none() {
+        anyhow::bail!(
+            "refusing to bind non-loopback address {addr} without OUTLINE_MCP_HTTP_TOKEN \
+             (set the token, or bind a loopback address)"
+        );
+    }
+
+    let mut http_config = StreamableHttpServerConfig::default();
+    if !loopback {
+        // Bearer auth replaces loopback Host validation for LAN/remote binds.
+        http_config.allowed_hosts.clear();
+    }
+    let service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        http_config,
+    );
+
+    let mut router = axum::Router::new().nest_service("/mcp", service);
+    if let Some(token) = token {
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let token = Arc::clone(&token);
+                async move {
+                    if bearer_token_matches(req.headers(), &token) {
+                        next.run(req).await
+                    } else {
+                        axum::response::IntoResponse::into_response((
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            "missing or invalid bearer token",
+                        ))
+                    }
+                }
+            },
+        ));
+    }
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, auth = if loopback { "loopback" } else { "bearer-token" }, "serving MCP over streamable HTTP at /mcp");
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+/// Constant-time comparison of the request's `Authorization: Bearer` value
+/// against the configured token.
+fn bearer_token_matches(headers: &axum::http::HeaderMap, token: &str) -> bool {
+    let Some(presented) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    let (a, b) = (presented.as_bytes(), token.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 // =============================================================================
 // MCP Server
 // =============================================================================

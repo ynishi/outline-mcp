@@ -34,4 +34,4 @@ mod resources;
 mod server;
 mod tools;
 
-pub use server::{run, OutlineMcpServer};
+pub use server::{run, run_http, OutlineMcpServer};
