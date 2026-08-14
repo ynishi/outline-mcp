@@ -12,7 +12,26 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
-- **Drop `smithery.yaml`** (added in `0.11.1`). Smithery has moved to a Streamable HTTP-only publish model — the web submit form now rejects stdio servers and requires a hosted HTTPS endpoint. `smithery.yaml` declared `startCommand.type: stdio`, which is no longer a valid publish target. Since outline-mcp is a stdio-only MCP server (spawned via `docker run -i --rm` or as a native binary), Smithery listing is not applicable without adding an HTTP transport + hosting layer, which is out of scope for the distribution surface. The file is removed to avoid signaling a distribution channel that does not work.
+### Fixed
+
+### Security
+
+## [0.12.0] - 2026-08-14
+
+### Added
+
+- **Streamable HTTP transport for SSOT-daemon mode** (`--mcp-http`, `crates/outline-mcp-rmcp/src/server.rs::run_http`, `crates/outline-mcp/src/main.rs`). One central process owns the shelf directory (book JSON + per-slug `.events.db`) and remote devices connect as MCP clients over `http://<bind>/mcp`, which preserves the existing single-writer storage model without any cross-device sync or conflict handling. `--bind` defaults to `127.0.0.1:8486`. Security model: on a loopback bind a token is optional and rmcp's default `Host` header validation guards against DNS rebinding; on a non-loopback bind `OUTLINE_MCP_HTTP_TOKEN` is mandatory and startup is refused without it (the check runs before any listener is opened), after which every request must carry `Authorization: Bearer <token>`. TLS termination is a reverse-proxy concern. Pulls in `rmcp`'s `transport-streamable-http-server` feature plus `axum` 0.8; the stdio transport is unchanged and remains the default with no flag.
+- **systemd / launchd daemon templates** (`contrib/systemd/outline-mcp.service`, `contrib/launchd/io.github.ynishi.outline-mcp.plist`) for running `--mcp-http` as a user-level service.
+- **Deployment runbooks** (`docs/runbooks/data-migration.md`, `docs/runbooks/multi-device-smoke.md`). The first covers moving an existing shelf to a central host (flat-shelf layout, WAL copy rule, single-book variant, legacy snapshot migration); the second is an eight-item `[OK]`/`[NG]` smoke checklist for the HTTP transport.
+- **Homebrew formula publish job** (`.github/workflows/release.yml`). Pushes the cargo-dist-generated Formula to the `ynishi/homebrew-outline-mcp` tap on tag push.
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+- **Drop `smithery.yaml`** (added in `0.11.1`). Smithery has moved to a Streamable HTTP-only publish model — the web submit form now rejects stdio servers and requires a hosted HTTPS endpoint. `smithery.yaml` declared `startCommand.type: stdio`, which is no longer a valid publish target. Note that the `--mcp-http` transport added in this same release does not change the conclusion: it is a self-hosted daemon meant for loopback or LAN use, not the hosted HTTPS endpoint a Smithery listing requires. The file is removed to avoid signaling a distribution channel that does not work.
 
 ### Fixed
 
