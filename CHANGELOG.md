@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Log lines no longer carry ANSI colour escapes** (`crates/outline-mcp-rmcp/src/server.rs`). Both the stdio and the `--mcp-http` subscriber called `tracing_subscriber::fmt().with_writer(std::io::stderr)` without `.with_ansi(false)`; tracing-subscriber does not probe the writer for TTY-ness, so escape codes were written verbatim into every non-terminal destination — a client's captured stderr in stdio mode, and `StandardErrorPath` / the journal under the launchd / systemd daemon forms. `grep`-ing a daemon log for the startup line returned `^[[2m…^[[0m`-laden output. Both subscribers now disable ANSI unconditionally, matching the expectation stated in `docs/runbooks/multi-device-smoke.md` §2.
+
 ### Security
 
 ## [0.11.1] - 2026-07-23

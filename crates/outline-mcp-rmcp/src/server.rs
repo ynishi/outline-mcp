@@ -49,8 +49,11 @@ pub async fn run(shelf_dir: PathBuf) -> anyhow::Result<()> {
     // the protocol stream, so this must never target stdout. `try_init`
     // (rather than `init`) tolerates a subscriber already having been
     // installed (e.g. by an embedding host, or a repeated call in tests).
+    // ANSI is off because tracing-subscriber never probes the writer for
+    // TTY-ness: stderr here is a client's captured pipe, not a terminal.
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .try_init();
 
     let server = OutlineMcpServer::new(shelf_dir);
@@ -85,9 +88,13 @@ pub async fn run_http(shelf_dir: PathBuf, bind: &str) -> anyhow::Result<()> {
 
     // Unlike the stdio path, stdout is not a protocol channel here, but the
     // subscriber still targets stderr so daemon logs behave identically in
-    // both transports (and under systemd, both land in the journal).
+    // both transports (and under systemd, both land in the journal). ANSI is
+    // off for the same reason as the stdio path, and it matters more here:
+    // a daemon's stderr is a log file (launchd `StandardErrorPath`) or the
+    // journal, and colour escapes would be written into it verbatim.
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .try_init();
 
     let server = OutlineMcpServer::new(shelf_dir);
