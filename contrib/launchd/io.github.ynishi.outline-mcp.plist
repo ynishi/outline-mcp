@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd user agent for outline-mcp SSOT-daemon mode (macOS).
+
+  launchd does not expand ~ — replace __HOME__ with your home directory
+  (e.g. /Users/you) before installing:
+
+    sed "s|__HOME__|$HOME|g" contrib/launchd/io.github.ynishi.outline-mcp.plist \
+      > ~/Library/LaunchAgents/io.github.ynishi.outline-mcp.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.ynishi.outline-mcp.plist
+
+  Stop / remove:
+    launchctl bootout gui/$(id -u)/io.github.ynishi.outline-mcp
+
+  LAN exposure requires OUTLINE_MCP_HTTP_TOKEN (startup is refused otherwise):
+  add it under EnvironmentVariables and change the bind address.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.ynishi.outline-mcp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.cargo/bin/outline-mcp</string>
+        <string>__HOME__/.config/outline-mcp/books</string>
+        <string>--mcp-http</string>
+        <string>--bind</string>
+        <string>127.0.0.1:8486</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/outline-mcp.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/outline-mcp.err</string>
+</dict>
+</plist>

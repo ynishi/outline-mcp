@@ -1,0 +1,27 @@
+# systemd user unit for outline-mcp SSOT-daemon mode (Linux).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/systemd/outline-mcp.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now outline-mcp
+#
+# Logs: journalctl --user -u outline-mcp -f
+
+[Unit]
+Description=outline-mcp — tree-structured knowledge base MCP server (streamable HTTP)
+After=network.target
+
+[Service]
+# Shelf directory defaults to ~/.config/outline-mcp/books when the
+# positional argument is omitted; kept explicit here so the unit is the
+# single place that states where the SSOT shelf lives.
+ExecStart=%h/.cargo/bin/outline-mcp %h/.config/outline-mcp/books --mcp-http --bind 127.0.0.1:8486
+# LAN exposure requires a token (startup is refused otherwise):
+#   Environment=OUTLINE_MCP_HTTP_TOKEN=<random-string>
+# and change --bind to 0.0.0.0:8486 in ExecStart.
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
