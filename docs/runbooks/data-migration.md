@@ -39,13 +39,15 @@ pgrep -fl outline-mcp
 
 - **stdio instances** are spawned by MCP clients (editor / agent sessions) —
   close those sessions.
-- **lds embeds outline in-process** (`lds-outline` wraps the same shelf dir
-  directly, no `outline-mcp` process appears in pgrep). Close every Claude
-  Code / lds session on the source host too, or its in-process handle keeps
-  writing the old inodes and those writes are lost after the move.
+- **In-process embedders leave no trace in pgrep.** A host can link this crate
+  and open the shelf directory directly instead of spawning `outline-mcp`, so
+  the checks above find nothing while the shelf is still being written
+  (`local-develop-server` is one such host). Close every session of any such
+  client on the source host too, or its in-process handle keeps writing the
+  old inodes and those writes are lost after the move.
 
-**Expect**: no `outline-mcp` process and no live lds session on the source
-host.
+**Expect**: no `outline-mcp` process, and no live session of any in-process
+embedder, on the source host.
 
 ## 2. Source host: archive
 
@@ -118,12 +120,12 @@ the next `shelf` — but the stop/start bracket keeps the WAL rule in §0 honest
   `find ~/.config/outline-mcp/books -type l ! -exec test -e {} \; -print`
   (expect: no output).
 - **Old host becomes a client**: after migration the source host must reach
-  the shelf through the central daemon only. Leaving lds's embedded outline
-  (or a standalone stdio outline-mcp) pointed at the old local shelf means
-  two writable copies — two diverging sources of truth. Switch the source
-  host to the HTTP endpoint (lds `[remote.outline]` config once landed, or a
-  direct MCP HTTP registration), or move the old shelf out of the default
-  path so an accidental embed start finds nothing.
+  the shelf through the central daemon only. Leaving an embedded outline (or
+  a standalone stdio outline-mcp) pointed at the old local shelf means two
+  writable copies — two diverging sources of truth. Switch the source host to
+  the HTTP endpoint (via whatever remote-server setting the embedder exposes,
+  or a direct MCP HTTP registration), or move the old shelf out of the
+  default path so an accidental embed start finds nothing.
 - **No node-level merge**: this procedure replaces files wholesale. If both
   sides accumulated distinct edits to the same book, merging is manual
   (snapshot dumps + eyeballs) — there is no merge subcommand. The `.bak`
