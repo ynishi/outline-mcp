@@ -45,6 +45,38 @@ cargo install --path .
 
 If the path argument is omitted, defaults to `outline-book.json` in the current directory.
 
+### Multi-device (one shelf, many devices)
+
+`--mcp-http` serves the same tools over MCP's streamable HTTP transport, so several devices can share one shelf. A single process owns the directory — book JSON plus the per-slug `.events.db` — which keeps the single-writer storage model intact, so there is no sync or conflict resolution to configure.
+
+```bash
+outline-mcp /path/to/books --mcp-http                          # 127.0.0.1:8486
+outline-mcp /path/to/books --mcp-http --bind 127.0.0.1:9000
+```
+
+Point clients at `/mcp` on that address:
+
+```json
+{
+  "mcpServers": {
+    "outline": {
+      "type": "http",
+      "url": "http://127.0.0.1:8486/mcp"
+    }
+  }
+}
+```
+
+Binding beyond loopback requires a token. Startup is refused without one, before any listener is opened:
+
+```bash
+OUTLINE_MCP_HTTP_TOKEN=<token> outline-mcp /path/to/books --mcp-http --bind 0.0.0.0:8486
+```
+
+Every request must then carry `Authorization: Bearer <token>` — set it wherever your MCP client configures request headers. TLS termination is a reverse-proxy concern. Logs go to stderr in both transports; stdout stays reserved for the stdio protocol channel.
+
+Service templates for running this as a daemon live in `contrib/systemd/` and `contrib/launchd/`. `docs/runbooks/` covers moving an existing shelf to a central host (`data-migration.md`) and verifying a deployment end to end (`multi-device-smoke.md`).
+
 ## Workflow
 
 ```
@@ -105,7 +137,7 @@ node_create  title="My Rule"  properties={"inject": "true", "scope": "rust"}
 
 ## Architecture
 
-The repository is a Cargo workspace with two crates: an rmcp-independent SDK (`outline-mcp-core`) and the MCP server binary (`outline-mcp`).
+The repository is a Cargo workspace with three crates: an rmcp-independent SDK (`outline-mcp-core`), the MCP protocol layer (`outline-mcp-rmcp`), and the server binary (`outline-mcp`).
 
 ```
 crates/
@@ -121,19 +153,24 @@ crates/
 │       └── infra/        # Persistence
 │           ├── json_store.rs # JSON file repository (atomic write)
 │           ├── changelog_store.rs
+│           ├── ai_store_changelog.rs
 │           └── snapshot.rs
-└── outline-mcp/          # Binary crate (MCP server, depends on outline-mcp-core)
+├── outline-mcp-rmcp/     # MCP layer (rmcp; stdio + streamable HTTP)
+│   └── src/
+│       ├── server.rs     # Transports (run / run_http) + server type
+│       ├── tools.rs      # Tool handlers
+│       └── resources.rs  # Resource handlers
+└── outline-mcp/          # Binary crate (CLI entry point)
     └── src/
-        ├── main.rs       # Entry point
-        └── interface/
-            └── mcp/      # MCP handlers (rmcp, stdio)
+        ├── main.rs       # Flag parsing (--mcp-http / --bind), transport dispatch
+        └── cli.rs        # `migrate-snapshots` subcommand
 ```
 
 Downstream applications that want to embed the tree / snapshot / changelog logic without pulling `rmcp` can depend on `outline-mcp-core` directly:
 
 ```toml
 [dependencies]
-outline-mcp-core = "0.7"
+outline-mcp-core = "0.12"
 ```
 
 ## Export Formats
