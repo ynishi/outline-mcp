@@ -104,6 +104,7 @@ impl OutlineMcpServer {
             node_type,
             placeholder: req.placeholder.map(normalize_text),
             properties: req.properties,
+            properties_patch: req.properties_patch,
             status,
         };
 
@@ -1646,6 +1647,7 @@ impl OutlineMcpServer {
                 node_type: None,
                 placeholder: None,
                 properties: item.properties.clone(),
+                properties_patch: item.properties_patch.clone(),
                 status,
             };
             resolved.push((id, update_req));

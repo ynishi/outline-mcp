@@ -159,6 +159,23 @@ impl TemplateNode {
         self.updated_at = Some(Timestamp::now());
     }
 
+    /// Merge `patch` into the existing properties: listed keys are inserted or
+    /// overwritten, unlisted keys are left alone.
+    ///
+    /// This exists because [`set_properties`](Self::set_properties) replaces
+    /// the whole map, which forces a caller that wants to change one key to
+    /// read every other key back and resend it. Where the map has to travel
+    /// over a wire that is not lossless, that round-trip is where properties
+    /// get dropped. Removal still goes through `set_properties` — a patch
+    /// carries no way to say "absent".
+    pub(crate) fn patch_properties(&mut self, patch: HashMap<String, String>) {
+        if patch.is_empty() {
+            return;
+        }
+        self.properties.extend(patch);
+        self.updated_at = Some(Timestamp::now());
+    }
+
     // Subtask 4 (snapshot_restore) で使用予定
     #[allow(dead_code)]
     pub(crate) fn set_status(&mut self, status: NodeStatus) {

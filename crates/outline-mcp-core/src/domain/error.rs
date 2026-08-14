@@ -19,4 +19,12 @@ pub enum DomainError {
     /// A move would place a node under one of its own descendants.
     #[error("cannot move node {0} under its own descendant")]
     CyclicMove(NodeId),
+
+    /// An update supplied both `properties` (replace) and `properties_patch`
+    /// (merge). Applying both would make the result depend on their order, so
+    /// the caller has to say which one it means.
+    #[error(
+        "node {0}: `properties` (replace) and `properties_patch` (merge) are mutually exclusive"
+    )]
+    ConflictingPropertyUpdate(NodeId),
 }

@@ -179,8 +179,14 @@ pub(crate) struct McpNodeUpdateRequest {
     pub node_type: Option<String>,
     #[schemars(description = "New placeholder hint (null to clear)")]
     pub placeholder: Option<Option<String>>,
-    #[schemars(description = "Replace all properties (omit to keep current). Pass {} to clear.")]
+    #[schemars(
+        description = "Replace all properties (omit to keep current). Pass {} to clear. Use `properties_patch` to change some keys without resending the rest; the two are mutually exclusive."
+    )]
     pub properties: Option<HashMap<String, String>>,
+    #[schemars(
+        description = "Merge these properties into the existing ones: listed keys are set, unlisted keys are kept. Use this to change one key without reading the others back. Cannot be combined with `properties`; removal goes through `properties`."
+    )]
+    pub properties_patch: Option<HashMap<String, String>>,
     #[schemars(
         description = "Node status: 'active' or 'draft'. Draft nodes are excluded from select_book inject."
     )]
@@ -372,8 +378,14 @@ pub(crate) struct McpBatchUpdateItem {
     pub title: Option<String>,
     #[schemars(description = "New body (null to clear, omit to keep current)")]
     pub body: Option<Option<String>>,
-    #[schemars(description = "Replace all properties (omit to keep current). Pass {} to clear.")]
+    #[schemars(
+        description = "Replace all properties (omit to keep current). Pass {} to clear. Use `properties_patch` to change some keys without resending the rest; the two are mutually exclusive."
+    )]
     pub properties: Option<HashMap<String, String>>,
+    #[schemars(
+        description = "Merge these properties into the existing ones: listed keys are set, unlisted keys are kept. Cannot be combined with `properties`."
+    )]
+    pub properties_patch: Option<HashMap<String, String>>,
     #[schemars(description = "Node status: 'active' or 'draft'")]
     pub status: Option<String>,
 }

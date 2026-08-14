@@ -35,7 +35,14 @@ pub struct UpdateNodeRequest {
     /// New placeholder: `Some(None)` clears it, `None` keeps the current value.
     pub placeholder: Option<Option<String>>,
     /// Replacement property map, or `None` to keep the current one.
+    ///
+    /// Mutually exclusive with [`properties_patch`](Self::properties_patch).
     pub properties: Option<HashMap<String, String>>,
+    /// Properties to merge into the existing map: listed keys are inserted or
+    /// overwritten, unlisted keys survive. `None` keeps the current map.
+    ///
+    /// Mutually exclusive with [`properties`](Self::properties).
+    pub properties_patch: Option<HashMap<String, String>>,
     /// New lifecycle status, or `None` to keep the current one.
     pub status: Option<super::changelog::NodeStatus>,
 }
@@ -143,6 +150,12 @@ impl TemplateBook {
 
     /// ノード更新。
     pub fn update_node(&mut self, id: NodeId, req: UpdateNodeRequest) -> Result<(), DomainError> {
+        // Rejected before any field is touched: applying replace and merge in
+        // the same call would make the outcome depend on which ran last.
+        if req.properties.is_some() && req.properties_patch.is_some() {
+            return Err(DomainError::ConflictingPropertyUpdate(id));
+        }
+
         let node = self
             .nodes
             .get_mut(&id)
@@ -162,6 +175,9 @@ impl TemplateBook {
         }
         if let Some(properties) = req.properties {
             node.set_properties(properties);
+        }
+        if let Some(patch) = req.properties_patch {
+            node.patch_properties(patch);
         }
         if let Some(status) = req.status {
             node.set_status(status);
@@ -636,6 +652,7 @@ mod tests {
                 node_type: Some(NodeType::Content),
                 placeholder: None,
                 properties: None,
+                properties_patch: None,
                 status: None,
             },
         )
@@ -645,6 +662,107 @@ mod tests {
         assert_eq!(node.title(), "New");
         assert_eq!(node.body(), Some("description"));
         assert_eq!(*node.node_type(), NodeType::Content);
+    }
+
+    /// Add a node carrying `properties`, returning its id.
+    fn node_with_props(book: &mut TemplateBook, props: &[(&str, &str)]) -> NodeId {
+        book.add_node(AddNodeRequest {
+            parent: None,
+            title: "N".into(),
+            node_type: NodeType::Content,
+            body: None,
+            placeholder: None,
+            position: usize::MAX,
+            properties: props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        })
+        .unwrap()
+    }
+
+    fn patch_only(patch: &[(&str, &str)]) -> UpdateNodeRequest {
+        UpdateNodeRequest {
+            title: None,
+            body: None,
+            node_type: None,
+            placeholder: None,
+            properties: None,
+            properties_patch: Some(
+                patch
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            status: None,
+        }
+    }
+
+    #[test]
+    fn properties_patch_sets_listed_keys_and_keeps_the_rest() {
+        let mut book = make_book();
+        // `evidence` is the shape that motivated the patch path: a free-text
+        // value a caller cannot safely round-trip through a lossy transport.
+        let id = node_with_props(
+            &mut book,
+            &[
+                ("gate_status", "pending"),
+                ("kind", "Pitfall"),
+                ("evidence", "a, b = c"),
+            ],
+        );
+
+        book.update_node(id, patch_only(&[("gate_status", "approved")]))
+            .unwrap();
+
+        let node = book.get_node(id).unwrap();
+        assert_eq!(node.get_property("gate_status"), Some("approved"));
+        assert_eq!(node.get_property("kind"), Some("Pitfall"));
+        assert_eq!(node.get_property("evidence"), Some("a, b = c"));
+        assert_eq!(node.properties().len(), 3);
+    }
+
+    #[test]
+    fn properties_patch_adds_keys_to_a_node_that_had_none() {
+        let mut book = make_book();
+        let id = node_with_props(&mut book, &[]);
+
+        book.update_node(id, patch_only(&[("inject", "true")]))
+            .unwrap();
+
+        assert_eq!(
+            book.get_node(id).unwrap().get_property("inject"),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn empty_properties_patch_is_a_no_op() {
+        let mut book = make_book();
+        let id = node_with_props(&mut book, &[("kind", "Fact")]);
+
+        book.update_node(id, patch_only(&[])).unwrap();
+
+        let node = book.get_node(id).unwrap();
+        assert_eq!(node.get_property("kind"), Some("Fact"));
+        assert_eq!(node.properties().len(), 1);
+    }
+
+    #[test]
+    fn properties_and_properties_patch_together_are_rejected() {
+        let mut book = make_book();
+        let id = node_with_props(&mut book, &[("kind", "Fact")]);
+
+        let mut req = patch_only(&[("gate_status", "approved")]);
+        req.properties = Some(HashMap::new());
+
+        let err = book.update_node(id, req).unwrap_err();
+        assert!(matches!(err, DomainError::ConflictingPropertyUpdate(_)));
+
+        // Rejected before anything was applied.
+        let node = book.get_node(id).unwrap();
+        assert_eq!(node.get_property("kind"), Some("Fact"));
+        assert_eq!(node.get_property("gate_status"), None);
     }
 
     #[test]

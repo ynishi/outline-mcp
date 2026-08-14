@@ -59,6 +59,7 @@ async fn service_update_node() {
             node_type: None,
             placeholder: None,
             properties: None,
+            properties_patch: None,
             status: None,
         },
     )
@@ -70,6 +71,92 @@ async fn service_update_node() {
     let node = book.get_node(design_id).unwrap();
     assert_eq!(node.title(), "Architecture");
     assert_eq!(node.body(), Some("Updated body"));
+}
+
+/// Changing one property must not cost the others — including a value a caller
+/// could not have parsed back out of the text rendering (`, ` and `=` inside
+/// it), which is the case that made "read them all and resend" unsafe.
+#[tokio::test]
+async fn service_update_node_properties_patch_preserves_untouched_keys() {
+    let tb = TestBook::standard();
+    let svc = TestBook::service_with_book(&tb.book);
+    let design_id = tb.ids["design"];
+
+    let seed: std::collections::HashMap<String, String> = [
+        ("gate_status", "pending"),
+        ("kind", "Pitfall"),
+        ("evidence_quote", "note: a, b = c"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+
+    svc.update_node(
+        design_id,
+        UpdateNodeRequest {
+            title: None,
+            body: None,
+            node_type: None,
+            placeholder: None,
+            properties: Some(seed),
+            properties_patch: None,
+            status: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    svc.update_node(
+        design_id,
+        UpdateNodeRequest {
+            title: None,
+            body: None,
+            node_type: None,
+            placeholder: None,
+            properties: None,
+            properties_patch: Some(
+                [("gate_status".to_string(), "approved".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            status: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Re-read through the repository so this covers persistence, not just the
+    // in-memory aggregate.
+    let book = svc.read_tree().await.unwrap();
+    let node = book.get_node(design_id).unwrap();
+    assert_eq!(node.get_property("gate_status"), Some("approved"));
+    assert_eq!(node.get_property("kind"), Some("Pitfall"));
+    assert_eq!(node.get_property("evidence_quote"), Some("note: a, b = c"));
+    assert_eq!(node.properties().len(), 3);
+}
+
+#[tokio::test]
+async fn service_update_node_rejects_replace_and_patch_together() {
+    let tb = TestBook::standard();
+    let svc = TestBook::service_with_book(&tb.book);
+    let design_id = tb.ids["design"];
+
+    let result = svc
+        .update_node(
+            design_id,
+            UpdateNodeRequest {
+                title: None,
+                body: None,
+                node_type: None,
+                placeholder: None,
+                properties: Some(std::collections::HashMap::new()),
+                properties_patch: Some([("k".to_string(), "v".to_string())].into_iter().collect()),
+                status: None,
+            },
+        )
+        .await;
+
+    assert_error_contains(result, "mutually exclusive");
 }
 
 #[tokio::test]

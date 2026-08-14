@@ -212,6 +212,7 @@ impl<R: BookRepository> BookService<R> {
                     node_type: req.node_type.clone(),
                     placeholder: req.placeholder.clone(),
                     properties: req.properties.clone(),
+                    properties_patch: req.properties_patch.clone(),
                     status: req.status,
                 },
             )?;
@@ -496,6 +497,7 @@ mod tests {
             node_type: None,
             placeholder: None,
             properties: None,
+            properties_patch: None,
             status: None,
         };
         let ((), warning) = svc.update_node(id, update_req).await.expect("update");
@@ -647,6 +649,7 @@ mod tests {
             node_type: None,
             placeholder: None,
             properties: None,
+            properties_patch: None,
             status: None,
         };
         let (count, warnings) = svc
@@ -678,6 +681,7 @@ mod tests {
                     node_type: None,
                     placeholder: None,
                     properties: None,
+                    properties_patch: None,
                     status: None,
                 },
             ),
@@ -689,6 +693,7 @@ mod tests {
                     node_type: None,
                     placeholder: None,
                     properties: None,
+                    properties_patch: None,
                     status: Some(NodeStatus::Draft),
                 },
             ),
@@ -729,6 +734,7 @@ mod tests {
                         node_type: None,
                         placeholder: None,
                         properties: None,
+                        properties_patch: None,
                         status: None,
                     },
                 ),
@@ -740,6 +746,7 @@ mod tests {
                         node_type: None,
                         placeholder: None,
                         properties: None,
+                        properties_patch: None,
                         status: None,
                     },
                 ),
