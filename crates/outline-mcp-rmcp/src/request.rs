@@ -423,6 +423,15 @@ pub(crate) struct McpNodeQueryRequest {
     pub status: Option<String>,
     #[schemars(description = "Subtree root ID (toc ID or UUID). Only search within this subtree.")]
     pub subtree_root: Option<String>,
+    #[schemars(
+        description = "Output format: 'text' (default) or 'json'. Use 'json' when a program \
+                       reads the result: the text rendering puts each node's properties on one \
+                       line and prefixes only the first line of its body, so a property value \
+                       containing a newline truncates the line and a body starting with a fence \
+                       loses its marker. 'text' rather than 'markdown' because this tool's \
+                       default rendering is a plain listing."
+    )]
+    pub format: Option<String>,
 }
 
 // =============================================================================

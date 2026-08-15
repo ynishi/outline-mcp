@@ -1668,7 +1668,7 @@ impl OutlineMcpServer {
     }
 
     #[tool(
-        description = "Query nodes by properties, status, type, or subtree. Returns UUIDs needed for batch operations. Use `include_body: true` to include node content.",
+        description = "Query nodes by properties, status, type, or subtree. Returns UUIDs needed for batch operations. Use `include_body: true` to include node content. Programs should pass `format: \"json\"` — the default text rendering is lossy for property values containing newlines and for bodies starting with a fence.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1712,6 +1712,44 @@ impl OutlineMcpServer {
         if let Some(ref s) = req.status {
             let st = parse_node_status(s)?;
             nodes.retain(|n| n.status() == st);
+        }
+
+        // Before the empty check on purpose. Zero matches is the ordinary
+        // outcome for a poller (the placement gate asks "is there anything
+        // pending" every three hours and the answer is usually no), so a
+        // caller that asked for JSON must get JSON then too — otherwise the
+        // quiet day is the one that breaks it.
+        if parse_query_format(req.format.as_deref())? == QueryFormat::Json {
+            let out = serde_json::json!({
+                "matches": nodes.len(),
+                "nodes": nodes.iter().map(|node| {
+                    let mut o = serde_json::json!({
+                        "id": node.id().to_string(),
+                        "short": node.id().short(),
+                        "title": node.title(),
+                        "node_type": match node.node_type() {
+                            NodeType::Section => "section",
+                            NodeType::Content => "content",
+                        },
+                        "status": match node.status() {
+                            outline_mcp_core::domain::model::changelog::NodeStatus::Active => "active",
+                            outline_mcp_core::domain::model::changelog::NodeStatus::Draft => "draft",
+                        },
+                        "placeholder": node.placeholder(),
+                        // Always an object, never omitted: a caller has to be
+                        // able to tell "this node has no properties" from
+                        // "properties did not come back".
+                        "properties": node.properties(),
+                    });
+                    // Present only when asked for, so "I did not request the
+                    // body" and "the body is empty" stay distinguishable.
+                    if req.include_body {
+                        o["body"] = serde_json::json!(node.body());
+                    }
+                    o
+                }).collect::<Vec<_>>(),
+            });
+            return Ok(CallToolResult::structured(out));
         }
 
         if nodes.is_empty() {
@@ -1821,6 +1859,29 @@ fn diff_header_name(label: Option<&str>, millis: i64) -> String {
     }
 }
 
+/// Output shape for `node_query`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryFormat {
+    /// The human-readable listing this tool has always produced.
+    Text,
+    /// One JSON object, for callers that parse the result.
+    Json,
+}
+
+/// Unknown values are rejected rather than defaulted, so a typo surfaces here
+/// instead of as a decode failure in the caller — the text a program did not
+/// ask for is still valid text.
+fn parse_query_format(s: Option<&str>) -> Result<QueryFormat, McpError> {
+    match s {
+        Some("json") => Ok(QueryFormat::Json),
+        Some("text") | None => Ok(QueryFormat::Text),
+        Some(other) => Err(McpError::invalid_params(
+            format!("Unknown format: '{other}'. Use: text, json"),
+            None,
+        )),
+    }
+}
+
 fn parse_dump_format(s: Option<&str>) -> Result<EjectFormat, McpError> {
     match s {
         Some("json") => Ok(EjectFormat::Json),
@@ -1869,6 +1930,56 @@ fn prepare_dump_dir(dir: &std::path::Path, overwrite: bool) -> Result<(), McpErr
         )
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod query_format_tests {
+    use super::*;
+
+    #[test]
+    fn parse_query_format_defaults_to_text() {
+        assert_eq!(parse_query_format(None).unwrap(), QueryFormat::Text);
+        assert_eq!(parse_query_format(Some("text")).unwrap(), QueryFormat::Text);
+        assert_eq!(parse_query_format(Some("json")).unwrap(), QueryFormat::Json);
+    }
+
+    #[test]
+    fn parse_query_format_rejects_unknown() {
+        // Silently falling back to text would surface as a decode failure in
+        // the caller, a long way from the typo that caused it.
+        let err = parse_query_format(Some("markdown")).unwrap_err();
+        assert!(err.to_string().contains("Unknown format"));
+        assert!(parse_query_format(Some("")).is_err());
+    }
+
+    /// The values that make the text rendering lossy, kept in one place so a
+    /// reader can see what the JSON path has to survive.
+    const HOSTILE_VALUE: &str = "note: a, b = c\nsecond line\n---\n```lua";
+
+    #[test]
+    fn json_body_survives_values_that_break_the_text_rendering() {
+        // `Properties: k=v, k=v` truncates at the first newline in a value,
+        // and a `---` line inside a body is indistinguishable from the entry
+        // separator. serde_json escapes both, so neither can leak into the
+        // frame.
+        let encoded = serde_json::json!({ "properties": { "evidence_quote": HOSTILE_VALUE } });
+        let round_tripped = encoded["properties"]["evidence_quote"].as_str().unwrap();
+        assert_eq!(
+            round_tripped, HOSTILE_VALUE,
+            "value must survive byte-for-byte"
+        );
+
+        let serialized = serde_json::to_string(&encoded).unwrap();
+        assert!(
+            !serialized.contains('\n'),
+            "raw newline must not reach the wire"
+        );
+        let decoded: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            decoded["properties"]["evidence_quote"].as_str().unwrap(),
+            HOSTILE_VALUE
+        );
+    }
 }
 
 #[cfg(test)]

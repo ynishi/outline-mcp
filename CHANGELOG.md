@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`format: "json"` on `node_query`** (`crates/outline-mcp-rmcp/src/{request,tools}.rs`). Returns one JSON object — `{matches, nodes:[{id, short, title, node_type, status, placeholder, properties, body?}]}` — via `CallToolResult::structured`, which carries both `structuredContent` and the serialized text, as the spec recommends for backwards compatibility. Default stays `"text"`, so existing callers are untouched; an unrecognised value is rejected rather than silently treated as text, since the failure would otherwise surface as a decode error far from the typo.
+
+  The text rendering was never safe to parse. Properties are drawn on one line and only the *first* line of a body gets its `   Body: ` prefix, so a property value containing a newline truncates the line — dropping whichever keys `HashMap` iteration happened to place after it — a body starting with a fence loses its marker to the prefix, and a `---` line inside a body is indistinguishable from the entry separator. Measured on a live 1121-node book: 63 nodes carry a newline in `evidence_quote`, and two runs of the same parse recovered 869 then 863 of 900 `kind` values. Downstream that meant a knowledge-placement gate deleting nodes whose evidence it could not see. The JSON path returns all 1121 nodes with zero body or property mismatches, including the 51 bodies starting with `## ` and the 3 containing a bare `---`.
+
+  Zero matches returns `{"matches":0,"nodes":[]}` rather than the "No matching nodes found." sentence. A poller asking "is there anything pending" gets that answer most of the time, so it is the case a JSON caller can least afford to have return prose.
+
+  No `outputSchema` is declared: it would oblige every response to carry structured content, which the default text mode does not.
+
 ### Changed
 
 ### Deprecated
