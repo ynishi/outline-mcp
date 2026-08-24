@@ -1,0 +1,9 @@
+# The Dockerfile only COPYs Cargo.toml / Cargo.lock / crates/ — keep the
+# build context down to those (target/ alone is multiple GB).
+target/
+.git/
+.github/
+.sandbox-snapshots/
+workspace/
+docs/
+contrib/

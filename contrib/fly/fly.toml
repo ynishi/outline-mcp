@@ -1,0 +1,38 @@
+# fly.toml — host outline-mcp on Fly.io Machines (single machine + volume,
+# single-writer model preserved: every device talks to this one daemon).
+#
+# Usage (from the repo root — the Dockerfile is auto-detected there):
+#   fly deploy --config contrib/fly/fly.toml
+#
+# Full walkthrough: docs/runbooks/fly-io-deploy.md
+#
+# `app` is a placeholder — create your own app first:
+#   fly apps create <your-app-name>
+app = "outline-mcp-server"
+primary_region = "nrt"
+
+[processes]
+  # Positional arg = shelf directory on the mounted volume (book JSON files
+  # + per-slug `.events.db` SQLite). Non-loopback bind requires
+  # OUTLINE_MCP_HTTP_TOKEN (set as a Fly secret); TLS terminates at the Fly
+  # edge, so the container speaks plain HTTP.
+  app = "/data/books --mcp-http --bind 0.0.0.0:8486"
+
+[[mounts]]
+  # fly volumes create outline_data --region nrt --size 1 --yes
+  source = "outline_data"
+  destination = "/data"
+
+[http_service]
+  processes = ["app"]
+  internal_port = 8486
+  force_https = true
+  # A stateful daemon should not scale to zero or fan out: exactly one
+  # machine may own the volume / book files / SQLite event logs.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

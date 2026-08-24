@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Fly.io hosting** — `contrib/fly/fly.toml` (single machine + volume, edge TLS, bearer auth via `OUTLINE_MCP_HTTP_TOKEN`; shelf directory on the mounted volume, `--bind 0.0.0.0:8486`) and `docs/runbooks/fly-io-deploy.md` (app/volume/secrets setup, deploy, smoke, non-interactive data migration from a local shelf via `fly ssh sftp put`, client registration). Backup relies on Fly's automatic daily volume snapshots plus the existing `snapshot_create` / `snapshot_restore` tools; off-Fly (S3-compatible) upload is intentionally not implemented. Verified against a real deploy (machine + volume in `nrt`, 401/no-token / 200/token smoke, 29-book shelf served after migration).
+- **`.dockerignore`** — the Dockerfile only COPYs `Cargo.toml` / `Cargo.lock` / `crates/`, but the build context uploaded everything (`target/` alone is multiple GB, re-uploaded on every `fly deploy` / `docker build`).
+
 ### Changed
 
 ### Deprecated
