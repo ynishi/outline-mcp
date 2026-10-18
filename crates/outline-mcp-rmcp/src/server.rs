@@ -28,6 +28,7 @@ use outline_mcp_core::application::service::BookService;
 use outline_mcp_core::domain::model::id::NodeId;
 use outline_mcp_core::infra::changelog_bridge::HistoryPreservingChangeLogRepository;
 use outline_mcp_core::infra::json_store::JsonBookRepository;
+use outline_mcp_core::infra::legacy_shelf_store::LegacyShelfStore;
 use outline_mcp_core::infra::snapshot::SnapshotService;
 use outline_mcp_core::infra::snapshot_migrator::count_orphan_snapshots;
 use outline_mcp_core::infra::snapshot_sink::SnapshotOnlySink;
@@ -170,6 +171,10 @@ fn bearer_token_matches(headers: &axum::http::HeaderMap, token: &str) -> bool {
 // =============================================================================
 // MCP Server
 // =============================================================================
+
+/// The `BookService` every tool handler uses: one book file in the shelf
+/// directory plus its changelog, behind the (non-atomic) legacy adapter.
+pub(crate) type ShelfService = BookService<LegacyShelfStore<JsonBookRepository>>;
 
 /// The outline-mcp MCP server.
 ///
@@ -316,7 +321,7 @@ impl OutlineMcpServer {
     }
 
     /// 選択中BookのServiceを返す。未選択ならエラー。
-    pub(crate) async fn service(&self) -> Result<BookService<JsonBookRepository>, McpError> {
+    pub(crate) async fn service(&self) -> Result<ShelfService, McpError> {
         let slug = {
             let guard = self
                 .selected
@@ -336,13 +341,13 @@ impl OutlineMcpServer {
     }
 
     /// 指定slugのServiceを返す（選択状態不要）。
-    pub(crate) async fn service_for(
-        &self,
-        slug: &str,
-    ) -> Result<BookService<JsonBookRepository>, McpError> {
+    pub(crate) async fn service_for(&self, slug: &str) -> Result<ShelfService, McpError> {
         let repo = JsonBookRepository::new(self.book_path(slug));
         let changelog = Box::new(self.changelog_for(slug).await?);
-        Ok(BookService::new(repo).with_changelog(changelog))
+        Ok(BookService::new(
+            LegacyShelfStore::new(repo).with_changelog(changelog),
+            slug,
+        ))
     }
 
     /// Shelf内のslug一覧をソート順で返す。

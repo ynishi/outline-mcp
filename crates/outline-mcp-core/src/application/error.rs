@@ -11,9 +11,21 @@ pub enum AppError {
     #[error("book not found: initialize first")]
     BookNotFound,
 
-    /// The underlying `BookRepository` failed to load or save.
+    /// The underlying store failed to load or commit.
     #[error("storage error: {0}")]
     Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// Another writer committed the book between this operation's read and
+    /// its commit; nothing was stored. Re-reading and retrying is safe.
+    #[error(
+        "the book changed while this write was in progress (expected version {expected:?}, found {actual:?}); nothing was stored — read it again and retry"
+    )]
+    Conflict {
+        /// The version this operation read.
+        expected: Option<i64>,
+        /// The version found at commit time.
+        actual: Option<i64>,
+    },
 
     /// File I/O failed while ejecting the book to disk.
     #[error("eject I/O error: {0}")]

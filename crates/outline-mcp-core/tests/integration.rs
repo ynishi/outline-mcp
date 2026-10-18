@@ -9,6 +9,7 @@ use outline_mcp_core::application::service::BookService;
 use outline_mcp_core::domain::model::book::{AddNodeRequest, TemplateBook, UpdateNodeRequest};
 use outline_mcp_core::domain::model::node::NodeType;
 use outline_mcp_core::infra::json_store::JsonBookRepository;
+use outline_mcp_core::infra::legacy_shelf_store::LegacyShelfStore;
 
 // =============================================================================
 // BookService CRUD (with InMemoryRepo)
@@ -197,7 +198,7 @@ async fn service_remove_node() {
 #[tokio::test]
 async fn service_read_nonexistent_book_errors() {
     let repo = common::InMemoryRepo::new();
-    let svc = BookService::new(repo);
+    let svc = BookService::new(LegacyShelfStore::new(repo), "test");
     let result = svc.read_tree().await;
     assert_error_contains(result, "book not found");
 }
@@ -279,14 +280,14 @@ async fn service_json_repo_roundtrip() {
     let path = dir.path().join("book.json");
 
     let repo = JsonBookRepository::new(&path);
-    let svc = BookService::new(repo);
+    let svc = BookService::new(LegacyShelfStore::new(repo), "book");
 
     let book = svc.create_book("File Test", 3).await.unwrap();
     assert_eq!(book.title(), "File Test");
 
     // 新たなServiceインスタンスで読み直す
     let repo2 = JsonBookRepository::new(&path);
-    let svc2 = BookService::new(repo2);
+    let svc2 = BookService::new(LegacyShelfStore::new(repo2), "book");
     let loaded = svc2.read_tree().await.unwrap();
     assert_eq!(loaded.title(), "File Test");
 }

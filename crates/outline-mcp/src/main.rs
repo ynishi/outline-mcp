@@ -1,5 +1,5 @@
 //! Thin entry point: dispatches the `migrate-snapshots` CLI subcommand (see
-//! `cli`), or else parses the shelf directory / transport flags from argv and
+//! `cli`) or the `migrate` subcommand (see `migrate_db`), or else parses the shelf directory / transport flags from argv and
 //! hands off to `outline_mcp_rmcp::run` (stdio) or `run_http` (streamable
 //! HTTP), which own the MCP server (rmcp transport, tool_router, resources)
 //! and its `outline-mcp-core` wiring.
@@ -10,6 +10,7 @@
 //! outline-mcp [shelf_dir]                          # stdio (default)
 //! outline-mcp [shelf_dir] --mcp-http [--bind ADDR] # streamable HTTP daemon
 //! outline-mcp migrate-snapshots --shelf <path>     # CLI subcommand
+//! outline-mcp migrate [--database-url <url>]       # apply Postgres migrations
 //! ```
 //!
 //! `--bind` defaults to `127.0.0.1:8486`. Non-loopback binds require
@@ -18,6 +19,7 @@
 use std::path::PathBuf;
 
 mod cli;
+mod migrate_db;
 
 /// Default bind address for `--mcp-http` (loopback; SSOT-daemon deployments
 /// override with `--bind 0.0.0.0:8486` + `OUTLINE_MCP_HTTP_TOKEN`).
@@ -29,6 +31,10 @@ async fn main() -> anyhow::Result<()> {
 
     if argv.first().map(String::as_str) == Some("migrate-snapshots") {
         let exit_code = cli::run(argv.into_iter().skip(1)).await?;
+        std::process::exit(exit_code);
+    }
+    if argv.first().map(String::as_str) == Some("migrate") {
+        let exit_code = migrate_db::run(argv.into_iter().skip(1)).await?;
         std::process::exit(exit_code);
     }
 

@@ -11,6 +11,7 @@ use outline_mcp_core::domain::model::book::{AddNodeRequest, TemplateBook};
 use outline_mcp_core::domain::model::id::NodeId;
 use outline_mcp_core::domain::model::node::NodeType;
 use outline_mcp_core::domain::repository::BookRepository;
+use outline_mcp_core::infra::legacy_shelf_store::LegacyShelfStore;
 
 // =============================================================================
 // InMemoryBookRepository — テスト用リポジトリ
@@ -171,10 +172,10 @@ impl TestBook {
     }
 
     /// InMemoryRepoにBookを保存してBookServiceを返す。
-    pub fn service_with_book(book: &TemplateBook) -> BookService<InMemoryRepo> {
+    pub fn service_with_book(book: &TemplateBook) -> BookService<LegacyShelfStore<InMemoryRepo>> {
         let repo = InMemoryRepo::new();
         repo.seed(book);
-        BookService::new(repo)
+        BookService::new(LegacyShelfStore::new(repo), "test")
     }
 }
 

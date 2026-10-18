@@ -1,0 +1,531 @@
+//! [`PgBookStore`]: books in Postgres, one transaction per write.
+//!
+//! # The commit
+//!
+//! [`BookStore::commit`] runs in one transaction:
+//!
+//! 1. Lock the book row (`SELECT version ... FOR UPDATE`) and compare its
+//!    version with the caller's. A create inserts the row with
+//!    `ON CONFLICT DO NOTHING` instead, so two concurrent creators cannot both
+//!    win: the loser sees no row inserted and answers a conflict.
+//! 2. Diff the stored node rows against the new book and write only what
+//!    changed (delete the missing, upsert the new or different). A one-node
+//!    edit on a book of a thousand nodes writes one row, plus the siblings
+//!    whose position moved.
+//! 3. Insert the write's events and bump the version.
+//!
+//! Either all of it commits or none of it does, so a stored change always
+//! has its events — the property the pre-port storage lacked.
+//!
+//! # Events
+//!
+//! An event stores the whole node before and after as `jsonb`. History is
+//! read row by row; nothing is replayed, so no stored event can make a later
+//! read or write fail. `before` / `after` come back re-serialized from
+//! `jsonb`, so key order and whitespace may differ from the strings written;
+//! the JSON value is the same.
+//!
+//! All SQL is runtime-checked (`sqlx::query`), so building this crate needs
+//! no database.
+
+use std::collections::HashMap;
+
+use async_trait::async_trait;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::Value;
+use sqlx::postgres::{PgPoolOptions, PgRow};
+use sqlx::{PgPool, Postgres, Row, Transaction};
+use uuid::Uuid;
+
+use crate::domain::model::book::TemplateBook;
+use crate::domain::model::changelog::ChangeEntry;
+use crate::domain::model::id::{BookId, NodeId};
+use crate::domain::model::node::{NodeParts, TemplateNode};
+use crate::domain::model::timestamp::Timestamp;
+use crate::domain::store::{BookStore, BookSummary, Committed, StoreError, Versioned};
+
+/// Books, nodes and events in Postgres. Cheap to clone (shares one pool).
+#[derive(Clone)]
+pub struct PgBookStore {
+    pool: PgPool,
+}
+
+/// One `nodes` row, as written and as compared when diffing.
+#[derive(Debug, Clone, PartialEq)]
+struct NodeRow {
+    id: Uuid,
+    parent: Option<Uuid>,
+    position: i32,
+    title: String,
+    body: Option<String>,
+    node_type: String,
+    placeholder: Option<String>,
+    properties: Value,
+    status: String,
+    updated_at: Option<i64>,
+}
+
+impl PgBookStore {
+    /// Connect to the database at `database_url`. Does not run migrations.
+    pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(database_url)
+            .await
+            .map_err(StoreError::backend)?;
+        Ok(Self { pool })
+    }
+
+    /// Wrap an existing pool.
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Apply the bundled migrations (`crates/outline-mcp-core/migrations`).
+    pub async fn migrate(&self) -> Result<(), StoreError> {
+        sqlx::migrate!("./migrations")
+            .run(&self.pool)
+            .await
+            .map_err(StoreError::backend)
+    }
+
+    async fn node_rows(
+        tx: &mut Transaction<'_, Postgres>,
+        slug: &str,
+    ) -> Result<HashMap<Uuid, NodeRow>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, parent, position, title, body, node_type, placeholder, properties, status, updated_at \
+             FROM nodes WHERE book = $1",
+        )
+        .bind(slug)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(StoreError::backend)?;
+        rows.iter()
+            .map(|r| {
+                let row = node_row(r)?;
+                Ok((row.id, row))
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl BookStore for PgBookStore {
+    async fn load(&self, slug: &str) -> Result<Option<Versioned<TemplateBook>>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let Some(book_row) =
+            sqlx::query("SELECT book_id, title, max_depth, version FROM books WHERE slug = $1")
+                .bind(slug)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(StoreError::backend)?
+        else {
+            return Ok(None);
+        };
+        let rows = Self::node_rows(&mut tx, slug).await?;
+        tx.commit().await.map_err(StoreError::backend)?;
+
+        let book_id: Uuid = book_row.try_get("book_id").map_err(StoreError::backend)?;
+        let title: String = book_row.try_get("title").map_err(StoreError::backend)?;
+        let max_depth: i16 = book_row.try_get("max_depth").map_err(StoreError::backend)?;
+        let version: i64 = book_row.try_get("version").map_err(StoreError::backend)?;
+        let max_depth = u8::try_from(max_depth).map_err(StoreError::backend)?;
+
+        let book = assemble(BookId::from_uuid(book_id), title, max_depth, rows)?;
+        Ok(Some(Versioned {
+            value: book,
+            version,
+        }))
+    }
+
+    async fn commit(
+        &self,
+        slug: &str,
+        expected_version: Option<i64>,
+        book: &TemplateBook,
+        events: &[ChangeEntry],
+    ) -> Result<Committed, StoreError> {
+        let new_rows = rows_of(book)?;
+        let max_depth = i16::from(book.max_depth());
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+
+        let (version, old_rows) = match expected_version {
+            None => {
+                let inserted = sqlx::query(
+                    "INSERT INTO books (slug, book_id, title, max_depth, version) \
+                     VALUES ($1, $2, $3, $4, 1) ON CONFLICT (slug) DO NOTHING",
+                )
+                .bind(slug)
+                .bind(book.id().as_uuid())
+                .bind(book.title())
+                .bind(max_depth)
+                .execute(&mut *tx)
+                .await
+                .map_err(StoreError::backend)?
+                .rows_affected();
+                if inserted == 0 {
+                    drop(tx);
+                    let actual: Option<i64> =
+                        sqlx::query_scalar("SELECT version FROM books WHERE slug = $1")
+                            .bind(slug)
+                            .fetch_optional(&self.pool)
+                            .await
+                            .map_err(StoreError::backend)?;
+                    return Err(StoreError::Conflict {
+                        expected: None,
+                        actual,
+                    });
+                }
+                (1, HashMap::new())
+            }
+            Some(expected) => {
+                let actual: Option<i64> =
+                    sqlx::query_scalar("SELECT version FROM books WHERE slug = $1 FOR UPDATE")
+                        .bind(slug)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(StoreError::backend)?;
+                if actual != Some(expected) {
+                    return Err(StoreError::Conflict {
+                        expected: Some(expected),
+                        actual,
+                    });
+                }
+                let version = expected + 1;
+                sqlx::query(
+                    "UPDATE books SET book_id = $2, title = $3, max_depth = $4, version = $5, \
+                     updated_at = now() WHERE slug = $1",
+                )
+                .bind(slug)
+                .bind(book.id().as_uuid())
+                .bind(book.title())
+                .bind(max_depth)
+                .bind(version)
+                .execute(&mut *tx)
+                .await
+                .map_err(StoreError::backend)?;
+                (version, Self::node_rows(&mut tx, slug).await?)
+            }
+        };
+
+        let removed: Vec<Uuid> = old_rows
+            .keys()
+            .filter(|id| !new_rows.contains_key(id))
+            .copied()
+            .collect();
+        if !removed.is_empty() {
+            sqlx::query("DELETE FROM nodes WHERE book = $1 AND id = ANY($2)")
+                .bind(slug)
+                .bind(&removed)
+                .execute(&mut *tx)
+                .await
+                .map_err(StoreError::backend)?;
+        }
+        for row in new_rows.values() {
+            if old_rows.get(&row.id) == Some(row) {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO nodes (book, id, parent, position, title, body, node_type, placeholder, properties, status, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 ON CONFLICT (book, id) DO UPDATE SET parent = EXCLUDED.parent, position = EXCLUDED.position, \
+                 title = EXCLUDED.title, body = EXCLUDED.body, node_type = EXCLUDED.node_type, \
+                 placeholder = EXCLUDED.placeholder, properties = EXCLUDED.properties, \
+                 status = EXCLUDED.status, updated_at = EXCLUDED.updated_at",
+            )
+            .bind(slug)
+            .bind(row.id)
+            .bind(row.parent)
+            .bind(row.position)
+            .bind(&row.title)
+            .bind(&row.body)
+            .bind(&row.node_type)
+            .bind(&row.placeholder)
+            .bind(&row.properties)
+            .bind(&row.status)
+            .bind(row.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::backend)?;
+        }
+
+        for entry in events {
+            sqlx::query(
+                "INSERT INTO events (book, node_id, action, before, after, at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(slug)
+            .bind(entry.node_id.as_uuid())
+            .bind(enum_str(&entry.action)?)
+            .bind(json_column(&entry.before)?)
+            .bind(json_column(&entry.after)?)
+            .bind(entry.timestamp.as_millis())
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::backend)?;
+        }
+
+        tx.commit().await.map_err(StoreError::backend)?;
+        Ok(Committed {
+            version,
+            warnings: Vec::new(),
+        })
+    }
+
+    async fn history(&self, slug: &str) -> Result<Vec<ChangeEntry>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT node_id, action, before, after, at FROM events WHERE book = $1 ORDER BY id",
+        )
+        .bind(slug)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::backend)?;
+        rows.iter().map(change_entry).collect()
+    }
+
+    async fn history_by_node(
+        &self,
+        slug: &str,
+        node_id: NodeId,
+    ) -> Result<Vec<ChangeEntry>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT node_id, action, before, after, at FROM events \
+             WHERE book = $1 AND node_id = $2 ORDER BY id",
+        )
+        .bind(slug)
+        .bind(node_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::backend)?;
+        rows.iter().map(change_entry).collect()
+    }
+
+    async fn list_books(&self) -> Result<Vec<BookSummary>, StoreError> {
+        let rows = sqlx::query("SELECT slug, title FROM books ORDER BY slug")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::backend)?;
+        rows.iter()
+            .map(|r| {
+                Ok(BookSummary {
+                    slug: r.try_get("slug").map_err(StoreError::backend)?,
+                    title: r.try_get("title").map_err(StoreError::backend)?,
+                })
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// book <-> rows
+// ---------------------------------------------------------------------------
+
+/// Every node of `book` as a row. `position` is the index among siblings.
+fn rows_of(book: &TemplateBook) -> Result<HashMap<Uuid, NodeRow>, StoreError> {
+    let mut positions: HashMap<NodeId, i32> = HashMap::new();
+    for (i, id) in book.root_nodes().iter().enumerate() {
+        positions.insert(*id, index(i)?);
+    }
+    let ids: Vec<NodeId> = book.all_node_ids().collect();
+    for id in &ids {
+        if let Some(node) = book.get_node(*id) {
+            for (i, child) in node.children().iter().enumerate() {
+                positions.insert(*child, index(i)?);
+            }
+        }
+    }
+
+    let mut rows = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let Some(node) = book.get_node(id) else {
+            continue;
+        };
+        let properties = serde_json::to_value(node.properties()).map_err(StoreError::backend)?;
+        let row = NodeRow {
+            id: id.as_uuid(),
+            parent: node.parent().map(|p| p.as_uuid()),
+            position: positions.get(&id).copied().unwrap_or(0),
+            title: node.title().to_string(),
+            body: node.body().map(str::to_string),
+            node_type: enum_str(node.node_type())?,
+            placeholder: node.placeholder().map(str::to_string),
+            properties,
+            status: enum_str(&node.status())?,
+            updated_at: node.updated_at().map(|t| t.as_millis()),
+        };
+        rows.insert(row.id, row);
+    }
+    Ok(rows)
+}
+
+/// Rebuild a book from its rows: children and root order come from
+/// `(parent, position)`.
+fn assemble(
+    id: BookId,
+    title: String,
+    max_depth: u8,
+    rows: HashMap<Uuid, NodeRow>,
+) -> Result<TemplateBook, StoreError> {
+    let mut by_parent: HashMap<Option<Uuid>, Vec<(i32, Uuid)>> = HashMap::new();
+    for row in rows.values() {
+        by_parent
+            .entry(row.parent)
+            .or_default()
+            .push((row.position, row.id));
+    }
+    for siblings in by_parent.values_mut() {
+        siblings.sort();
+    }
+    let ordered = |parent: Option<Uuid>| -> Vec<NodeId> {
+        by_parent
+            .get(&parent)
+            .map(|s| s.iter().map(|(_, id)| NodeId::from_uuid(*id)).collect())
+            .unwrap_or_default()
+    };
+
+    let mut nodes = HashMap::with_capacity(rows.len());
+    for row in rows.values() {
+        let properties: HashMap<String, String> =
+            serde_json::from_value(row.properties.clone()).map_err(StoreError::backend)?;
+        let node = TemplateNode::from_parts(NodeParts {
+            id: NodeId::from_uuid(row.id),
+            parent: row.parent.map(NodeId::from_uuid),
+            children: ordered(Some(row.id)),
+            title: row.title.clone(),
+            body: row.body.clone(),
+            node_type: str_enum(&row.node_type)?,
+            placeholder: row.placeholder.clone(),
+            properties,
+            status: str_enum(&row.status)?,
+            updated_at: row.updated_at.map(Timestamp::from_millis),
+        });
+        nodes.insert(node.id(), node);
+    }
+    Ok(TemplateBook::from_parts(
+        id,
+        title,
+        max_depth,
+        nodes,
+        ordered(None),
+    ))
+}
+
+fn node_row(r: &PgRow) -> Result<NodeRow, StoreError> {
+    Ok(NodeRow {
+        id: r.try_get("id").map_err(StoreError::backend)?,
+        parent: r.try_get("parent").map_err(StoreError::backend)?,
+        position: r.try_get("position").map_err(StoreError::backend)?,
+        title: r.try_get("title").map_err(StoreError::backend)?,
+        body: r.try_get("body").map_err(StoreError::backend)?,
+        node_type: r.try_get("node_type").map_err(StoreError::backend)?,
+        placeholder: r.try_get("placeholder").map_err(StoreError::backend)?,
+        properties: r.try_get("properties").map_err(StoreError::backend)?,
+        status: r.try_get("status").map_err(StoreError::backend)?,
+        updated_at: r.try_get("updated_at").map_err(StoreError::backend)?,
+    })
+}
+
+fn change_entry(r: &PgRow) -> Result<ChangeEntry, StoreError> {
+    let node_id: Option<Uuid> = r.try_get("node_id").map_err(StoreError::backend)?;
+    let action: String = r.try_get("action").map_err(StoreError::backend)?;
+    let before: Option<Value> = r.try_get("before").map_err(StoreError::backend)?;
+    let after: Option<Value> = r.try_get("after").map_err(StoreError::backend)?;
+    let at: i64 = r.try_get("at").map_err(StoreError::backend)?;
+    Ok(ChangeEntry::new(
+        // Every event this adapter writes names its node; a NULL can only come
+        // from a future book-level import and reads as the nil id.
+        NodeId::from_uuid(node_id.unwrap_or(Uuid::nil())),
+        str_enum(&action)?,
+        before.map(|v| v.to_string()),
+        after.map(|v| v.to_string()),
+        Timestamp::from_millis(at),
+    ))
+}
+
+/// A `ChangeEntry` side (JSON text) as a `jsonb` value.
+fn json_column(s: &Option<String>) -> Result<Option<Value>, StoreError> {
+    s.as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(StoreError::backend)
+}
+
+/// A unit enum as its serde name (`NodeType::Section` → `"Section"`).
+fn enum_str<T: Serialize>(v: &T) -> Result<String, StoreError> {
+    match serde_json::to_value(v).map_err(StoreError::backend)? {
+        Value::String(s) => Ok(s),
+        other => Err(StoreError::backend(format!(
+            "expected a unit enum, serialized as {other}"
+        ))),
+    }
+}
+
+/// The inverse of [`enum_str`].
+fn str_enum<T: DeserializeOwned>(s: &str) -> Result<T, StoreError> {
+    serde_json::from_value(Value::String(s.to_string())).map_err(StoreError::backend)
+}
+
+fn index(i: usize) -> Result<i32, StoreError> {
+    i32::try_from(i).map_err(StoreError::backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::model::book::AddNodeRequest;
+    use crate::domain::model::node::NodeType;
+
+    fn add(book: &mut TemplateBook, parent: Option<NodeId>, title: &str) -> NodeId {
+        book.add_node(AddNodeRequest {
+            parent,
+            title: title.to_string(),
+            node_type: NodeType::Section,
+            body: Some(format!("{title} body")),
+            placeholder: None,
+            position: usize::MAX,
+            properties: [("k".to_string(), title.to_string())].into(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn rows_round_trip_preserves_order_and_fields() {
+        let mut book = TemplateBook::new("B", 4);
+        let a = add(&mut book, None, "a");
+        let b = add(&mut book, None, "b");
+        let a1 = add(&mut book, Some(a), "a1");
+        let a2 = add(&mut book, Some(a), "a2");
+        book.move_node(b, None, 0).unwrap();
+
+        let rows = rows_of(&book).unwrap();
+        let back = assemble(book.id(), book.title().to_string(), book.max_depth(), rows).unwrap();
+
+        assert_eq!(back.root_nodes(), &[b, a]);
+        assert_eq!(back.get_node(a).unwrap().children(), &[a1, a2]);
+        assert_eq!(
+            serde_json::to_value(back.get_node(a1).unwrap()).unwrap(),
+            serde_json::to_value(book.get_node(a1).unwrap()).unwrap()
+        );
+        assert_eq!(back.node_count(), 4);
+    }
+
+    #[test]
+    fn unchanged_rows_compare_equal_so_commit_skips_them() {
+        let mut book = TemplateBook::new("B", 4);
+        let a = add(&mut book, None, "a");
+        let before = rows_of(&book).unwrap();
+        let b = add(&mut book, None, "b");
+        let after = rows_of(&book).unwrap();
+        assert_eq!(before.get(&a.as_uuid()), after.get(&a.as_uuid()));
+        assert!(!before.contains_key(&b.as_uuid()));
+    }
+
+    #[test]
+    fn enum_names_round_trip() {
+        assert_eq!(enum_str(&NodeType::Section).unwrap(), "Section");
+        let t: NodeType = str_enum("Content").unwrap();
+        assert_eq!(t, NodeType::Content);
+    }
+}
