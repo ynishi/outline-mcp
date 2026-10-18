@@ -393,17 +393,53 @@ async fn delete_cascades_to_nodes_events_and_snapshots_against_postgres() {
     assert_eq!(rows("events", gone.clone()).await, 2);
     assert_eq!(rows("snapshots", gone.clone()).await, 1);
 
+    // A delete at a version read before a later write deletes nothing.
+    let checked = BookStore::load(&store, &gone)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    BookService::new(store.clone(), gone.clone())
+        .add_node(add_req(None, "late"))
+        .await
+        .expect("late write");
+    let err = BookStore::delete(&store, &gone, checked)
+        .await
+        .expect_err("stale delete");
+    assert!(
+        matches!(err, StoreError::Conflict { expected: Some(e), actual: Some(a) } if e == checked && a == checked + 1),
+        "{err}"
+    );
+    assert_eq!(rows("nodes", gone.clone()).await, 3);
+    assert_eq!(rows("events", gone.clone()).await, 3);
+    assert_eq!(rows("snapshots", gone.clone()).await, 1);
+
     // The port's delete: one statement, everything of that book goes.
-    assert!(BookStore::delete(&store, &gone).await.expect("delete"));
+    assert!(BookStore::delete(&store, &gone, checked + 1)
+        .await
+        .expect("delete"));
     assert!(BookStore::load(&store, &gone).await.unwrap().is_none());
     for table in ["nodes", "events", "snapshots"] {
         assert_eq!(rows(table, gone.clone()).await, 0, "{table} rows left");
     }
     assert_eq!(SnapshotStore::delete_all(&store, &gone).await.unwrap(), 0);
     assert!(
-        !BookStore::delete(&store, &gone).await.unwrap(),
+        !BookStore::delete(&store, &gone, checked + 1).await.unwrap(),
         "already gone"
     );
+
+    // The slug can be created again and starts empty.
+    let again = BookService::new(store.clone(), gone.clone());
+    again.create_book("Again", 4).await.expect("re-create");
+    assert!(BookStore::history(&store, &gone).await.unwrap().is_empty());
+    assert!(SnapshotStore::list(&store, &gone).await.unwrap().is_empty());
+    assert_eq!(rows("nodes", gone.clone()).await, 0);
+    let v = BookStore::load(&store, &gone)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert!(BookStore::delete(&store, &gone, v).await.unwrap());
 
     // The other book is untouched.
     assert_eq!(rows("nodes", kept.clone()).await, 2);
@@ -417,5 +453,10 @@ async fn delete_cascades_to_nodes_events_and_snapshots_against_postgres() {
         "delete_all leaves the book"
     );
 
-    assert!(BookStore::delete(&store, &kept).await.unwrap());
+    let v = BookStore::load(&store, &kept)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert!(BookStore::delete(&store, &kept, v).await.unwrap());
 }

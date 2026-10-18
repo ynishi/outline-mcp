@@ -110,7 +110,7 @@ where
         Ok(Vec::new())
     }
 
-    async fn delete(&self, _slug: &str) -> Result<bool, StoreError> {
+    async fn delete(&self, _slug: &str, _expected_version: i64) -> Result<bool, StoreError> {
         // Only `import-shelf` reads through this adapter; nothing deletes a
         // pre-Postgres shelf through it.
         Err(StoreError::backend(

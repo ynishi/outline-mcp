@@ -109,8 +109,16 @@ impl BookStore for MemoryBookStore {
             .collect())
     }
 
-    async fn delete(&self, slug: &str) -> Result<bool, StoreError> {
-        Ok(self.books.lock().await.remove(slug).is_some())
+    async fn delete(&self, slug: &str, expected_version: i64) -> Result<bool, StoreError> {
+        let mut books = self.books.lock().await;
+        match books.get(slug).map(|s| s.version) {
+            None => Ok(false),
+            Some(v) if v == expected_version => Ok(books.remove(slug).is_some()),
+            Some(v) => Err(StoreError::Conflict {
+                expected: Some(expected_version),
+                actual: Some(v),
+            }),
+        }
     }
 }
 
@@ -410,17 +418,43 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store.delete("gone").await.unwrap());
+        assert!(store.delete("gone", 1).await.unwrap());
         assert!(store.load("gone").await.unwrap().is_none());
         assert!(store.history("gone").await.unwrap().is_empty());
         assert!(store.load("kept").await.unwrap().is_some());
         assert_eq!(store.history("kept").await.unwrap().len(), 1);
 
         assert!(
-            !store.delete("gone").await.unwrap(),
+            !store.delete("gone", 1).await.unwrap(),
             "second delete finds nothing"
         );
-        assert!(!store.delete("never").await.unwrap());
+        assert!(!store.delete("never", 1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_at_a_stale_version_conflicts_and_keeps_the_book() {
+        let store = MemoryBookStore::new();
+        let book = TemplateBook::new("B", 4);
+        store.commit("b", None, &book, &[]).await.unwrap();
+        store
+            .commit("b", Some(1), &book, &[entry(NodeId::new())])
+            .await
+            .unwrap();
+
+        let err = store.delete("b", 1).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Conflict {
+                    expected: Some(1),
+                    actual: Some(2)
+                }
+            ),
+            "{err}"
+        );
+        assert!(store.load("b").await.unwrap().is_some());
+        assert_eq!(store.history("b").await.unwrap().len(), 1);
+        assert!(store.delete("b", 2).await.unwrap());
     }
 
     #[tokio::test]

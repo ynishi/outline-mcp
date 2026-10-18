@@ -104,10 +104,16 @@ pub trait BookStore: Send + Sync {
     /// Every stored book, ordered by slug.
     async fn list_books(&self) -> Result<Vec<BookSummary>, StoreError>;
 
-    /// Delete a book together with its history. Returns `false` if there was
-    /// no such book. Snapshots belong to [`SnapshotStore::delete_all`]; a store
-    /// that keeps both in one place may remove them here as well.
-    async fn delete(&self, slug: &str) -> Result<bool, StoreError>;
+    /// Delete a book together with its history, if its stored version is
+    /// still `expected_version`.
+    ///
+    /// Returns `false` if there is no such book, and fails with
+    /// [`StoreError::Conflict`] (deleting nothing) if the book was written
+    /// after the caller read `expected_version` — so a caller that checked
+    /// what the book holds never removes content it did not see. Snapshots
+    /// belong to [`SnapshotStore::delete_all`]; a store that keeps both in one
+    /// place may remove them here as well.
+    async fn delete(&self, slug: &str, expected_version: i64) -> Result<bool, StoreError>;
 }
 
 #[async_trait]
@@ -142,8 +148,8 @@ impl<T: BookStore + ?Sized> BookStore for Arc<T> {
         (**self).list_books().await
     }
 
-    async fn delete(&self, slug: &str) -> Result<bool, StoreError> {
-        (**self).delete(slug).await
+    async fn delete(&self, slug: &str, expected_version: i64) -> Result<bool, StoreError> {
+        (**self).delete(slug, expected_version).await
     }
 }
 

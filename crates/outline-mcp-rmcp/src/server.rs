@@ -23,7 +23,7 @@ use rmcp::{
 use outline_mcp_core::application::error::AppError;
 use outline_mcp_core::application::service::BookService;
 use outline_mcp_core::domain::model::id::NodeId;
-use outline_mcp_core::domain::store::{BookStore, SnapshotStore};
+use outline_mcp_core::domain::store::{BookStore, SnapshotStore, StoreError};
 
 use crate::helpers::{build_hierarchical_ids, find_hierarchical_id, is_hierarchical_id};
 use crate::request::parse_node_id;
@@ -182,12 +182,27 @@ fn bearer_token_matches(headers: &axum::http::HeaderMap, token: &str) -> bool {
 // MCP Server
 // =============================================================================
 
+/// The error a session gets when the book it works on no longer exists.
+pub(crate) const BOOK_GONE: &str =
+    "The selected book no longer exists (it may have been deleted). \
+     Use `shelf` to list books and `select_book` to choose one.";
+
 /// What a book holds, as reported (and removed) by `book_delete`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BookFootprint {
     pub nodes: usize,
     pub history: usize,
     pub snapshots: usize,
+    /// The book version the counts were read at; the delete is conditional
+    /// on it.
+    pub version: i64,
+}
+
+impl BookFootprint {
+    /// Nothing that a delete would lose: no nodes, history or snapshots.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.nodes == 0 && self.history == 0 && self.snapshots == 0
+    }
 }
 
 impl std::fmt::Display for BookFootprint {
@@ -326,13 +341,16 @@ impl OutlineMcpServer {
             nodes: book.value.node_count(),
             history: history.len(),
             snapshots: snapshots.len(),
+            version: book.version,
         }))
     }
 
     /// The `book_delete` tool: delete `slug` with its nodes, history and
-    /// snapshots. A book that still has nodes or snapshots is refused unless
-    /// `force`; `dry_run` only reports. Clears this session's selection when
-    /// it pointed at the deleted book; other sessions are not touched.
+    /// snapshots. A book with any nodes, history or snapshots is refused
+    /// unless `force`; `dry_run` only reports. The delete is conditional on
+    /// the version the counts were read at, so a write in between makes it
+    /// delete nothing. Clears this session's selection when it pointed at
+    /// the deleted book; other sessions are not touched.
     pub(crate) async fn delete_book(
         &self,
         slug: &str,
@@ -350,7 +368,7 @@ impl OutlineMcpServer {
                 "Dry run: would delete '{slug}': {fp}. Nothing changed."
             ));
         }
-        if !force && (fp.nodes > 0 || fp.snapshots > 0) {
+        if !force && !fp.is_empty() {
             return Err(McpError::invalid_params(
                 format!(
                     "Book '{slug}' is not empty ({fp}). Deleting it cannot be undone; \
@@ -360,9 +378,24 @@ impl OutlineMcpServer {
             ));
         }
 
-        let deleted = self.storage.books.delete(slug).await.map_err(|e| {
-            McpError::internal_error(format!("Failed to delete book '{slug}': {e}"), None)
-        })?;
+        let deleted = match self.storage.books.delete(slug, fp.version).await {
+            Ok(deleted) => deleted,
+            Err(StoreError::Conflict { .. }) => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Book '{slug}' changed since it was checked ({fp} at that point); \
+                         nothing was deleted. Check it again and retry."
+                    ),
+                    None,
+                ))
+            }
+            Err(e) => {
+                return Err(McpError::internal_error(
+                    format!("Failed to delete book '{slug}': {e}"),
+                    None,
+                ))
+            }
+        };
         if !deleted {
             return Err(McpError::invalid_params(
                 format!("Book '{slug}' not found (deleted concurrently?)."),
@@ -416,7 +449,15 @@ impl OutlineMcpServer {
     }
 
     pub(crate) fn to_mcp_error(e: AppError) -> McpError {
-        McpError::internal_error(format!("{e}"), None)
+        match e {
+            // The book the session works on is gone: deleted by another
+            // session (`book_delete`) after this one selected it, or — for a
+            // write — between its read and its commit. Not a server fault.
+            AppError::BookNotFound | AppError::Conflict { actual: None, .. } => {
+                McpError::invalid_params(BOOK_GONE, None)
+            }
+            e => McpError::internal_error(format!("{e}"), None),
+        }
     }
 
     /// 階層番号 / Full UUID / short prefix / title部分一致 → NodeId。
@@ -594,6 +635,11 @@ mod tests {
     use super::*;
 
     use outline_mcp_core::infra::memory_store::{MemoryBookStore, MemorySnapshotStore};
+
+    // Used by the book_delete tests below; earlier tests import them locally.
+    use outline_mcp_core::domain::model::book::AddNodeRequest;
+    use outline_mcp_core::domain::model::node::NodeType;
+    use std::collections::HashMap;
 
     pub(crate) fn memory_server() -> OutlineMcpServer {
         OutlineMcpServer::new(Storage::new(
@@ -774,12 +820,13 @@ mod tests {
             .unwrap();
     }
 
-    fn footprint(nodes: usize, history: usize, snapshots: usize) -> Option<BookFootprint> {
-        Some(BookFootprint {
-            nodes,
-            history,
-            snapshots,
-        })
+    /// (nodes, history, snapshots) of `slug`, or `None` if it does not exist.
+    async fn counts(server: &OutlineMcpServer, slug: &str) -> Option<(usize, usize, usize)> {
+        server
+            .book_footprint(slug)
+            .await
+            .unwrap()
+            .map(|fp| (fp.nodes, fp.history, fp.snapshots))
     }
 
     #[tokio::test]
@@ -792,10 +839,7 @@ mod tests {
         assert!(err
             .message
             .contains("1 nodes, 1 history entries, 1 snapshots"));
-        assert_eq!(
-            server.book_footprint("full").await.unwrap(),
-            footprint(1, 1, 1)
-        );
+        assert_eq!(counts(&server, "full").await, Some((1, 1, 1)));
     }
 
     #[tokio::test]
@@ -807,10 +851,7 @@ mod tests {
             let msg = server.delete_book("full", force, true).await.unwrap();
             assert!(msg.contains("would delete 'full': 1 nodes"), "{msg}");
         }
-        assert_eq!(
-            server.book_footprint("full").await.unwrap(),
-            footprint(1, 1, 1)
-        );
+        assert_eq!(counts(&server, "full").await, Some((1, 1, 1)));
     }
 
     #[tokio::test]
@@ -837,10 +878,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(server.list_book_slugs().await.unwrap(), vec!["other"]);
-        assert_eq!(
-            server.book_footprint("other").await.unwrap(),
-            footprint(1, 1, 1)
-        );
+        assert_eq!(counts(&server, "other").await, Some((1, 1, 1)));
     }
 
     #[tokio::test]
@@ -888,5 +926,118 @@ mod tests {
         book_with_content(&shared, "again").await;
         let msg = b.delete_book("again", true, false).await.unwrap();
         assert!(!msg.contains("selected"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn book_delete_refuses_a_node_less_book_with_history_without_force() {
+        let server = memory_server();
+        book_with_content(&server, "hist").await;
+        // Remove the node and the snapshot: only history is left.
+        let svc = server.service_for("hist").await.unwrap();
+        let id = svc.read_tree().await.unwrap().root_nodes()[0];
+        svc.remove_node(id).await.unwrap();
+        server.storage.snapshots.delete_all("hist").await.unwrap();
+        assert_eq!(counts(&server, "hist").await, Some((0, 2, 0)));
+
+        let err = server.delete_book("hist", false, false).await.unwrap_err();
+        assert!(err.message.contains("not empty"), "{}", err.message);
+        assert!(err.message.contains("0 nodes, 2 history entries"));
+        server.delete_book("hist", true, false).await.unwrap();
+        assert_eq!(counts(&server, "hist").await, None);
+    }
+
+    #[tokio::test]
+    async fn book_delete_after_a_concurrent_write_deletes_nothing() {
+        let server = memory_server();
+        book_with_content(&server, "busy").await;
+        let fp = server.book_footprint("busy").await.unwrap().unwrap();
+
+        // Another session writes after the counts were read.
+        server
+            .service_for("busy")
+            .await
+            .unwrap()
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "late".to_string(),
+                node_type: NodeType::Content,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+                properties: HashMap::new(),
+            })
+            .await
+            .unwrap();
+
+        let err = server
+            .storage
+            .books
+            .delete("busy", fp.version)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err}");
+        assert_eq!(counts(&server, "busy").await, Some((2, 2, 1)));
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_book_was_deleted_gets_a_clear_error() {
+        let shared = memory_server();
+        book_with_content(&shared, "gone").await;
+        let reader = shared.for_new_session();
+        *reader.selected.write().unwrap() = Some("gone".into());
+
+        shared
+            .for_new_session()
+            .delete_book("gone", true, false)
+            .await
+            .unwrap();
+
+        // Read path (what `toc` does).
+        let err = reader
+            .service()
+            .await
+            .unwrap()
+            .read_tree()
+            .await
+            .map_err(OutlineMcpServer::to_mcp_error)
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("no longer exists"), "{}", err.message);
+
+        // Write path (what `node_create` does).
+        let err = reader
+            .service()
+            .await
+            .unwrap()
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "x".to_string(),
+                node_type: NodeType::Content,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+                properties: HashMap::new(),
+            })
+            .await
+            .map_err(OutlineMcpServer::to_mcp_error)
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("no longer exists"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn delete_then_init_the_same_slug_starts_empty() {
+        let server = memory_server();
+        book_with_content(&server, "reuse").await;
+        server.delete_book("reuse", true, false).await.unwrap();
+
+        server
+            .service_for("reuse")
+            .await
+            .unwrap()
+            .create_book("Again", 4)
+            .await
+            .unwrap();
+        assert_eq!(counts(&server, "reuse").await, Some((0, 0, 0)));
     }
 }

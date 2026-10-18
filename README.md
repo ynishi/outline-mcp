@@ -88,7 +88,7 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 13. **`snapshot_create`** / **`snapshot_list`** / **`snapshot_restore`** — Full book versioning (create, list, restore)
 14. **`node_history`** — View per-node change log with before/after diffs
 15. **`dump`** — Export full book as JSON file
-16. **`book_delete`** — Delete a book with its nodes, history and snapshots (cannot be undone). The slug is required; a book that still has nodes or snapshots needs `force: true`, and `dry_run: true` only reports what would be removed
+16. **`book_delete`** — Delete a book with its nodes, history and snapshots (cannot be undone). The slug is required; a book with any nodes, history or snapshots needs `force: true`, and `dry_run: true` only reports what would be removed. A write to the book between the check and the delete makes the delete fail without removing anything
 
 ### Node IDs
 

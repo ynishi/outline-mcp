@@ -406,7 +406,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "book_delete",
-        description = "Delete a book with all its nodes, history and snapshots. Cannot be undone: the book's snapshots are deleted too, so there is nothing to restore from. The slug must be given explicitly. A book that still has nodes or snapshots is refused unless `force: true`; `dry_run: true` reports what would be removed and changes nothing. Clears this session's selection if it pointed at the deleted book.",
+        description = "Delete a book with all its nodes, history and snapshots. Cannot be undone: the book's snapshots are deleted too, so there is nothing to restore from. The slug must be given explicitly. A book that has any nodes, history or snapshots is refused unless `force: true`; `dry_run: true` reports what would be removed and changes nothing. If the book is written after its contents were checked, nothing is deleted and the call fails; check again and retry. Clears this session's selection if it pointed at the deleted book.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
