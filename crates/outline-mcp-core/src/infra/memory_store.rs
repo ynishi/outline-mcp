@@ -108,6 +108,18 @@ impl BookStore for MemoryBookStore {
             })
             .collect())
     }
+
+    async fn delete(&self, slug: &str, expected_version: i64) -> Result<bool, StoreError> {
+        let mut books = self.books.lock().await;
+        match books.get(slug).map(|s| s.version) {
+            None => Ok(false),
+            Some(v) if v == expected_version => Ok(books.remove(slug).is_some()),
+            Some(v) => Err(StoreError::Conflict {
+                expected: Some(expected_version),
+                actual: Some(v),
+            }),
+        }
+    }
 }
 
 struct StoredSnapshot {
@@ -236,6 +248,13 @@ impl SnapshotStore for MemorySnapshotStore {
                 None => false,
             },
         )
+    }
+
+    async fn delete_all(&self, slug: &str) -> Result<u64, StoreError> {
+        let mut snapshots = self.snapshots.lock().await;
+        let before = snapshots.len();
+        snapshots.retain(|(s, _), _| s != slug);
+        Ok((before - snapshots.len()) as u64)
     }
 }
 
@@ -375,5 +394,80 @@ mod tests {
             .map(|s| s.slug)
             .collect();
         assert_eq!(slugs, vec!["a", "z"]);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_book_and_its_history_only() {
+        let store = MemoryBookStore::new();
+        store
+            .commit(
+                "gone",
+                None,
+                &TemplateBook::new("G", 4),
+                &[entry(NodeId::new())],
+            )
+            .await
+            .unwrap();
+        store
+            .commit(
+                "kept",
+                None,
+                &TemplateBook::new("K", 4),
+                &[entry(NodeId::new())],
+            )
+            .await
+            .unwrap();
+
+        assert!(store.delete("gone", 1).await.unwrap());
+        assert!(store.load("gone").await.unwrap().is_none());
+        assert!(store.history("gone").await.unwrap().is_empty());
+        assert!(store.load("kept").await.unwrap().is_some());
+        assert_eq!(store.history("kept").await.unwrap().len(), 1);
+
+        assert!(
+            !store.delete("gone", 1).await.unwrap(),
+            "second delete finds nothing"
+        );
+        assert!(!store.delete("never", 1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_at_a_stale_version_conflicts_and_keeps_the_book() {
+        let store = MemoryBookStore::new();
+        let book = TemplateBook::new("B", 4);
+        store.commit("b", None, &book, &[]).await.unwrap();
+        store
+            .commit("b", Some(1), &book, &[entry(NodeId::new())])
+            .await
+            .unwrap();
+
+        let err = store.delete("b", 1).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Conflict {
+                    expected: Some(1),
+                    actual: Some(2)
+                }
+            ),
+            "{err}"
+        );
+        assert!(store.load("b").await.unwrap().is_some());
+        assert_eq!(store.history("b").await.unwrap().len(), 1);
+        assert!(store.delete("b", 2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn snapshot_delete_all_removes_one_books_snapshots() {
+        let store = MemorySnapshotStore::new();
+        let book = TemplateBook::new("b", 4);
+        store.create("gone", &book, None).await.unwrap();
+        store.create("gone", &book, Some("x")).await.unwrap();
+        store.create("kept", &book, None).await.unwrap();
+
+        assert_eq!(store.delete_all("gone").await.unwrap(), 2);
+        assert!(store.list("gone").await.unwrap().is_empty());
+        assert_eq!(store.list("kept").await.unwrap().len(), 1);
+        assert_eq!(store.delete_all("gone").await.unwrap(), 0);
     }
 }

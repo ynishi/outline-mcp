@@ -103,6 +103,17 @@ pub trait BookStore: Send + Sync {
 
     /// Every stored book, ordered by slug.
     async fn list_books(&self) -> Result<Vec<BookSummary>, StoreError>;
+
+    /// Delete a book together with its history, if its stored version is
+    /// still `expected_version`.
+    ///
+    /// Returns `false` if there is no such book, and fails with
+    /// [`StoreError::Conflict`] (deleting nothing) if the book was written
+    /// after the caller read `expected_version` — so a caller that checked
+    /// what the book holds never removes content it did not see. Snapshots
+    /// belong to [`SnapshotStore::delete_all`]; a store that keeps both in one
+    /// place may remove them here as well.
+    async fn delete(&self, slug: &str, expected_version: i64) -> Result<bool, StoreError>;
 }
 
 #[async_trait]
@@ -135,6 +146,10 @@ impl<T: BookStore + ?Sized> BookStore for Arc<T> {
 
     async fn list_books(&self) -> Result<Vec<BookSummary>, StoreError> {
         (**self).list_books().await
+    }
+
+    async fn delete(&self, slug: &str, expected_version: i64) -> Result<bool, StoreError> {
+        (**self).delete(slug, expected_version).await
     }
 }
 
@@ -193,6 +208,9 @@ pub trait SnapshotStore: Send + Sync {
     /// Set (or replace) a snapshot's label. Returns `false` if there is no
     /// snapshot at `timestamp`.
     async fn tag(&self, slug: &str, timestamp: Timestamp, label: &str) -> Result<bool, StoreError>;
+
+    /// Delete every snapshot of a book. Returns how many were removed.
+    async fn delete_all(&self, slug: &str) -> Result<u64, StoreError>;
 }
 
 #[async_trait]
@@ -230,5 +248,9 @@ impl<T: SnapshotStore + ?Sized> SnapshotStore for Arc<T> {
 
     async fn tag(&self, slug: &str, timestamp: Timestamp, label: &str) -> Result<bool, StoreError> {
         (**self).tag(slug, timestamp, label).await
+    }
+
+    async fn delete_all(&self, slug: &str) -> Result<u64, StoreError> {
+        (**self).delete_all(slug).await
     }
 }

@@ -490,6 +490,35 @@ impl BookStore for PgBookStore {
             })
             .collect()
     }
+
+    /// One statement: nodes, events and snapshots go with the book row
+    /// through `ON DELETE CASCADE`, so the deletion is atomic. The version
+    /// condition is in the same statement, so a write committed after the
+    /// caller's read makes it delete nothing.
+    async fn delete(&self, slug: &str, expected_version: i64) -> Result<bool, StoreError> {
+        let deleted = sqlx::query("DELETE FROM books WHERE slug = $1 AND version = $2")
+            .bind(slug)
+            .bind(expected_version)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::backend)?
+            .rows_affected();
+        if deleted > 0 {
+            return Ok(true);
+        }
+        let actual: Option<i64> = sqlx::query_scalar("SELECT version FROM books WHERE slug = $1")
+            .bind(slug)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::backend)?;
+        match actual {
+            None => Ok(false),
+            Some(v) => Err(StoreError::Conflict {
+                expected: Some(expected_version),
+                actual: Some(v),
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -621,6 +650,15 @@ impl SnapshotStore for PgBookStore {
                 .map_err(StoreError::backend)?
                 .rows_affected();
         Ok(updated > 0)
+    }
+
+    async fn delete_all(&self, slug: &str) -> Result<u64, StoreError> {
+        Ok(sqlx::query("DELETE FROM snapshots WHERE book = $1")
+            .bind(slug)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::backend)?
+            .rows_affected())
     }
 }
 
