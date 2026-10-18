@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Docker image builds with Rust 1.97** (was 1.88). sqlx 0.9 requires rustc 1.94 or later, so the image no longer built.
 - **Storage is Postgres; `serve` / `stdio` require a database.** The server takes `OUTLINE_MCP_DATABASE_URL` (or `--database-url`) and refuses to start without one, on a database `migrate` has not brought up to date, or when the connection fails — within about 5 s, saying whether the host was unreachable, the login was rejected or the database does not exist. Every MCP tool now runs on the store, so a write and its history entry are committed together and a stale per-book version is rejected instead of overwriting a concurrent write. Fixes #2 for books served from Postgres.
 - **Bulk writes are chunked.** A commit still runs in one transaction, but node and history rows go in statements of at most 500 rows and about 1 MB each. Writing a large book in one statement per table (an 8 MB history in a single `UNNEST`) sent a 256 MB Postgres machine into crash recovery during an import; the same 29-book import now runs in chunks and still rolls back as a whole if any chunk fails.
 - **Daemon templates and runbooks target Postgres.** `contrib/systemd` and `contrib/launchd` drop the shelf path and take the database URL from their environment block; `docs/runbooks/data-migration.md` is now the `import-shelf` procedure (local shelf or a shelf on a Fly volume) and `multi-device-smoke.md` adds the startup-refusal checks.
