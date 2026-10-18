@@ -27,6 +27,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Each HTTP session has its own selected book** (#6). Every streamable-HTTP session used to share one selection, so `select_book` (or `init`) in one session redirected the next write of every other session into that book. Sessions now share the storage but start with no book selected and keep their own selection; stdio is unchanged.
+
 ### Security
 
 ## [0.14.0] - 2026-08-15
