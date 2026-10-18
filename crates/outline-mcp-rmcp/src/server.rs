@@ -127,8 +127,11 @@ pub async fn run_http(storage: Storage, bind: &str) -> anyhow::Result<()> {
         // Bearer auth replaces loopback Host validation for LAN/remote binds.
         http_config.allowed_hosts.clear();
     }
+    // One server value per MCP session: the storage is shared, the selected
+    // book is not, so `select_book` in one session never redirects another
+    // session's writes.
     let service = StreamableHttpService::new(
-        move || Ok(server.clone()),
+        move || Ok(server.for_new_session()),
         Arc::new(LocalSessionManager::default()),
         http_config,
     );
@@ -204,6 +207,18 @@ impl OutlineMcpServer {
             storage,
             selected: Arc::new(RwLock::new(None)),
             tool_router: Self::tool_router(),
+        }
+    }
+
+    /// A server for a new MCP session: the same storage, no book selected.
+    ///
+    /// `Clone` shares `selected` (it is an `Arc`), which is right inside one
+    /// session and wrong across sessions — the HTTP transport builds one
+    /// server per session through this instead.
+    pub(crate) fn for_new_session(&self) -> Self {
+        Self {
+            selected: Arc::new(RwLock::new(None)),
+            ..self.clone()
         }
     }
 
@@ -538,5 +553,92 @@ mod tests {
         assert!(server.selected_slug().is_err());
         *server.selected.write().unwrap() = Some("b".into());
         assert_eq!(server.selected_slug().unwrap(), "b");
+    }
+
+    #[test]
+    fn new_session_starts_unselected_and_does_not_share_selection() {
+        let shared = memory_server();
+        *shared.selected.write().unwrap() = Some("x".into());
+
+        let a = shared.for_new_session();
+        let b = shared.for_new_session();
+        assert!(
+            a.selected_slug().is_err(),
+            "a new session starts unselected"
+        );
+
+        *a.selected.write().unwrap() = Some("a-book".into());
+        *b.selected.write().unwrap() = Some("b-book".into());
+        assert_eq!(a.selected_slug().unwrap(), "a-book");
+        assert_eq!(b.selected_slug().unwrap(), "b-book");
+        assert_eq!(shared.selected_slug().unwrap(), "x");
+    }
+
+    #[tokio::test]
+    async fn sessions_write_to_the_book_each_selected() {
+        use outline_mcp_core::domain::model::book::AddNodeRequest;
+        use outline_mcp_core::domain::model::node::NodeType;
+        use std::collections::HashMap;
+
+        let shared = memory_server();
+        for (slug, title) in [("a-book", "A"), ("b-book", "B")] {
+            shared
+                .service_for(slug)
+                .await
+                .unwrap()
+                .create_book(title, 4)
+                .await
+                .unwrap();
+        }
+
+        let a = shared.for_new_session();
+        let b = shared.for_new_session();
+        *a.selected.write().unwrap() = Some("a-book".into());
+        *b.selected.write().unwrap() = Some("b-book".into());
+
+        let node = |title: &str| AddNodeRequest {
+            parent: None,
+            title: title.to_string(),
+            node_type: NodeType::Content,
+            body: None,
+            placeholder: None,
+            position: usize::MAX,
+            properties: HashMap::new(),
+        };
+        a.service()
+            .await
+            .unwrap()
+            .add_node(node("from a"))
+            .await
+            .unwrap();
+        b.service()
+            .await
+            .unwrap()
+            .add_node(node("from b"))
+            .await
+            .unwrap();
+
+        let titles = |book: outline_mcp_core::domain::model::book::TemplateBook| {
+            book.all_nodes_dfs()
+                .iter()
+                .map(|n| n.title().to_string())
+                .collect::<Vec<_>>()
+        };
+        let a_book = shared
+            .service_for("a-book")
+            .await
+            .unwrap()
+            .read_tree()
+            .await
+            .unwrap();
+        let b_book = shared
+            .service_for("b-book")
+            .await
+            .unwrap()
+            .read_tree()
+            .await
+            .unwrap();
+        assert_eq!(titles(a_book), vec!["from a"]);
+        assert_eq!(titles(b_book), vec!["from b"]);
     }
 }
