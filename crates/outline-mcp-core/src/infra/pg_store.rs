@@ -25,9 +25,12 @@
 //! `jsonb`, so key order and whitespace may differ from the strings written;
 //! the JSON value is the same.
 //!
-//! Node rows and events are written with one `UNNEST` statement each, so a
-//! write costs a fixed number of round trips however many rows it touches
-//! (an import of a thousand-node book included).
+//! Node rows and events are written with `UNNEST` statements of at most
+//! [`CHUNK_ROWS`] rows and about [`CHUNK_BYTES`] of payload each, all inside
+//! the one transaction. A small edit is one statement; an import of a
+//! thousand-node book with an 8 MB history is a few dozen, and still commits
+//! or rolls back as a whole. One statement per table was tried first: a
+//! ~10 MB `UNNEST` sent a 256 MB Postgres machine into crash recovery.
 //!
 //! # Snapshots
 //!
@@ -72,6 +75,34 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// How long [`PgBookStore::connect_with`] waits for a first connection by
 /// default before reporting the database unreachable.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Most rows one bulk statement in [`BookStore::commit`] carries.
+pub const CHUNK_ROWS: usize = 500;
+
+/// Approximate payload one bulk statement in [`BookStore::commit`] carries;
+/// a chunk closes at whichever of this and [`CHUNK_ROWS`] it reaches first.
+pub const CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Split `items` into consecutive ranges of at most [`CHUNK_ROWS`] items and,
+/// by `size`, about [`CHUNK_BYTES`] each. A single item larger than
+/// [`CHUNK_BYTES`] gets a range of its own.
+fn chunk_ranges<T>(items: &[T], size: impl Fn(&T) -> usize) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let (mut start, mut bytes) = (0, 0);
+    for (i, item) in items.iter().enumerate() {
+        let s = size(item);
+        if i > start && (i - start >= CHUNK_ROWS || bytes + s > CHUNK_BYTES) {
+            ranges.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes += s;
+    }
+    if start < items.len() {
+        ranges.push(start..items.len());
+    }
+    ranges
+}
 
 /// Books, nodes and events in Postgres. Cheap to clone (shares one pool).
 #[derive(Clone)]
@@ -133,6 +164,16 @@ struct NodeRow {
     properties: Value,
     status: String,
     updated_at: Option<i64>,
+}
+
+impl NodeRow {
+    /// Rough wire size of the row, for [`chunk_ranges`].
+    fn approx_bytes(&self) -> usize {
+        64 + self.title.len()
+            + self.body.as_ref().map_or(0, String::len)
+            + self.placeholder.as_ref().map_or(0, String::len)
+            + self.properties.to_string().len()
+    }
 }
 
 impl PgBookStore {
@@ -323,19 +364,20 @@ impl BookStore for PgBookStore {
             .filter(|id| !new_rows.contains_key(id))
             .copied()
             .collect();
-        if !removed.is_empty() {
+        for range in chunk_ranges(&removed, |_| 16) {
             sqlx::query("DELETE FROM nodes WHERE book = $1 AND id = ANY($2)")
                 .bind(slug)
-                .bind(&removed)
+                .bind(&removed[range])
                 .execute(&mut *tx)
                 .await
                 .map_err(StoreError::backend)?;
         }
-        let changed: Vec<&NodeRow> = new_rows
+        let changed_all: Vec<&NodeRow> = new_rows
             .values()
             .filter(|row| old_rows.get(&row.id) != Some(*row))
             .collect();
-        if !changed.is_empty() {
+        for range in chunk_ranges(&changed_all, |r| r.approx_bytes()) {
+            let changed = &changed_all[range];
             sqlx::query(
                 "INSERT INTO nodes (book, id, parent, position, title, body, node_type, placeholder, properties, status, updated_at) \
                  SELECT $1, * FROM UNNEST($2::uuid[], $3::uuid[], $4::int4[], $5::text[], $6::text[], \
@@ -361,7 +403,13 @@ impl BookStore for PgBookStore {
             .map_err(StoreError::backend)?;
         }
 
-        if !events.is_empty() {
+        let event_size = |e: &ChangeEntry| {
+            64 + e.before.as_ref().map_or(0, String::len) + e.after.as_ref().map_or(0, String::len)
+        };
+        // Chunks run in order, and each keeps its own order, so `id` (the
+        // history order) still follows `events`.
+        for range in chunk_ranges(events, event_size) {
+            let events = &events[range];
             let mut node_ids = Vec::with_capacity(events.len());
             let mut actions = Vec::with_capacity(events.len());
             let mut befores = Vec::with_capacity(events.len());
@@ -782,6 +830,30 @@ mod tests {
         let after = rows_of(&book).unwrap();
         assert_eq!(before.get(&a.as_uuid()), after.get(&a.as_uuid()));
         assert!(!before.contains_key(&b.as_uuid()));
+    }
+
+    #[test]
+    fn chunk_ranges_split_by_rows_and_bytes() {
+        assert!(chunk_ranges::<u8>(&[], |_| 1).is_empty());
+
+        let rows = vec![0u8; CHUNK_ROWS * 2 + 1];
+        let ranges = chunk_ranges(&rows, |_| 1);
+        assert_eq!(
+            ranges,
+            vec![
+                0..CHUNK_ROWS,
+                CHUNK_ROWS..CHUNK_ROWS * 2,
+                CHUNK_ROWS * 2..CHUNK_ROWS * 2 + 1
+            ]
+        );
+
+        // Three items of 0.4 MB: two fit under CHUNK_BYTES, the third starts a new chunk.
+        let big = vec![CHUNK_BYTES * 2 / 5; 3];
+        assert_eq!(chunk_ranges(&big, |s| *s), vec![0..2, 2..3]);
+
+        // An item over the limit stands alone rather than being dropped.
+        let huge = vec![1, CHUNK_BYTES * 3, 1];
+        assert_eq!(chunk_ranges(&huge, |s| *s), vec![0..1, 1..2, 2..3]);
     }
 
     #[test]

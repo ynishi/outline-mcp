@@ -61,7 +61,7 @@ OUTLINE_MCP_HTTP_TOKEN=<token> outline-mcp --mcp-http --bind 0.0.0.0:8486
 
 Every request must then carry `Authorization: Bearer <token>` — set it wherever your MCP client configures request headers. TLS termination is a reverse-proxy concern. Logs go to stderr in both transports; stdout stays reserved for the stdio protocol channel.
 
-Service templates for running this as a daemon live in `contrib/systemd/` and `contrib/launchd/`, and `docs/runbooks/` covers deployment. Both still describe the pre-Postgres shelf directory and are being updated; until then, pass the database through `OUTLINE_MCP_DATABASE_URL` instead of a shelf path.
+Service templates for running this as a daemon live in `contrib/systemd/` and `contrib/launchd/` (both take the database URL from their environment block). `docs/runbooks/` covers hosting on Fly.io with an unmanaged Fly Postgres app (`fly-io-deploy.md`, config in `contrib/fly/fly.toml`), importing a pre-Postgres shelf (`data-migration.md`) and an end-to-end smoke checklist (`multi-device-smoke.md`).
 
 ## Workflow
 

@@ -1,132 +1,105 @@
-# Data migration — moving the shelf to the central daemon host
+# Data migration — moving a pre-Postgres shelf into the database
 
-Procedure for migrating an existing outline-mcp shelf
-(`~/.config/outline-mcp/books/`) from one host to the central `--mcp-http`
-daemon host with plain `tar`. Mirrors mini-app-mcp's
-`docs/runbooks/data-migration.md`; layout facts below are from
-`outline-mcp-rmcp::server` / `outline-mcp-core::infra::snapshot_sink`.
+Up to 0.14, outline-mcp stored each book as files in a shelf directory
+(default `~/.config/outline-mcp/books/`). The server now reads only Postgres;
+`outline-mcp import-shelf` copies a shelf into it once. This runbook covers a
+local shelf and a shelf on a Fly volume.
 
-## 0. Data layout
+## 0. Source layout
 
 ```
-~/.config/outline-mcp/books/
+<shelf>/
 ├── <slug>.json                        # book body (1 file per book)
-├── <slug>.events.db (+ -wal / -shm)   # ai-store event log (snapshots + changelog)
-├── <slug>.snap.<millis>.json          # snapshot dumps (SnapshotOnlySink output)
+├── <slug>.events.db (+ -wal / -shm)   # event log (history + snapshots), 0.10–0.14
+├── <slug>.snap.<millis>.json          # snapshot dumps
 ├── <slug>.snap.<millis>.meta.json     # snapshot label sidecar (when labeled)
-└── <slug>.changelog.json              # legacy sidecar (pre ai-store), may be absent
+└── <slug>.changelog.json              # older history sidecar, may be absent
 ```
 
-- The shelf is flat: **one book = one `<slug>.json` plus its same-slug
-  sidecars**, so a single book can be migrated by copying its slug's files
-  (see §5).
-- `-wal` / `-shm` are SQLite WAL sidecars. Copying them is safe **only while
-  no process has the DB open** — SQLite recovers from the WAL on next open.
-  Never tar a live shelf.
+The importer reads all of them. History is read entry by entry rather than
+by replaying the event log, so a book whose log no longer replays (the
+`patch application failed` warning, issue #2) still imports with its full
+history.
 
-## 1. Source host: stop every server and client
+## 1. Stop every writer of the shelf
 
-outline-mcp has **two consumer shapes**, both must be stopped:
+The shelf must not change while it is copied, and nothing should keep
+writing to it afterwards — once imported, the database is the only copy that
+counts.
 
 ```sh
-# standalone daemon / stdio server, if any
 pgrep -fl outline-mcp
-# macOS daemon, if installed:
-#   launchctl bootout gui/$(id -u)/io.github.ynishi.outline-mcp
-# Linux daemon, if installed:
-#   systemctl --user stop outline-mcp
+# macOS daemon, if installed:   launchctl bootout gui/$(id -u)/io.github.ynishi.outline-mcp
+# Linux daemon, if installed:   systemctl --user stop outline-mcp
 ```
 
-- **stdio instances** are spawned by MCP clients (editor / agent sessions) —
-  close those sessions.
-- **In-process embedders leave no trace in pgrep.** A host can link this crate
-  and open the shelf directory directly instead of spawning `outline-mcp`, so
-  the checks above find nothing while the shelf is still being written
-  (`local-develop-server` is one such host). Close every session of any such
-  client on the source host too, or its in-process handle keeps writing the
-  old inodes and those writes are lost after the move.
+Close the MCP client sessions that spawn stdio servers, too. Hosts that
+embed the crate and open the shelf in-process leave no trace in `pgrep`;
+close their sessions as well.
 
-**Expect**: no `outline-mcp` process, and no live session of any in-process
-embedder, on the source host.
+## 2. Get the shelf onto the machine that runs the import
 
-## 2. Source host: archive
+**Local shelf**: nothing to do; use its path below.
+
+**Shelf on a Fly volume** (a deploy from before Postgres, machine still
+running the old image):
 
 ```sh
-tar -C ~/.config/outline-mcp -czf /tmp/outline-books.tgz books
+fly ssh console --app <your-app-name> -C "tar -czf /data/books-export.tgz -C /data books"
+fly ssh sftp get /data/books-export.tgz ./books-export.tgz --app <your-app-name>
+mkdir -p ./shelf-export && tar -xzf ./books-export.tgz -C ./shelf-export
+# the shelf is now ./shelf-export/books
 ```
 
-## 3. Transfer
+Stop clients from writing to the old deployment before taking the archive;
+writes made after it are not in the import.
+
+Copy the directory as a whole, as the `tar` above does. Each
+`<slug>.events.db` has `-wal` / `-shm` siblings, and the `-wal` file can
+hold history that has not been written back into `.events.db` yet; a copy
+that picks only `*.json` and `*.events.db` can import with entries missing,
+and the comparison table cannot notice, because it compares the import with
+that same copy.
+
+## 3. Migrate and import
 
 ```sh
-scp /tmp/outline-books.tgz <central-host>:/tmp/
+export OUTLINE_MCP_DATABASE_URL="postgres://<user>:<password>@<host>:5432/<database>"
+# for a Fly Postgres app, through `fly proxy 15433:5432 --app <db-app>`:
+#   postgres://<user>:<password>@127.0.0.1:15433/<database>
+
+outline-mcp migrate
+outline-mcp import-shelf --shelf <shelf-dir>               # every book
+outline-mcp import-shelf --shelf <shelf-dir> --slug rust   # one book
 ```
 
-## 4. Central host: stop, set aside, extract, start
+The importer prints one row per book and a summary:
 
-```sh
-systemctl --user stop outline-mcp
-mkdir -p ~/.config/outline-mcp
-[ -d ~/.config/outline-mcp/books ] && mv ~/.config/outline-mcp/books ~/.config/outline-mcp/books.bak.$(date +%Y%m%d)   # keep, do not delete
-tar -C ~/.config/outline-mcp -xzf /tmp/outline-books.tgz
-systemctl --user start outline-mcp
+```
+slug         result  nodes(src/db)  hash  history(src/db)  snapshots(src/db)
+development  ok      1121/1121      same  5110/5110        0/0
+...
+29 book(s): 29 matched, 0 failed or differ
 ```
 
-Set the existing dir aside even when it is empty — a daemon that already ran
-on this host has created the dir, and extracting into that mixed state is
-asking for confusion.
+**Expect**: every row `ok` / `same`, equal counts on both sides, and exit 0.
+Any book that fails or differs makes the command exit non-zero; its row says
+which comparison did not match.
 
-Verify:
+A slug that already exists in the database is refused. Re-run with
+`--replace` to overwrite it — for example after fixing a source file, or to
+take a fresher copy of a shelf that was still being written.
 
-```sh
-systemctl --user is-active outline-mcp
-curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8486/mcp \
-  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"migrate","version":"0"}}}'
-```
+## 4. Point clients at the new server
 
-**Expect**: `active` and `200`. Then call `shelf` from any MCP client and
-confirm every migrated book slug is listed, and `select_book` + `toc` on a
-known book shows its nodes.
+Every host that used the shelf, locally or through the old deployment, now
+talks to the database-backed server: start `outline-mcp` with
+`OUTLINE_MCP_DATABASE_URL`, or register the HTTP endpoint (see
+`fly-io-deploy.md` §7). An embedder or stdio server still pointed at the old
+shelf path refuses to start and points at `import-shelf`.
 
-## 5. Single-book variant
+## 5. Keep the source until you are sure
 
-```sh
-# source (after §1 stop) — one slug + all its sidecars
-tar -C ~/.config/outline-mcp/books -czf /tmp/<slug>.tgz \
-  $(cd ~/.config/outline-mcp/books && ls <slug>.json <slug>.events.db* <slug>.snap.* 2>/dev/null)
-# central host: stop daemon → set aside same-slug files → extract → start
-tar -C ~/.config/outline-mcp/books -xzf /tmp/<slug>.tgz
-```
-
-The shelf is scanned per call, so a running daemon picks the new book up on
-the next `shelf` — but the stop/start bracket keeps the WAL rule in §0 honest.
-
-## 6. Post-migration checks and caveats
-
-- **Ephemeral sidecars**: after the daemon reopens an `.events.db`, its
-  `-shm` differs from the archived copy. Expected — regenerated shared
-  memory, not data.
-- **Legacy snapshot dumps**: if the source shelf predates the ai-store
-  snapshot stream, import the on-disk `.snap.*.json` dumps into the event
-  log once, on the central host:
-
-  ```sh
-  outline-mcp migrate-snapshots --shelf ~/.config/outline-mcp/books
-  ```
-
-  Idempotent per its timestamp contract; run it before trusting
-  `snapshot_list` / `snapshot_restore` on migrated books.
-- **Dangling symlinks**: books are normally real files, but check anyway —
-  `find ~/.config/outline-mcp/books -type l ! -exec test -e {} \; -print`
-  (expect: no output).
-- **Old host becomes a client**: after migration the source host must reach
-  the shelf through the central daemon only. Leaving an embedded outline (or
-  a standalone stdio outline-mcp) pointed at the old local shelf means two
-  writable copies — two diverging sources of truth. Switch the source host to
-  the HTTP endpoint (via whatever remote-server setting the embedder exposes,
-  or a direct MCP HTTP registration), or move the old shelf out of the
-  default path so an accidental embed start finds nothing.
-- **No node-level merge**: this procedure replaces files wholesale. If both
-  sides accumulated distinct edits to the same book, merging is manual
-  (snapshot dumps + eyeballs) — there is no merge subcommand. The `.bak`
-  dir from §4 is the safety net; keep it until the migration is confirmed.
+The importer only reads the shelf. Keep the shelf directory (and, for Fly,
+the old volume) until the imported books have been in use for a while; it is
+the fallback if something turns out to be missing.

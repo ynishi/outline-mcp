@@ -153,6 +153,86 @@ async fn round_trip_against_postgres() {
 }
 
 #[tokio::test]
+async fn bulk_commit_is_chunked_and_atomic_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!("OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres bulk test did NOT run");
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let slug = format!("_test-bulk-{}", std::process::id());
+
+    // 2,500 nodes with ~1 KB bodies and 5,000 events with ~2 KB each: several
+    // chunks by row count and by bytes, in one commit.
+    let body = "x".repeat(1000);
+    let mut book = TemplateBook::new("Bulk", 4);
+    let mut ids = Vec::new();
+    for i in 0..2500 {
+        let mut req = add_req(None, &format!("n{i}"));
+        req.body = Some(body.clone());
+        ids.push(book.add_node(req).unwrap());
+    }
+    let payload = format!(r#"{{"body":"{body}"}}"#);
+    let events: Vec<ChangeEntry> = (0..5000)
+        .map(|i| {
+            ChangeEntry::new(
+                ids[i % ids.len()],
+                ChangeAction::Update,
+                Some(payload.clone()),
+                Some(payload.clone()),
+                Timestamp::from_millis(1_000 + i as i64),
+            )
+        })
+        .collect();
+    let committed = store
+        .commit(&slug, None, &book, &events)
+        .await
+        .expect("bulk commit");
+    let loaded = store.load(&slug).await.unwrap().expect("book stored");
+    assert_eq!(loaded.value.node_count(), 2500);
+    let history = store.history(&slug).await.unwrap();
+    assert_eq!(history.len(), 5000);
+    assert!(
+        history
+            .windows(2)
+            .all(|w| w[0].timestamp.as_millis() < w[1].timestamp.as_millis()),
+        "history keeps the order the events were given across chunks"
+    );
+
+    // A failure in the last chunk rolls back every earlier chunk of the commit.
+    let mut more = loaded.value.clone();
+    for i in 0..1200 {
+        more.add_node(add_req(None, &format!("m{i}"))).unwrap();
+    }
+    let mut bad_events = events[..1200].to_vec();
+    bad_events.push(ChangeEntry::new(
+        ids[0],
+        ChangeAction::Update,
+        Some("{ not json".to_string()),
+        None,
+        Timestamp::from_millis(9_999_999),
+    ));
+    assert!(store
+        .commit(&slug, Some(committed.version), &more, &bad_events)
+        .await
+        .is_err());
+    let after = store.load(&slug).await.unwrap().expect("book still there");
+    assert_eq!(after.version, committed.version, "version unchanged");
+    assert_eq!(
+        after.value.node_count(),
+        2500,
+        "no node from the failed commit"
+    );
+    assert_eq!(
+        store.history(&slug).await.unwrap().len(),
+        5000,
+        "no event either"
+    );
+
+    assert!(store.delete_book(&slug).await.unwrap());
+}
+
+#[tokio::test]
 async fn snapshots_restore_and_import_against_postgres() {
     let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
         eprintln!(

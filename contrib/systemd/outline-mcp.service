@@ -13,10 +13,12 @@ Description=outline-mcp — tree-structured knowledge base MCP server (streamabl
 After=network.target
 
 [Service]
-# Shelf directory defaults to ~/.config/outline-mcp/books when the
-# positional argument is omitted; kept explicit here so the unit is the
-# single place that states where the SSOT shelf lives.
-ExecStart=%h/.cargo/bin/outline-mcp %h/.config/outline-mcp/books --mcp-http --bind 127.0.0.1:8486
+# Books live in Postgres. Replace the placeholder with your database URL and
+# run `outline-mcp migrate` against it once before enabling the unit: the
+# server refuses to start on an unmigrated database. To keep the URL out of
+# this file, use EnvironmentFile=%h/.config/outline-mcp/server.env instead.
+Environment=OUTLINE_MCP_DATABASE_URL=postgres://<user>:<password>@<host>:5432/<database>
+ExecStart=%h/.cargo/bin/outline-mcp --mcp-http --bind 127.0.0.1:8486
 # LAN exposure requires a token (startup is refused otherwise):
 #   Environment=OUTLINE_MCP_HTTP_TOKEN=<random-string>
 # and change --bind to 0.0.0.0:8486 in ExecStart.
