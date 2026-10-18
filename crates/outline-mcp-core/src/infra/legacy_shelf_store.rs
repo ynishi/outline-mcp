@@ -109,4 +109,12 @@ where
         // listing (`list_book_slugs` in the server) stays the source of slugs.
         Ok(Vec::new())
     }
+
+    async fn delete(&self, _slug: &str) -> Result<bool, StoreError> {
+        // Only `import-shelf` reads through this adapter; nothing deletes a
+        // pre-Postgres shelf through it.
+        Err(StoreError::backend(
+            "deleting a book is not supported on the legacy shelf adapter",
+        ))
+    }
 }

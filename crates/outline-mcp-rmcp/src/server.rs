@@ -182,6 +182,24 @@ fn bearer_token_matches(headers: &axum::http::HeaderMap, token: &str) -> bool {
 // MCP Server
 // =============================================================================
 
+/// What a book holds, as reported (and removed) by `book_delete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BookFootprint {
+    pub nodes: usize,
+    pub history: usize,
+    pub snapshots: usize,
+}
+
+impl std::fmt::Display for BookFootprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} nodes, {} history entries, {} snapshots",
+            self.nodes, self.history, self.snapshots
+        )
+    }
+}
+
 /// The `BookService` every tool handler uses: one book of the server's
 /// [`Storage`].
 pub(crate) type ServerService = BookService<Arc<dyn BookStore>>;
@@ -290,6 +308,92 @@ impl OutlineMcpServer {
                 McpError::internal_error(format!("Failed to list books: {e}"), None)
             })?;
         Ok(books.into_iter().map(|b| b.slug).collect())
+    }
+
+    /// What deleting `slug` would remove, or `None` if there is no such book.
+    pub(crate) async fn book_footprint(
+        &self,
+        slug: &str,
+    ) -> Result<Option<BookFootprint>, McpError> {
+        let read_err =
+            |e| McpError::internal_error(format!("Failed to read book '{slug}': {e}"), None);
+        let Some(book) = self.storage.books.load(slug).await.map_err(read_err)? else {
+            return Ok(None);
+        };
+        let history = self.storage.books.history(slug).await.map_err(read_err)?;
+        let snapshots = self.storage.snapshots.list(slug).await.map_err(read_err)?;
+        Ok(Some(BookFootprint {
+            nodes: book.value.node_count(),
+            history: history.len(),
+            snapshots: snapshots.len(),
+        }))
+    }
+
+    /// The `book_delete` tool: delete `slug` with its nodes, history and
+    /// snapshots. A book that still has nodes or snapshots is refused unless
+    /// `force`; `dry_run` only reports. Clears this session's selection when
+    /// it pointed at the deleted book; other sessions are not touched.
+    pub(crate) async fn delete_book(
+        &self,
+        slug: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<String, McpError> {
+        let Some(fp) = self.book_footprint(slug).await? else {
+            return Err(McpError::invalid_params(
+                format!("Book '{slug}' not found. Use `shelf` to list books."),
+                None,
+            ));
+        };
+        if dry_run {
+            return Ok(format!(
+                "Dry run: would delete '{slug}': {fp}. Nothing changed."
+            ));
+        }
+        if !force && (fp.nodes > 0 || fp.snapshots > 0) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Book '{slug}' is not empty ({fp}). Deleting it cannot be undone; \
+                     pass `force: true` to delete it anyway, or `dry_run: true` to only report."
+                ),
+                None,
+            ));
+        }
+
+        let deleted = self.storage.books.delete(slug).await.map_err(|e| {
+            McpError::internal_error(format!("Failed to delete book '{slug}': {e}"), None)
+        })?;
+        if !deleted {
+            return Err(McpError::invalid_params(
+                format!("Book '{slug}' not found (deleted concurrently?)."),
+                None,
+            ));
+        }
+        self.storage.snapshots.delete_all(slug).await.map_err(|e| {
+            McpError::internal_error(
+                format!("Deleted book '{slug}' but failed to delete its snapshots: {e}"),
+                None,
+            )
+        })?;
+
+        let mut cleared = false;
+        {
+            let mut guard = self
+                .selected
+                .write()
+                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+            if guard.as_deref() == Some(slug) {
+                *guard = None;
+                cleared = true;
+            }
+        }
+        let mut msg = format!("Deleted book '{slug}': {fp}.");
+        if cleared {
+            msg.push_str(
+                " It was this session's selected book; select another with `select_book`.",
+            );
+        }
+        Ok(msg)
     }
 
     /// 番号 or slug → slug に解決する。
@@ -640,5 +744,149 @@ mod tests {
             .unwrap();
         assert_eq!(titles(a_book), vec!["from a"]);
         assert_eq!(titles(b_book), vec!["from b"]);
+    }
+
+    /// A book `slug` with one node (and its create event) and one snapshot.
+    async fn book_with_content(server: &OutlineMcpServer, slug: &str) {
+        use outline_mcp_core::domain::model::book::AddNodeRequest;
+        use outline_mcp_core::domain::model::node::NodeType;
+        use std::collections::HashMap;
+
+        let svc = server.service_for(slug).await.unwrap();
+        svc.create_book(slug, 4).await.unwrap();
+        svc.add_node(AddNodeRequest {
+            parent: None,
+            title: "n".to_string(),
+            node_type: NodeType::Content,
+            body: None,
+            placeholder: None,
+            position: usize::MAX,
+            properties: HashMap::new(),
+        })
+        .await
+        .unwrap();
+        let book = svc.read_tree().await.unwrap();
+        server
+            .storage
+            .snapshots
+            .create(slug, &book, None)
+            .await
+            .unwrap();
+    }
+
+    fn footprint(nodes: usize, history: usize, snapshots: usize) -> Option<BookFootprint> {
+        Some(BookFootprint {
+            nodes,
+            history,
+            snapshots,
+        })
+    }
+
+    #[tokio::test]
+    async fn book_delete_refuses_a_non_empty_book_without_force() {
+        let server = memory_server();
+        book_with_content(&server, "full").await;
+
+        let err = server.delete_book("full", false, false).await.unwrap_err();
+        assert!(err.message.contains("not empty"), "{}", err.message);
+        assert!(err
+            .message
+            .contains("1 nodes, 1 history entries, 1 snapshots"));
+        assert_eq!(
+            server.book_footprint("full").await.unwrap(),
+            footprint(1, 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn book_delete_dry_run_reports_and_changes_nothing() {
+        let server = memory_server();
+        book_with_content(&server, "full").await;
+
+        for force in [false, true] {
+            let msg = server.delete_book("full", force, true).await.unwrap();
+            assert!(msg.contains("would delete 'full': 1 nodes"), "{msg}");
+        }
+        assert_eq!(
+            server.book_footprint("full").await.unwrap(),
+            footprint(1, 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn book_delete_with_force_removes_book_history_and_snapshots() {
+        let server = memory_server();
+        book_with_content(&server, "full").await;
+        book_with_content(&server, "other").await;
+
+        let msg = server.delete_book("full", true, false).await.unwrap();
+        assert!(msg.contains("Deleted book 'full': 1 nodes"), "{msg}");
+        assert_eq!(server.book_footprint("full").await.unwrap(), None);
+        assert!(server
+            .storage
+            .books
+            .history("full")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(server
+            .storage
+            .snapshots
+            .list("full")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(server.list_book_slugs().await.unwrap(), vec!["other"]);
+        assert_eq!(
+            server.book_footprint("other").await.unwrap(),
+            footprint(1, 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn book_delete_of_an_empty_book_needs_no_force() {
+        let server = memory_server();
+        server
+            .service_for("empty")
+            .await
+            .unwrap()
+            .create_book("E", 4)
+            .await
+            .unwrap();
+        server.delete_book("empty", false, false).await.unwrap();
+        assert_eq!(server.book_footprint("empty").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn book_delete_of_a_missing_book_is_an_error() {
+        let server = memory_server();
+        let err = server.delete_book("nope", true, false).await.unwrap_err();
+        assert!(err.message.contains("not found"), "{}", err.message);
+        let err = server.delete_book("nope", false, true).await.unwrap_err();
+        assert!(err.message.contains("not found"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn book_delete_clears_only_the_calling_sessions_selection() {
+        let shared = memory_server();
+        book_with_content(&shared, "full").await;
+        let a = shared.for_new_session();
+        let b = shared.for_new_session();
+        *a.selected.write().unwrap() = Some("full".into());
+        *b.selected.write().unwrap() = Some("full".into());
+
+        let msg = a.delete_book("full", true, false).await.unwrap();
+        assert!(msg.contains("this session's selected book"), "{msg}");
+        assert!(a.selected_slug().is_err());
+        assert_eq!(
+            b.selected_slug().unwrap(),
+            "full",
+            "other sessions untouched"
+        );
+
+        // A session whose selection points elsewhere is told nothing about it.
+        book_with_content(&shared, "again").await;
+        let msg = b.delete_book("again", true, false).await.unwrap();
+        assert!(!msg.contains("selected"), "{msg}");
     }
 }

@@ -12,8 +12,8 @@ use crate::helpers::{build_hierarchical_ids, find_hierarchical_id, format_toc};
 use crate::request::{
     normalize_text, parse_node_id, parse_node_status, parse_node_type, sanitize_for_filename,
     unescape_newlines, validate_filename, validate_import_path, validate_slug, McpBatchMoveRequest,
-    McpBatchUpdateRequest, McpBookHistoryRequest, McpDumpRequest, McpEjectRequest,
-    McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpNodeCreateRequest,
+    McpBatchUpdateRequest, McpBookDeleteRequest, McpBookHistoryRequest, McpDumpRequest,
+    McpEjectRequest, McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpNodeCreateRequest,
     McpNodeHistoryRequest, McpNodeMoveRequest, McpNodeQueryRequest, McpNodeUpdateRequest,
     McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest, McpSnapshotDiffRequest,
     McpSnapshotDumpAllRequest, McpSnapshotDumpRequest, McpSnapshotListRequest,
@@ -401,6 +401,27 @@ impl OutlineMcpServer {
                 req.slug,
                 book.max_depth()
             ),
+        )]))
+    }
+
+    #[tool(
+        name = "book_delete",
+        description = "Delete a book with all its nodes, history and snapshots. Cannot be undone: the book's snapshots are deleted too, so there is nothing to restore from. The slug must be given explicitly. A book that still has nodes or snapshots is refused unless `force: true`; `dry_run: true` reports what would be removed and changes nothing. Clears this session's selection if it pointed at the deleted book.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn book_delete(
+        &self,
+        Parameters(req): Parameters<McpBookDeleteRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_slug(&req.slug)?;
+        let msg = self.delete_book(&req.slug, req.force, req.dry_run).await?;
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            msg,
         )]))
     }
 

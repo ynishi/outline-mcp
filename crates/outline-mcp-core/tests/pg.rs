@@ -348,3 +348,74 @@ async fn snapshots_restore_and_import_against_postgres() {
     assert!(store.delete_book(&shelf_slug).await.unwrap());
     assert!(SnapshotStore::list(&store, &slug).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn delete_cascades_to_nodes_events_and_snapshots_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!("OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres delete test did NOT run");
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = sqlx::PgPool::connect(&url).await.expect("count connect");
+    let gone = format!("_test-del-gone-{}", std::process::id());
+    let kept = format!("_test-del-kept-{}", std::process::id());
+
+    for slug in [&gone, &kept] {
+        let svc = BookService::new(store.clone(), slug.clone());
+        svc.create_book("Del", 4).await.expect("create_book");
+        let (a, _) = svc.add_node(add_req(None, "a")).await.expect("add a");
+        svc.add_node(add_req(Some(a), "b")).await.expect("add b");
+        let book = svc.read_tree().await.expect("read");
+        SnapshotStore::create(&store, slug, &book, Some("s"))
+            .await
+            .expect("snapshot");
+    }
+
+    let rows = |table: &'static str, slug: String| {
+        let pool = pool.clone();
+        async move {
+            let sql = match table {
+                "nodes" => "SELECT count(*) FROM nodes WHERE book = $1",
+                "events" => "SELECT count(*) FROM events WHERE book = $1",
+                "snapshots" => "SELECT count(*) FROM snapshots WHERE book = $1",
+                other => panic!("unexpected table {other}"),
+            };
+            let n: i64 = sqlx::query_scalar(sql)
+                .bind(slug)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+            n
+        }
+    };
+    assert_eq!(rows("nodes", gone.clone()).await, 2);
+    assert_eq!(rows("events", gone.clone()).await, 2);
+    assert_eq!(rows("snapshots", gone.clone()).await, 1);
+
+    // The port's delete: one statement, everything of that book goes.
+    assert!(BookStore::delete(&store, &gone).await.expect("delete"));
+    assert!(BookStore::load(&store, &gone).await.unwrap().is_none());
+    for table in ["nodes", "events", "snapshots"] {
+        assert_eq!(rows(table, gone.clone()).await, 0, "{table} rows left");
+    }
+    assert_eq!(SnapshotStore::delete_all(&store, &gone).await.unwrap(), 0);
+    assert!(
+        !BookStore::delete(&store, &gone).await.unwrap(),
+        "already gone"
+    );
+
+    // The other book is untouched.
+    assert_eq!(rows("nodes", kept.clone()).await, 2);
+    assert_eq!(rows("events", kept.clone()).await, 2);
+    assert_eq!(rows("snapshots", kept.clone()).await, 1);
+    assert_eq!(SnapshotStore::delete_all(&store, &kept).await.unwrap(), 1);
+    assert_eq!(rows("snapshots", kept.clone()).await, 0);
+    assert_eq!(
+        rows("nodes", kept.clone()).await,
+        2,
+        "delete_all leaves the book"
+    );
+
+    assert!(BookStore::delete(&store, &kept).await.unwrap());
+}

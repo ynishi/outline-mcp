@@ -252,6 +252,24 @@ pub(crate) struct McpInitRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpBookDeleteRequest {
+    #[schemars(
+        description = "Slug of the book to delete (from `shelf`). Required: the selected book is never deleted implicitly."
+    )]
+    pub slug: String,
+    #[schemars(
+        description = "Delete even if the book still has nodes or snapshots (default: false — such a book is refused with what would be removed)"
+    )]
+    #[serde(default)]
+    pub force: bool,
+    #[schemars(
+        description = "Only report what would be removed (nodes, history entries, snapshots); change nothing (default: false)"
+    )]
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct McpShelfRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

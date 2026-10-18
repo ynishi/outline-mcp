@@ -108,6 +108,10 @@ impl BookStore for MemoryBookStore {
             })
             .collect())
     }
+
+    async fn delete(&self, slug: &str) -> Result<bool, StoreError> {
+        Ok(self.books.lock().await.remove(slug).is_some())
+    }
 }
 
 struct StoredSnapshot {
@@ -236,6 +240,13 @@ impl SnapshotStore for MemorySnapshotStore {
                 None => false,
             },
         )
+    }
+
+    async fn delete_all(&self, slug: &str) -> Result<u64, StoreError> {
+        let mut snapshots = self.snapshots.lock().await;
+        let before = snapshots.len();
+        snapshots.retain(|(s, _), _| s != slug);
+        Ok((before - snapshots.len()) as u64)
     }
 }
 
@@ -375,5 +386,54 @@ mod tests {
             .map(|s| s.slug)
             .collect();
         assert_eq!(slugs, vec!["a", "z"]);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_book_and_its_history_only() {
+        let store = MemoryBookStore::new();
+        store
+            .commit(
+                "gone",
+                None,
+                &TemplateBook::new("G", 4),
+                &[entry(NodeId::new())],
+            )
+            .await
+            .unwrap();
+        store
+            .commit(
+                "kept",
+                None,
+                &TemplateBook::new("K", 4),
+                &[entry(NodeId::new())],
+            )
+            .await
+            .unwrap();
+
+        assert!(store.delete("gone").await.unwrap());
+        assert!(store.load("gone").await.unwrap().is_none());
+        assert!(store.history("gone").await.unwrap().is_empty());
+        assert!(store.load("kept").await.unwrap().is_some());
+        assert_eq!(store.history("kept").await.unwrap().len(), 1);
+
+        assert!(
+            !store.delete("gone").await.unwrap(),
+            "second delete finds nothing"
+        );
+        assert!(!store.delete("never").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn snapshot_delete_all_removes_one_books_snapshots() {
+        let store = MemorySnapshotStore::new();
+        let book = TemplateBook::new("b", 4);
+        store.create("gone", &book, None).await.unwrap();
+        store.create("gone", &book, Some("x")).await.unwrap();
+        store.create("kept", &book, None).await.unwrap();
+
+        assert_eq!(store.delete_all("gone").await.unwrap(), 2);
+        assert!(store.list("gone").await.unwrap().is_empty());
+        assert_eq!(store.list("kept").await.unwrap().len(), 1);
+        assert_eq!(store.delete_all("gone").await.unwrap(), 0);
     }
 }

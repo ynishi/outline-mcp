@@ -490,6 +490,12 @@ impl BookStore for PgBookStore {
             })
             .collect()
     }
+
+    /// One statement: nodes, events and snapshots go with the book row
+    /// through `ON DELETE CASCADE`, so the deletion is atomic.
+    async fn delete(&self, slug: &str) -> Result<bool, StoreError> {
+        self.delete_book(slug).await
+    }
 }
 
 #[async_trait]
@@ -621,6 +627,15 @@ impl SnapshotStore for PgBookStore {
                 .map_err(StoreError::backend)?
                 .rows_affected();
         Ok(updated > 0)
+    }
+
+    async fn delete_all(&self, slug: &str) -> Result<u64, StoreError> {
+        Ok(sqlx::query("DELETE FROM snapshots WHERE book = $1")
+            .bind(slug)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::backend)?
+            .rows_affected())
     }
 }
 
