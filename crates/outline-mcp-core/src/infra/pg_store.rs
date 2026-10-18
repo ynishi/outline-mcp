@@ -25,15 +25,34 @@
 //! `jsonb`, so key order and whitespace may differ from the strings written;
 //! the JSON value is the same.
 //!
+//! Node rows and events are written with one `UNNEST` statement each, so a
+//! write costs a fixed number of round trips however many rows it touches
+//! (an import of a thousand-node book included).
+//!
+//! # Snapshots
+//!
+//! The same type implements [`SnapshotStore`] over the `snapshots` table
+//! (`migrations/0002_snapshots.sql`): one row per snapshot holding the whole
+//! book as `jsonb`, keyed by `(book, taken_at)`.
+//!
+//! # Connecting
+//!
+//! [`PgBookStore::connect_with`] fails fast and says which of the usual
+//! causes it was ([`ConnectError`]); [`PgBookStore::pending_migrations`] tells
+//! a server that the schema has not been migrated yet. Neither message
+//! repeats the connection URL, which carries the password.
+//!
 //! All SQL is runtime-checked (`sqlx::query`), so building this crate needs
 //! no database.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
+use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -43,12 +62,62 @@ use crate::domain::model::changelog::ChangeEntry;
 use crate::domain::model::id::{BookId, NodeId};
 use crate::domain::model::node::{NodeParts, TemplateNode};
 use crate::domain::model::timestamp::Timestamp;
-use crate::domain::store::{BookStore, BookSummary, Committed, StoreError, Versioned};
+use crate::domain::store::{
+    BookStore, BookSummary, Committed, SnapshotInfo, SnapshotStore, StoreError, Versioned,
+};
+
+/// The bundled schema migrations (`crates/outline-mcp-core/migrations`).
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+/// How long [`PgBookStore::connect_with`] waits for a first connection by
+/// default before reporting the database unreachable.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Books, nodes and events in Postgres. Cheap to clone (shares one pool).
 #[derive(Clone)]
 pub struct PgBookStore {
     pool: PgPool,
+}
+
+/// Why [`PgBookStore::connect_with`] could not connect.
+///
+/// The messages name the cause and what to check; none of them includes the
+/// connection URL.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    /// The URL could not be parsed as a Postgres connection URL.
+    #[error("the database URL is not a valid Postgres connection URL: {0}")]
+    InvalidUrl(String),
+    /// No connection could be opened in time (host down, wrong host or port,
+    /// network, TLS).
+    #[error("could not reach the database server (check host, port and network): {0}")]
+    Unreachable(String),
+    /// The server rejected the user name or password.
+    #[error("the database server rejected the login (check user name and password): {0}")]
+    Authentication(String),
+    /// The server is up but the named database does not exist.
+    #[error("the database does not exist on the server (create it, or fix the database name in the URL): {0}")]
+    DatabaseMissing(String),
+    /// Anything else the driver reported.
+    #[error("could not connect to the database: {0}")]
+    Other(String),
+}
+
+impl ConnectError {
+    fn classify(e: sqlx::Error) -> Self {
+        match &e {
+            sqlx::Error::Configuration(inner) => Self::InvalidUrl(inner.to_string()),
+            sqlx::Error::Database(db) => match db.code().as_deref() {
+                Some("28P01") | Some("28000") => Self::Authentication(db.message().to_string()),
+                Some("3D000") => Self::DatabaseMissing(db.message().to_string()),
+                _ => Self::Other(db.message().to_string()),
+            },
+            sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::PoolTimedOut => {
+                Self::Unreachable(e.to_string())
+            }
+            _ => Self::Other(e.to_string()),
+        }
+    }
 }
 
 /// One `nodes` row, as written and as compared when diffing.
@@ -67,13 +136,21 @@ struct NodeRow {
 }
 
 impl PgBookStore {
-    /// Connect to the database at `database_url`. Does not run migrations.
-    pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
+    /// Connect to the database at `database_url`, waiting at most
+    /// [`DEFAULT_CONNECT_TIMEOUT`]. Does not run migrations.
+    pub async fn connect(database_url: &str) -> Result<Self, ConnectError> {
+        Self::connect_with(database_url, DEFAULT_CONNECT_TIMEOUT).await
+    }
+
+    /// Connect to the database at `database_url`, waiting at most `timeout`
+    /// for the first connection. Does not run migrations.
+    pub async fn connect_with(database_url: &str, timeout: Duration) -> Result<Self, ConnectError> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
+            .acquire_timeout(timeout)
             .connect(database_url)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(ConnectError::classify)?;
         Ok(Self { pool })
     }
 
@@ -84,10 +161,41 @@ impl PgBookStore {
 
     /// Apply the bundled migrations (`crates/outline-mcp-core/migrations`).
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        sqlx::migrate!("./migrations")
-            .run(&self.pool)
+        MIGRATOR.run(&self.pool).await.map_err(StoreError::backend)
+    }
+
+    /// Versions of the bundled migrations not yet applied to this database,
+    /// oldest first. Empty means the schema is current.
+    pub async fn pending_migrations(&self) -> Result<Vec<i64>, StoreError> {
+        let applied: Vec<i64> =
+            match sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success")
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(v) => v,
+                // 42P01 = undefined_table: nothing has ever been migrated here.
+                Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => {
+                    Vec::new()
+                }
+                Err(e) => return Err(StoreError::backend(e)),
+            };
+        Ok(MIGRATOR
+            .iter()
+            .map(|m| m.version)
+            .filter(|v| !applied.contains(v))
+            .collect())
+    }
+
+    /// Delete a book with its nodes, events and snapshots. Returns whether it
+    /// existed. Used by `import-shelf --replace`.
+    pub async fn delete_book(&self, slug: &str) -> Result<bool, StoreError> {
+        let deleted = sqlx::query("DELETE FROM books WHERE slug = $1")
+            .bind(slug)
+            .execute(&self.pool)
             .await
-            .map_err(StoreError::backend)
+            .map_err(StoreError::backend)?
+            .rows_affected();
+        Ok(deleted > 0)
     }
 
     async fn node_rows(
@@ -223,45 +331,63 @@ impl BookStore for PgBookStore {
                 .await
                 .map_err(StoreError::backend)?;
         }
-        for row in new_rows.values() {
-            if old_rows.get(&row.id) == Some(row) {
-                continue;
-            }
+        let changed: Vec<&NodeRow> = new_rows
+            .values()
+            .filter(|row| old_rows.get(&row.id) != Some(*row))
+            .collect();
+        if !changed.is_empty() {
             sqlx::query(
                 "INSERT INTO nodes (book, id, parent, position, title, body, node_type, placeholder, properties, status, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                 SELECT $1, * FROM UNNEST($2::uuid[], $3::uuid[], $4::int4[], $5::text[], $6::text[], \
+                                          $7::text[], $8::text[], $9::jsonb[], $10::text[], $11::int8[]) \
                  ON CONFLICT (book, id) DO UPDATE SET parent = EXCLUDED.parent, position = EXCLUDED.position, \
                  title = EXCLUDED.title, body = EXCLUDED.body, node_type = EXCLUDED.node_type, \
                  placeholder = EXCLUDED.placeholder, properties = EXCLUDED.properties, \
                  status = EXCLUDED.status, updated_at = EXCLUDED.updated_at",
             )
             .bind(slug)
-            .bind(row.id)
-            .bind(row.parent)
-            .bind(row.position)
-            .bind(&row.title)
-            .bind(&row.body)
-            .bind(&row.node_type)
-            .bind(&row.placeholder)
-            .bind(&row.properties)
-            .bind(&row.status)
-            .bind(row.updated_at)
+            .bind(changed.iter().map(|r| r.id).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.parent).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.position).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.title.clone()).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.body.clone()).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.node_type.clone()).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.placeholder.clone()).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.properties.clone()).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.status.clone()).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.updated_at).collect::<Vec<_>>())
             .execute(&mut *tx)
             .await
             .map_err(StoreError::backend)?;
         }
 
-        for entry in events {
+        if !events.is_empty() {
+            let mut node_ids = Vec::with_capacity(events.len());
+            let mut actions = Vec::with_capacity(events.len());
+            let mut befores = Vec::with_capacity(events.len());
+            let mut afters = Vec::with_capacity(events.len());
+            let mut ats = Vec::with_capacity(events.len());
+            for entry in events {
+                node_ids.push(entry.node_id.as_uuid());
+                actions.push(enum_str(&entry.action)?);
+                befores.push(json_column(&entry.before)?);
+                afters.push(json_column(&entry.after)?);
+                ats.push(entry.timestamp.as_millis());
+            }
+            // ORDER BY ord keeps `id` (the history order) in the order given.
             sqlx::query(
                 "INSERT INTO events (book, node_id, action, before, after, at) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                 SELECT $1, u.node_id, u.action, u.before, u.after, u.at \
+                 FROM UNNEST($2::uuid[], $3::text[], $4::jsonb[], $5::jsonb[], $6::int8[]) \
+                      WITH ORDINALITY AS u(node_id, action, before, after, at, ord) \
+                 ORDER BY u.ord",
             )
             .bind(slug)
-            .bind(entry.node_id.as_uuid())
-            .bind(enum_str(&entry.action)?)
-            .bind(json_column(&entry.before)?)
-            .bind(json_column(&entry.after)?)
-            .bind(entry.timestamp.as_millis())
+            .bind(node_ids)
+            .bind(actions)
+            .bind(befores)
+            .bind(afters)
+            .bind(ats)
             .execute(&mut *tx)
             .await
             .map_err(StoreError::backend)?;
@@ -316,6 +442,142 @@ impl BookStore for PgBookStore {
             })
             .collect()
     }
+}
+
+#[async_trait]
+impl SnapshotStore for PgBookStore {
+    async fn create(
+        &self,
+        slug: &str,
+        book: &TemplateBook,
+        label: Option<&str>,
+    ) -> Result<SnapshotInfo, StoreError> {
+        let tree = serde_json::to_value(book).map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        // Lock the book row so two snapshots of one book cannot pick the same
+        // millisecond.
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT version FROM books WHERE slug = $1 FOR UPDATE")
+                .bind(slug)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(StoreError::backend)?;
+        if exists.is_none() {
+            return Err(StoreError::backend(format!("book '{slug}' does not exist")));
+        }
+        let latest: Option<i64> =
+            sqlx::query_scalar("SELECT max(taken_at) FROM snapshots WHERE book = $1")
+                .bind(slug)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(StoreError::backend)?;
+        let now = Timestamp::now().as_millis();
+        let taken_at = latest.map_or(now, |l| now.max(l + 1));
+        let size: i32 = sqlx::query_scalar(
+            "INSERT INTO snapshots (book, taken_at, label, tree) VALUES ($1, $2, $3, $4) \
+             RETURNING octet_length(tree::text)",
+        )
+        .bind(slug)
+        .bind(taken_at)
+        .bind(label)
+        .bind(&tree)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StoreError::backend)?;
+        tx.commit().await.map_err(StoreError::backend)?;
+        Ok(SnapshotInfo {
+            timestamp: Timestamp::from_millis(taken_at),
+            label: label.map(str::to_string),
+            size_bytes: size_u64(size),
+        })
+    }
+
+    async fn insert(
+        &self,
+        slug: &str,
+        timestamp: Timestamp,
+        book: &TemplateBook,
+        label: Option<&str>,
+    ) -> Result<SnapshotInfo, StoreError> {
+        let tree = serde_json::to_value(book).map_err(StoreError::backend)?;
+        let size: Option<i32> = sqlx::query_scalar(
+            "INSERT INTO snapshots (book, taken_at, label, tree) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (book, taken_at) DO NOTHING RETURNING octet_length(tree::text)",
+        )
+        .bind(slug)
+        .bind(timestamp.as_millis())
+        .bind(label)
+        .bind(&tree)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::backend)?;
+        let Some(size) = size else {
+            return Err(StoreError::Conflict {
+                expected: None,
+                actual: Some(timestamp.as_millis()),
+            });
+        };
+        Ok(SnapshotInfo {
+            timestamp,
+            label: label.map(str::to_string),
+            size_bytes: size_u64(size),
+        })
+    }
+
+    async fn list(&self, slug: &str) -> Result<Vec<SnapshotInfo>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT taken_at, label, octet_length(tree::text) AS size FROM snapshots \
+             WHERE book = $1 ORDER BY taken_at DESC",
+        )
+        .bind(slug)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::backend)?;
+        rows.iter()
+            .map(|r| {
+                let taken_at: i64 = r.try_get("taken_at").map_err(StoreError::backend)?;
+                let size: i32 = r.try_get("size").map_err(StoreError::backend)?;
+                Ok(SnapshotInfo {
+                    timestamp: Timestamp::from_millis(taken_at),
+                    label: r.try_get("label").map_err(StoreError::backend)?,
+                    size_bytes: size_u64(size),
+                })
+            })
+            .collect()
+    }
+
+    async fn get(
+        &self,
+        slug: &str,
+        timestamp: Timestamp,
+    ) -> Result<Option<TemplateBook>, StoreError> {
+        let tree: Option<Value> =
+            sqlx::query_scalar("SELECT tree FROM snapshots WHERE book = $1 AND taken_at = $2")
+                .bind(slug)
+                .bind(timestamp.as_millis())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::backend)?;
+        tree.map(|t| serde_json::from_value(t).map_err(StoreError::backend))
+            .transpose()
+    }
+
+    async fn tag(&self, slug: &str, timestamp: Timestamp, label: &str) -> Result<bool, StoreError> {
+        let updated =
+            sqlx::query("UPDATE snapshots SET label = $3 WHERE book = $1 AND taken_at = $2")
+                .bind(slug)
+                .bind(timestamp.as_millis())
+                .bind(label)
+                .execute(&self.pool)
+                .await
+                .map_err(StoreError::backend)?
+                .rows_affected();
+        Ok(updated > 0)
+    }
+}
+
+fn size_u64(size: i32) -> u64 {
+    u64::try_from(size).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

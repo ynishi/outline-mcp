@@ -1,13 +1,10 @@
 //! `migrate` CLI subcommand: apply the Postgres schema migrations.
 //!
 //! `main.rs` dispatches to [`run`] on the `migrate` token, so this module owns
-//! argv parsing for everything after it. The server itself does not use
-//! Postgres yet; this only prepares a database for the upcoming store.
+//! argv parsing for everything after it. `serve` / `stdio` refuse to start on
+//! a database this has not brought up to date.
 
-use outline_mcp_core::infra::pg_store::PgBookStore;
-
-/// Environment variable naming the Postgres database.
-pub const DATABASE_URL_ENV: &str = "OUTLINE_MCP_DATABASE_URL";
+use crate::db;
 
 const HELP_TEXT: &str = "\
 outline-mcp migrate [--database-url <url>]
@@ -41,18 +38,10 @@ pub async fn run(argv: impl Iterator<Item = String>) -> anyhow::Result<i32> {
             return Ok(1);
         }
     };
-    let url = match resolve_url(flag, std::env::var(DATABASE_URL_ENV).ok()) {
-        Ok(url) => url,
-        Err(message) => {
-            eprintln!("error: {message}");
-            return Ok(1);
-        }
-    };
-
-    let store = match PgBookStore::connect(&url).await {
+    let store = match db::connect(flag).await {
         Ok(store) => store,
         Err(e) => {
-            eprintln!("error: could not connect to the database: {e}");
+            eprintln!("error: {e}");
             return Ok(1);
         }
     };
@@ -80,49 +69,9 @@ fn parse_args(argv: &[String]) -> Result<Option<String>, String> {
     Ok(url)
 }
 
-/// The flag wins over the environment; an empty value counts as unset.
-fn resolve_url(flag: Option<String>, env: Option<String>) -> Result<String, String> {
-    flag.into_iter()
-        .chain(env)
-        .find(|u| !u.trim().is_empty())
-        .ok_or_else(|| {
-            format!(
-                "no database configured: set {DATABASE_URL_ENV} or pass --database-url <url> \
-                 (a Postgres connection URL, e.g. postgres://user:pass@host:5432/db)"
-            )
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn missing_url_names_the_env_var() {
-        let err = resolve_url(None, None).unwrap_err();
-        assert!(err.contains(DATABASE_URL_ENV));
-        assert!(err.contains("--database-url"));
-    }
-
-    #[test]
-    fn empty_env_counts_as_unset() {
-        assert!(resolve_url(None, Some("  ".into())).is_err());
-    }
-
-    #[test]
-    fn flag_wins_over_env() {
-        let url = resolve_url(
-            Some("postgres://flag".into()),
-            Some("postgres://env".into()),
-        );
-        assert_eq!(url.unwrap(), "postgres://flag");
-    }
-
-    #[test]
-    fn env_is_used_without_flag() {
-        let url = resolve_url(None, Some("postgres://env".into()));
-        assert_eq!(url.unwrap(), "postgres://env");
-    }
 
     #[test]
     fn parse_args_rejects_unknown_and_missing_value() {

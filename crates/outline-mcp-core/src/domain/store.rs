@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use super::model::book::TemplateBook;
 use super::model::changelog::ChangeEntry;
 use super::model::id::NodeId;
+use super::model::timestamp::Timestamp;
 
 /// A stored value together with the version it was read at.
 ///
@@ -100,4 +103,132 @@ pub trait BookStore: Send + Sync {
 
     /// Every stored book, ordered by slug.
     async fn list_books(&self) -> Result<Vec<BookSummary>, StoreError>;
+}
+
+#[async_trait]
+impl<T: BookStore + ?Sized> BookStore for Arc<T> {
+    async fn load(&self, slug: &str) -> Result<Option<Versioned<TemplateBook>>, StoreError> {
+        (**self).load(slug).await
+    }
+
+    async fn commit(
+        &self,
+        slug: &str,
+        expected_version: Option<i64>,
+        book: &TemplateBook,
+        events: &[ChangeEntry],
+    ) -> Result<Committed, StoreError> {
+        (**self).commit(slug, expected_version, book, events).await
+    }
+
+    async fn history(&self, slug: &str) -> Result<Vec<ChangeEntry>, StoreError> {
+        (**self).history(slug).await
+    }
+
+    async fn history_by_node(
+        &self,
+        slug: &str,
+        node_id: NodeId,
+    ) -> Result<Vec<ChangeEntry>, StoreError> {
+        (**self).history_by_node(slug, node_id).await
+    }
+
+    async fn list_books(&self) -> Result<Vec<BookSummary>, StoreError> {
+        (**self).list_books().await
+    }
+}
+
+/// One stored snapshot, as listed (the book itself is read with
+/// [`SnapshotStore::get`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    /// When the snapshot was taken. Unique per book: it is the key
+    /// `snapshot_restore` / `snapshot_tag` / `snapshot_dump` take.
+    pub timestamp: Timestamp,
+    /// The label attached at creation or by [`SnapshotStore::tag`].
+    pub label: Option<String>,
+    /// Size of the stored book JSON, in bytes.
+    pub size_bytes: u64,
+}
+
+/// Whole-book snapshots, keyed by `(slug, timestamp)`.
+///
+/// A snapshot is a copy of the book at one moment. Restoring one is not this
+/// port's business: the caller reads it with [`SnapshotStore::get`] and
+/// commits it through [`BookStore`], so the restore lands in the history like
+/// any other write.
+#[async_trait]
+pub trait SnapshotStore: Send + Sync {
+    /// Store a snapshot of `book` taken now. When a snapshot of this book
+    /// already has the current millisecond, the new one takes the next free
+    /// one, so timestamps stay unique.
+    async fn create(
+        &self,
+        slug: &str,
+        book: &TemplateBook,
+        label: Option<&str>,
+    ) -> Result<SnapshotInfo, StoreError>;
+
+    /// Store a snapshot taken at `timestamp` (an import keeps the original
+    /// moment). Fails with [`StoreError::Conflict`] if that timestamp is taken.
+    async fn insert(
+        &self,
+        slug: &str,
+        timestamp: Timestamp,
+        book: &TemplateBook,
+        label: Option<&str>,
+    ) -> Result<SnapshotInfo, StoreError>;
+
+    /// The book's snapshots, newest first.
+    async fn list(&self, slug: &str) -> Result<Vec<SnapshotInfo>, StoreError>;
+
+    /// The book stored in one snapshot, or `None` if there is none at
+    /// `timestamp`.
+    async fn get(
+        &self,
+        slug: &str,
+        timestamp: Timestamp,
+    ) -> Result<Option<TemplateBook>, StoreError>;
+
+    /// Set (or replace) a snapshot's label. Returns `false` if there is no
+    /// snapshot at `timestamp`.
+    async fn tag(&self, slug: &str, timestamp: Timestamp, label: &str) -> Result<bool, StoreError>;
+}
+
+#[async_trait]
+impl<T: SnapshotStore + ?Sized> SnapshotStore for Arc<T> {
+    async fn create(
+        &self,
+        slug: &str,
+        book: &TemplateBook,
+        label: Option<&str>,
+    ) -> Result<SnapshotInfo, StoreError> {
+        (**self).create(slug, book, label).await
+    }
+
+    async fn insert(
+        &self,
+        slug: &str,
+        timestamp: Timestamp,
+        book: &TemplateBook,
+        label: Option<&str>,
+    ) -> Result<SnapshotInfo, StoreError> {
+        (**self).insert(slug, timestamp, book, label).await
+    }
+
+    async fn list(&self, slug: &str) -> Result<Vec<SnapshotInfo>, StoreError> {
+        (**self).list(slug).await
+    }
+
+    async fn get(
+        &self,
+        slug: &str,
+        timestamp: Timestamp,
+    ) -> Result<Option<TemplateBook>, StoreError> {
+        (**self).get(slug, timestamp).await
+    }
+
+    async fn tag(&self, slug: &str, timestamp: Timestamp, label: &str) -> Result<bool, StoreError> {
+        (**self).tag(slug, timestamp, label).await
+    }
 }

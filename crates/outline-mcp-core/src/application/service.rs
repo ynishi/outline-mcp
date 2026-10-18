@@ -238,6 +238,23 @@ impl<S: BookStore> BookService<S> {
         Ok(())
     }
 
+    /// Replace the book with `book` (a snapshot being restored), recording a
+    /// `Restore` event for every node of `book` in the same commit.
+    ///
+    /// The book must exist: a restore goes over the version just read, so a
+    /// concurrent write between the read and this commit is a conflict rather
+    /// than being silently overwritten.
+    pub async fn restore_book(&self, book: &TemplateBook) -> Result<(), AppError> {
+        let version = self.load_book().await?.version;
+        let at = Timestamp::now();
+        let events: Vec<ChangeEntry> = book
+            .all_node_ids()
+            .map(|id| ChangeEntry::new(id, ChangeAction::Restore, None, None, at))
+            .collect();
+        self.commit(Some(version), book, &events).await?;
+        Ok(())
+    }
+
     /// The book's recorded events, oldest first.
     pub async fn history(&self) -> Result<Vec<ChangeEntry>, AppError> {
         self.store.history(&self.slug).await.map_err(store_error)

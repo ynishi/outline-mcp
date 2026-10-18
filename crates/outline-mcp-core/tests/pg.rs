@@ -5,11 +5,13 @@
 
 use outline_mcp_core::application::error::AppError;
 use outline_mcp_core::application::service::BookService;
-use outline_mcp_core::domain::model::book::{AddNodeRequest, UpdateNodeRequest};
-use outline_mcp_core::domain::model::changelog::ChangeAction;
+use outline_mcp_core::domain::model::book::{AddNodeRequest, TemplateBook, UpdateNodeRequest};
+use outline_mcp_core::domain::model::changelog::{ChangeAction, ChangeEntry};
 use outline_mcp_core::domain::model::node::NodeType;
-use outline_mcp_core::domain::store::{BookStore, StoreError};
+use outline_mcp_core::domain::model::timestamp::Timestamp;
+use outline_mcp_core::domain::store::{BookStore, SnapshotStore, StoreError};
 use outline_mcp_core::infra::pg_store::PgBookStore;
+use outline_mcp_core::infra::shelf_import::{import_book, read_shelf_book};
 
 fn add_req(
     parent: Option<outline_mcp_core::domain::model::id::NodeId>,
@@ -148,4 +150,121 @@ async fn round_trip_against_postgres() {
         .execute(&pool)
         .await
         .expect("cleanup");
+}
+
+#[tokio::test]
+async fn snapshots_restore_and_import_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!(
+            "OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres snapshot/import test did NOT run"
+        );
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    assert!(store.pending_migrations().await.unwrap().is_empty());
+
+    let slug = format!("_test-snap-{}", std::process::id());
+    let svc = BookService::new(store.clone(), slug.clone());
+    svc.create_book("Snap Test", 4).await.expect("create_book");
+    let (a, _) = svc.add_node(add_req(None, "a")).await.expect("add a");
+
+    // snapshot, change, snapshot again: distinct, ordered, labelled
+    let s1 = store
+        .create(&slug, &svc.read_tree().await.unwrap(), Some("v1"))
+        .await
+        .expect("snapshot 1");
+    svc.update_node(a, title_req("changed")).await.unwrap();
+    let s2 = store
+        .create(&slug, &svc.read_tree().await.unwrap(), None)
+        .await
+        .expect("snapshot 2");
+    assert!(s2.timestamp > s1.timestamp);
+    assert!(s1.size_bytes > 0);
+    let listed = SnapshotStore::list(&store, &slug).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].timestamp, s2.timestamp, "newest first");
+    assert_eq!(listed[1].label.as_deref(), Some("v1"));
+    assert!(store.tag(&slug, s2.timestamp, "v2").await.unwrap());
+    assert!(!store
+        .tag(&slug, Timestamp::from_millis(1), "nope")
+        .await
+        .unwrap());
+    assert!(store
+        .insert(&slug, s1.timestamp, &TemplateBook::new("x", 4), None)
+        .await
+        .is_err());
+
+    // restore = one commit of the old tree plus a Restore event per node
+    let old = store.get(&slug, s1.timestamp).await.unwrap().expect("s1");
+    let events_before = svc.history().await.unwrap().len();
+    svc.restore_book(&old).await.expect("restore");
+    let tree = svc.read_tree().await.unwrap();
+    assert_eq!(tree.get_node(a).unwrap().title(), "a");
+    let history = svc.history().await.unwrap();
+    assert_eq!(history.len(), events_before + 1);
+    assert_eq!(history.last().unwrap().action, ChangeAction::Restore);
+
+    // import of a shelf keeps history and snapshot timestamps, and verifies
+    let dir = tempfile::tempdir().unwrap();
+    let shelf_slug = format!("{slug}-shelf");
+    std::fs::write(
+        dir.path().join(format!("{shelf_slug}.json")),
+        serde_json::to_string(&tree).unwrap(),
+    )
+    .unwrap();
+    let legacy = vec![ChangeEntry::new(
+        a,
+        ChangeAction::Create,
+        None,
+        None,
+        Timestamp::from_millis(123),
+    )];
+    std::fs::write(
+        dir.path().join(format!("{shelf_slug}.changelog.json")),
+        serde_json::to_string(&legacy).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(format!("{shelf_slug}.snap.4567.json")),
+        serde_json::to_string(&old).unwrap(),
+    )
+    .unwrap();
+    let source = read_shelf_book(dir.path(), &shelf_slug).await.unwrap();
+    let report = import_book(&store, &store, source, false, |s| {
+        let store = store.clone();
+        async move { store.delete_book(&s).await }
+    })
+    .await
+    .expect("import");
+    assert!(report.matches(), "{report:?}");
+    assert_eq!(
+        BookService::new(store.clone(), shelf_slug.clone())
+            .history()
+            .await
+            .unwrap()[0]
+            .timestamp,
+        Timestamp::from_millis(123)
+    );
+
+    // a second import refuses; --replace overwrites and still matches
+    let again = read_shelf_book(dir.path(), &shelf_slug).await.unwrap();
+    assert!(
+        import_book(&store, &store, again, false, |_| async { Ok(true) })
+            .await
+            .is_err()
+    );
+    let again = read_shelf_book(dir.path(), &shelf_slug).await.unwrap();
+    let report = import_book(&store, &store, again, true, |s| {
+        let store = store.clone();
+        async move { store.delete_book(&s).await }
+    })
+    .await
+    .expect("replace");
+    assert!(report.matches(), "{report:?}");
+
+    // cleanup (nodes, events and snapshots cascade)
+    assert!(store.delete_book(&slug).await.unwrap());
+    assert!(store.delete_book(&shelf_slug).await.unwrap());
+    assert!(SnapshotStore::list(&store, &slug).await.unwrap().is_empty());
 }

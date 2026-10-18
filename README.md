@@ -6,52 +6,38 @@ LLM sessions are ephemeral. **outline-mcp** gives them a persistent, editable kn
 
 ## Quick Start
 
+Books live in a Postgres database you run yourself. outline-mcp is a personal project published as-is: there is no hosted instance and no bundled database.
+
 ```bash
-cargo install --path .
+cargo install --path crates/outline-mcp
+
+export OUTLINE_MCP_DATABASE_URL=postgres://user:pass@host:5432/outline
+outline-mcp migrate          # create / update the schema; run once per upgrade
+outline-mcp                  # stdio
 ```
 
-### Claude Code (`~/.claude.json`)
+The server refuses to start when no database is configured, when the database cannot be reached (the message says whether the host is unreachable, the login was rejected, or the database does not exist), or when `migrate` has not been run against it. `--database-url <url>` overrides the environment variable on every subcommand.
 
-#### Native binary (after `cargo install`)
+### Claude Code (`~/.claude.json`)
 
 ```json
 {
   "mcpServers": {
     "outline": {
       "command": "outline-mcp",
-      "args": ["/path/to/your-book.json"]
+      "env": { "OUTLINE_MCP_DATABASE_URL": "postgres://user:pass@host:5432/outline" }
     }
   }
 }
 ```
 
-#### Docker (no Rust toolchain required)
+### Shared server (many devices)
 
-```json
-{
-  "mcpServers": {
-    "outline": {
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-v", "/path/to/data:/data",
-        "ghcr.io/ynishi/outline-mcp:latest",
-        "/data/your-book.json"
-      ]
-    }
-  }
-}
-```
-
-If the path argument is omitted, defaults to `outline-book.json` in the current directory.
-
-### Multi-device (one shelf, many devices)
-
-`--mcp-http` serves the same tools over MCP's streamable HTTP transport, so several devices can share one shelf. A single process owns the directory — book JSON plus the per-slug `.events.db` — which keeps the single-writer storage model intact, so there is no sync or conflict resolution to configure.
+`--mcp-http` serves the same tools over MCP's streamable HTTP transport. Every write is one database transaction with a per-book version check, so several server processes or devices can share one database.
 
 ```bash
-outline-mcp /path/to/books --mcp-http                          # 127.0.0.1:8486
-outline-mcp /path/to/books --mcp-http --bind 127.0.0.1:9000
+outline-mcp --mcp-http                          # 127.0.0.1:8486
+outline-mcp --mcp-http --bind 127.0.0.1:9000
 ```
 
 Point clients at `/mcp` on that address:
@@ -70,12 +56,12 @@ Point clients at `/mcp` on that address:
 Binding beyond loopback requires a token. Startup is refused without one, before any listener is opened:
 
 ```bash
-OUTLINE_MCP_HTTP_TOKEN=<token> outline-mcp /path/to/books --mcp-http --bind 0.0.0.0:8486
+OUTLINE_MCP_HTTP_TOKEN=<token> outline-mcp --mcp-http --bind 0.0.0.0:8486
 ```
 
 Every request must then carry `Authorization: Bearer <token>` — set it wherever your MCP client configures request headers. TLS termination is a reverse-proxy concern. Logs go to stderr in both transports; stdout stays reserved for the stdio protocol channel.
 
-Service templates for running this as a daemon live in `contrib/systemd/` and `contrib/launchd/`. `docs/runbooks/` covers moving an existing shelf to a central host (`data-migration.md`) and verifying a deployment end to end (`multi-device-smoke.md`).
+Service templates for running this as a daemon live in `contrib/systemd/` and `contrib/launchd/`, and `docs/runbooks/` covers deployment. Both still describe the pre-Postgres shelf directory and are being updated; until then, pass the database through `OUTLINE_MCP_DATABASE_URL` instead of a shelf path.
 
 ## Workflow
 
@@ -146,15 +132,14 @@ crates/
 │       ├── domain/       # Core model (TemplateBook, TemplateNode, NodeId)
 │       │   ├── model/    # Aggregate root + value objects
 │       │   ├── error.rs  # Domain errors
-│       │   └── repository.rs # BookRepository trait
+│       │   └── store.rs  # BookStore / SnapshotStore ports
 │       ├── application/  # Use cases
-│       │   ├── service.rs # BookService (CRUD)
+│       │   ├── service.rs # BookService (one commit per write)
 │       │   └── eject.rs  # EjectService (Markdown/JSON export & import)
 │       └── infra/        # Persistence
-│           ├── json_store.rs # JSON file repository (atomic write)
-│           ├── changelog_store.rs
-│           ├── ai_store_changelog.rs
-│           └── snapshot.rs
+│           ├── pg_store.rs     # Postgres adapter (sqlx); migrations/ holds the schema
+│           ├── memory_store.rs # In-memory adapter (tests)
+│           └── shelf_import.rs # Reader for pre-Postgres shelves (import-shelf)
 ├── outline-mcp-rmcp/     # MCP layer (rmcp; stdio + streamable HTTP)
 │   └── src/
 │       ├── server.rs     # Transports (run / run_http) + server type
@@ -162,8 +147,10 @@ crates/
 │       └── resources.rs  # Resource handlers
 └── outline-mcp/          # Binary crate (CLI entry point)
     └── src/
-        ├── main.rs       # Flag parsing (--mcp-http / --bind), transport dispatch
-        └── cli.rs        # `migrate-snapshots` subcommand
+        ├── main.rs       # Flag parsing (--database-url / --mcp-http / --bind), transport dispatch
+        ├── db.rs         # Database URL resolution and connection errors
+        ├── migrate_db.rs # `migrate` subcommand
+        └── import_shelf.rs # `import-shelf` subcommand
 ```
 
 Downstream applications that want to embed the tree / snapshot / changelog logic without pulling `rmcp` can depend on `outline-mcp-core` directly:
@@ -208,45 +195,19 @@ Tree-structured format that can be re-imported:
 
 ## Upgrading
 
-### From 0.9.1 or earlier
+### From a shelf directory (0.14 or earlier)
 
-The snapshot subsystem now persists to a per-book SQLite event log (`{shelf_dir}/{slug}.events.db`) in addition to the existing on-disk `.snap.{millis}.json` files. Existing installs must run the migrator once to fold pre-existing on-disk snapshots into the event log — until they do, those snapshots stay on disk but are not visible to `snapshot_list` / `snapshot_restore`.
-
-**1. Back up the shelf directory.** The migrator is idempotent and does not delete files, but the shelf directory is the source of truth for your books; a copy is cheap insurance.
+Earlier versions kept each book as `{slug}.json` in a shelf directory, with history in `{slug}.changelog.json` / `{slug}.events.db` and snapshots in `{slug}.snap.*.json`. The server no longer reads that directory; import it once into the database:
 
 ```
-cp -a <shelf-dir> <shelf-dir>.bak
+outline-mcp migrate
+outline-mcp import-shelf --shelf <shelf-dir>            # every book
+outline-mcp import-shelf --shelf <shelf-dir> --slug rust  # one book
 ```
 
-**2. Run the migrator.**
+For each book the importer copies the tree, the change history and the snapshots with their original timestamps, then reads the book back from the database and prints one row per book comparing source and database: node count, a hash over every node's content and position, history entries and snapshots. It exits non-zero if any book fails or differs. History is read entry by entry rather than by replaying the event log, so a book whose event log no longer replays (the warning described in #2) still imports with its full history.
 
-```
-outline-mcp migrate-snapshots --shelf <shelf-dir>
-```
-
-The migrator scans every `{slug}.snap.{millis}.json` file under `<shelf-dir>`, imports each into `{shelf-dir}/{slug}.events.db` with its original timestamp preserved, and leaves the source `.json` file in place. Output looks like:
-
-```
-== rust ==
-  scanned:  3
-  imported: 3
-  skipped:  0
-  failed:   0
-```
-
-Pass `--slug <slug>` to migrate one book at a time.
-
-**3. Verify (optional).** Re-running the migrator is a no-op — every file will report as `skipped`.
-
-### What the migrator does not do
-
-- It does not delete the source `.snap.*.json` files. Keep them for a while as a second layer of backup.
-- It will refuse a stream that already carries events from a different clock (e.g. a book that has been actively edited via `snapshot_create` between the upgrade and the migrator run). Run the migrator before doing new writes.
-- The startup warning that steers you here is emitted via `tracing::warn!` on `stderr`. MCP clients that swallow server stderr (Claude Code included) will not surface it — treat the migrator command as the canonical way to check.
-
-### Known limitations
-
-- Snapshots that were **post-hoc labeled** via `snapshot_tag` (as opposed to labeled at `snapshot_create` time) lose the "time the label was attached" value in their sidecar `.meta.json`'s internal `created_at` field. The label text itself is preserved, and `created_at` is never exposed through the MCP surface — this is an internal-metadata drift, not user-visible.
+A slug that already exists in the database is refused; `--replace` overwrites it. The shelf directory is only read, never modified — keep it until you have checked the report.
 
 ## License
 
