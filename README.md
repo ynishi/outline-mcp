@@ -80,7 +80,7 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 5. **`checklist`** — Export a section (or the whole book) as a Markdown checklist with checkboxes
 6. **`node_update`** — Edit title, body, type, placeholder, properties, or status (`active`/`draft`) of a node
 7. **`node_move`** — Relocate or delete nodes (with descendants)
-8. **`node_batch_move`** — Move or delete multiple nodes in a single atomic call (requires UUID or UUID-prefix IDs)
+8. **`node_batch_move`** — Move multiple nodes in a single atomic call (to delete a node, use `node_move` with `action: "remove"`) (requires UUID or UUID-prefix IDs)
 9. **`node_batch_update`** — Update title/body/type/properties/status on multiple nodes atomically
 10. **`node_query`** — Search nodes by property values, status (`active`/`draft`), or type (`section`/`content`); optionally include body in results
 11. **`import`** — Import a book from a previously exported JSON file
