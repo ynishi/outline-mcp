@@ -326,7 +326,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "import",
-        description = "Import a book from a JSON file (previously exported with `checklist` format: json). Replaces the current book entirely.",
+        description = "Import a book from a JSON file (previously exported with `checklist` format: json). Replaces the current book entirely; the replacement is recorded in history (a delete per removed node, a create per imported node; imported nodes get new ids, and removed nodes' history is reachable via `node_history` with their full UUID).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -347,10 +347,13 @@ impl OutlineMcpServer {
 
         let book = EjectService::import_tree(&tree).map_err(Self::to_mcp_error)?;
         let node_count = book.node_count();
-        svc.save_book(&book).await.map_err(Self::to_mcp_error)?;
+        let recorded = svc.import_book(&book).await.map_err(Self::to_mcp_error)?;
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            format!("Imported '{}': {} nodes", tree.title, node_count),
+            format!(
+                "Imported '{}': {} nodes ({} history entries recorded)",
+                tree.title, node_count, recorded
+            ),
         )]))
     }
 
@@ -2086,5 +2089,74 @@ mod dump_helpers_tests {
         assert!(dir.exists());
         assert!(!dir.join("stale.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod import_tool_tests {
+    use std::sync::Arc;
+
+    use outline_mcp_core::domain::model::node::NodeType;
+    use outline_mcp_core::infra::memory_store::{MemoryBookStore, MemorySnapshotStore};
+
+    use super::*;
+    use crate::server::Storage;
+
+    fn add_req(title: &str) -> AddNodeRequest {
+        AddNodeRequest {
+            parent: None,
+            title: title.to_string(),
+            node_type: NodeType::Content,
+            body: None,
+            placeholder: None,
+            position: usize::MAX,
+            properties: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn import_tool_records_the_replacement_in_history() {
+        let server = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        let svc = server.service_for("imp").await.unwrap();
+        svc.create_book("Imp", 4).await.unwrap();
+        let (old, _) = svc.add_node(add_req("old")).await.unwrap();
+        *server.selected.write().unwrap() = Some("imp".into());
+
+        // An export of a different tree: its nodes get fresh ids on import.
+        let mut other = outline_mcp_core::domain::model::book::TemplateBook::new("Imp", 4);
+        other.add_node(add_req("new 1")).unwrap();
+        other.add_node(add_req("new 2")).unwrap();
+        let json = EjectService::render_json(&other, None).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "outline-mcp-import-test-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).unwrap();
+
+        let result = server
+            .import(Parameters(McpImportRequest {
+                file_path: path.to_string_lossy().into_owned(),
+            }))
+            .await
+            .expect("import");
+        let _ = std::fs::remove_file(&path);
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("3 history entries recorded"), "{text}");
+
+        let history = svc.history().await.unwrap();
+        let tail: Vec<_> = history[1..].iter().map(|e| e.action).collect();
+        assert_eq!(
+            tail.iter().filter(|a| **a == ChangeAction::Delete).count(),
+            1
+        );
+        assert_eq!(
+            tail.iter().filter(|a| **a == ChangeAction::Create).count(),
+            2
+        );
+        let old_history = svc.history_by_node(old).await.unwrap();
+        assert_eq!(old_history.last().unwrap().action, ChangeAction::Delete);
     }
 }
