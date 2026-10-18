@@ -69,6 +69,25 @@ impl TemplateBook {
         }
     }
 
+    /// Rebuild a book from stored parts (storage adapters only). The caller
+    /// owns consistency: every id in `root_nodes` and in each node's
+    /// `children` must be a key of `nodes`, as the adapter wrote it.
+    pub(crate) fn from_parts(
+        id: BookId,
+        title: String,
+        max_depth: u8,
+        nodes: HashMap<NodeId, TemplateNode>,
+        root_nodes: Vec<NodeId>,
+    ) -> Self {
+        Self {
+            id,
+            title,
+            max_depth,
+            nodes,
+            root_nodes,
+        }
+    }
+
     /// Return the book's unique ID.
     pub fn id(&self) -> BookId {
         self.id

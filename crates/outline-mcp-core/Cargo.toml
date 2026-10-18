@@ -16,12 +16,24 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+# ai-store is read only by `infra::shelf_import` (the `import-shelf` command),
+# to bring changelog history out of pre-Postgres `{slug}.events.db` files.
+# Remove both once no shelf is left to import.
 ai-store-core = "0.9"
 ai-store-sqlite = "0.9"
-ai-store-sync = "0.9"
 json-patch = "4"
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "sync", "fs"] }
 async-trait = "0.1"
+sqlx = { version = "0.9", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls",
+    "migrate",
+    "macros",
+    "json",
+    "uuid",
+] }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }

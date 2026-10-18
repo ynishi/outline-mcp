@@ -1,15 +1,13 @@
 // SMARTLINT: Status::InReview (1774100840)
 //! [`OutlineMcpServer`]: the `ServerHandler` implementation and its
-//! `shelf_dir` / `selected` state.
+//! [`Storage`] / `selected` state.
 //!
-//! MCP Protocol (stdio) <-> application::BookService / EjectService
+//! MCP Protocol (stdio / streamable HTTP) <-> application::BookService /
+//! EjectService, over the [`BookStore`] / [`SnapshotStore`] ports. The binary
+//! connects them to Postgres; tests use the in-memory adapters.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use ai_store_core::Store;
-use ai_store_sqlite::SqliteStore;
 use rmcp::{
     handler::server::{tool::ToolCallContext, tool::ToolRouter},
     model::{
@@ -21,16 +19,11 @@ use rmcp::{
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use tokio::sync::Mutex as AsyncMutex;
 
 use outline_mcp_core::application::error::AppError;
 use outline_mcp_core::application::service::BookService;
 use outline_mcp_core::domain::model::id::NodeId;
-use outline_mcp_core::infra::changelog_bridge::HistoryPreservingChangeLogRepository;
-use outline_mcp_core::infra::json_store::JsonBookRepository;
-use outline_mcp_core::infra::snapshot::SnapshotService;
-use outline_mcp_core::infra::snapshot_migrator::count_orphan_snapshots;
-use outline_mcp_core::infra::snapshot_sink::SnapshotOnlySink;
+use outline_mcp_core::domain::store::{BookStore, SnapshotStore};
 
 use crate::helpers::{build_hierarchical_ids, find_hierarchical_id, is_hierarchical_id};
 use crate::request::parse_node_id;
@@ -40,11 +33,27 @@ use crate::resources;
 // Public entry point
 // =============================================================================
 
-/// MCP Serverを起動する。shelf_dirは複数Book格納ディレクトリ。
-pub async fn run(shelf_dir: PathBuf) -> anyhow::Result<()> {
+/// Where the server keeps books and snapshots.
+///
+/// One value backs every tool call and every HTTP session; cloning shares the
+/// underlying stores.
+#[derive(Clone)]
+pub struct Storage {
+    pub(crate) books: Arc<dyn BookStore>,
+    pub(crate) snapshots: Arc<dyn SnapshotStore>,
+}
+
+impl Storage {
+    /// Serve `books` and `snapshots` (typically the same Postgres store).
+    pub fn new(books: Arc<dyn BookStore>, snapshots: Arc<dyn SnapshotStore>) -> Self {
+        Self { books, snapshots }
+    }
+}
+
+/// Serve MCP over stdio, on `storage`.
+pub async fn run(storage: Storage) -> anyhow::Result<()> {
     // Best-effort: a minimal stderr-only subscriber so `tracing::warn!`
-    // calls (e.g. `OutlineMcpServer::store_for`'s orphan-snapshot warning)
-    // are actually visible somewhere. stdout is reserved for the MCP stdio
+    // calls are actually visible somewhere. stdout is reserved for the MCP stdio
     // JSON-RPC transport below — writing anywhere else there would corrupt
     // the protocol stream, so this must never target stdout. `try_init`
     // (rather than `init`) tolerates a subscriber already having been
@@ -56,7 +65,7 @@ pub async fn run(shelf_dir: PathBuf) -> anyhow::Result<()> {
         .with_ansi(false)
         .try_init();
 
-    let server = OutlineMcpServer::new(shelf_dir);
+    let server = OutlineMcpServer::new(storage);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -64,11 +73,10 @@ pub async fn run(shelf_dir: PathBuf) -> anyhow::Result<()> {
 
 /// Serve over streamable HTTP transport (multi-device / SSOT-daemon mode).
 ///
-/// One central daemon owns the shelf directory (book JSON files + per-slug
-/// `.events.db` SQLite); remote devices connect as MCP clients to
-/// `http://<bind>/mcp`. Because every device talks to the same single
-/// process, the existing single-writer storage model is preserved and no
-/// cross-device sync/conflict handling is needed.
+/// Remote devices connect as MCP clients to `http://<bind>/mcp`. Every write
+/// is one database transaction with a version check, so concurrent clients
+/// cannot silently overwrite each other's change: the later one gets a
+/// conflict and retries.
 ///
 /// # Security model
 ///
@@ -79,7 +87,7 @@ pub async fn run(shelf_dir: PathBuf) -> anyhow::Result<()> {
 ///   `Authorization: Bearer <token>`. Host validation is disabled in this
 ///   case (the bearer token replaces it); TLS termination, if desired, is a
 ///   reverse-proxy concern.
-pub async fn run_http(shelf_dir: PathBuf, bind: &str) -> anyhow::Result<()> {
+pub async fn run_http(storage: Storage, bind: &str) -> anyhow::Result<()> {
     use std::sync::Arc;
 
     use rmcp::transport::streamable_http_server::{
@@ -97,7 +105,7 @@ pub async fn run_http(shelf_dir: PathBuf, bind: &str) -> anyhow::Result<()> {
         .with_ansi(false)
         .try_init();
 
-    let server = OutlineMcpServer::new(shelf_dir);
+    let server = OutlineMcpServer::new(storage);
 
     let addr: std::net::SocketAddr = bind
         .parse()
@@ -119,8 +127,11 @@ pub async fn run_http(shelf_dir: PathBuf, bind: &str) -> anyhow::Result<()> {
         // Bearer auth replaces loopback Host validation for LAN/remote binds.
         http_config.allowed_hosts.clear();
     }
+    // One server value per MCP session: the storage is shared, the selected
+    // book is not, so `select_book` in one session never redirects another
+    // session's writes.
     let service = StreamableHttpService::new(
-        move || Ok(server.clone()),
+        move || Ok(server.for_new_session()),
         Arc::new(LocalSessionManager::default()),
         http_config,
     );
@@ -171,214 +182,120 @@ fn bearer_token_matches(headers: &axum::http::HeaderMap, token: &str) -> bool {
 // MCP Server
 // =============================================================================
 
+/// The `BookService` every tool handler uses: one book of the server's
+/// [`Storage`].
+pub(crate) type ServerService = BookService<Arc<dyn BookStore>>;
+
 /// The outline-mcp MCP server.
 ///
-/// Holds the shelf directory (the directory containing one JSON file per
-/// book) and the currently selected book, and implements `ServerHandler` by
-/// dispatching MCP tool calls onto
-/// `outline_mcp_core::application::service::BookService`.
+/// Holds the [`Storage`] and the currently selected book, and implements
+/// `ServerHandler` by dispatching MCP tool calls onto
+/// `outline_mcp_core::application::service::BookService` (books, history)
+/// and the [`SnapshotStore`] (snapshots).
 #[derive(Clone)]
 pub struct OutlineMcpServer {
-    pub(crate) shelf_dir: PathBuf,
+    pub(crate) storage: Storage,
     pub(crate) selected: Arc<RwLock<Option<String>>>,
     tool_router: ToolRouter<Self>,
-    /// Lazily constructed, slug-keyed `ai_store_sqlite::SqliteStore` handles
-    /// (bundles the `Store`, its SQLite backend driver, and the shared
-    /// `AsyncIsle` in one type — see `Self::store_for`) backing both
-    /// `snapshot_service_for` and `changelog_for`. One SQLite file per slug
-    /// (`{shelf_dir}/{slug}.events.db`), opened on first access and reused
-    /// thereafter — opening spawns a dedicated backend thread
-    /// (`ai-store-sqlite`), so this must not happen on every tool call.
-    snapshot_stores: Arc<AsyncMutex<HashMap<String, SqliteStore>>>,
 }
 
 impl OutlineMcpServer {
-    /// Construct a new server rooted at `shelf_dir` (the directory
-    /// containing one JSON file per book). No book is selected until
+    /// Construct a new server over `storage`. No book is selected until
     /// `select_book` (or `init`) is called.
-    pub fn new(shelf_dir: PathBuf) -> Self {
+    pub fn new(storage: Storage) -> Self {
         Self {
-            shelf_dir,
+            storage,
             selected: Arc::new(RwLock::new(None)),
             tool_router: Self::tool_router(),
-            snapshot_stores: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
-    /// Returns the (lazily constructed, cached) ai-store `Store` for `slug`,
-    /// with a `SnapshotOnlySink` registered so snapshot dumps land on disk.
-    /// Shared by both the snapshot subsystem (`Self::snapshot_service_for`)
-    /// and the per-node changelog (`Self::changelog_for`).
+    /// A server for a new MCP session: the same storage, no book selected.
     ///
-    /// Built via `SqliteStore::open_with` — the one-call assembly
-    /// `ai-store-sqlite` provides over hand-wiring `SqliteBackends` +
-    /// `Store::new` (which this used to do, ignoring `SqliteBackends`'
-    /// checkpoint backend entirely). `SqliteStore` bundles the `Store`, its
-    /// SQLite backend driver, and the shared `AsyncIsle` in one cached
-    /// value, and derives durable (SQLite-persisted) sink checkpoints along
-    /// the way; nothing in this server currently calls `Store::catch_up` /
-    /// `Store::rebuild` (the only consumers of that checkpoint), so this is
-    /// presently inert but strictly more correct than the in-memory-only
-    /// checkpoints the hand-wired construction had.
-    ///
-    /// `Store` is cheap to clone (every field is `Arc`-backed internally —
-    /// see `ai_store_core::Store`'s doc comment), so returning a fresh
-    /// `Arc::new(..)` around a `.clone()` of the cached `SqliteStore`'s
-    /// `Store` on every call is equivalent to sharing one `Arc<Store>`: the
-    /// per-stream write locks, checkpoint map, and registered sinks are the
-    /// same underlying instances either way.
-    pub(crate) async fn store_for(&self, slug: &str) -> Result<Arc<Store>, McpError> {
-        {
-            let cache = self.snapshot_stores.lock().await;
-            if let Some(entry) = cache.get(slug) {
-                return Ok(Arc::new(entry.store().clone()));
-            }
+    /// `Clone` shares `selected` (it is an `Arc`), which is right inside one
+    /// session and wrong across sessions — the HTTP transport builds one
+    /// server per session through this instead.
+    pub(crate) fn for_new_session(&self) -> Self {
+        Self {
+            selected: Arc::new(RwLock::new(None)),
+            ..self.clone()
         }
+    }
 
-        std::fs::create_dir_all(&self.shelf_dir).map_err(|e| {
-            McpError::internal_error(format!("Failed to create shelf directory: {e}"), None)
-        })?;
-        let db_path = self.shelf_dir.join(format!("{slug}.events.db"));
-        let sink_shelf_dir = self.shelf_dir.clone();
-        let sink_slug = slug.to_string();
-        let sqlite_store = SqliteStore::open_with(&db_path, move |builder| {
-            builder.sink(Arc::new(SnapshotOnlySink::new(sink_shelf_dir, sink_slug)))
-        })
-        .await
-        .map_err(|e| {
-            McpError::internal_error(
-                format!("Failed to open event store for '{slug}': {e}"),
+    /// The snapshot store.
+    pub(crate) fn snapshots(&self) -> &dyn SnapshotStore {
+        self.storage.snapshots.as_ref()
+    }
+
+    /// The selected book's slug, or the "No book selected" error.
+    pub(crate) fn selected_slug(&self) -> Result<String, McpError> {
+        let guard = self
+            .selected
+            .read()
+            .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
+        guard.clone().ok_or_else(|| {
+            McpError::invalid_params(
+                "No book selected. Use `shelf` to list books and `select_book` to choose one.",
                 None,
             )
-        })?;
-        let store = Arc::new(sqlite_store.store().clone());
-
-        // Best-effort: warn about un-migrated legacy `.snap.*.json` files
-        // for this slug now that its `Store` has been freshly constructed
-        // (see `count_orphan_snapshots`'s doc comment — this is an exact
-        // count of files not yet imported). `store_for` is lazy — called on
-        // first access, not eagerly for every book at process startup — so
-        // this warning surfaces on that same first touch rather than at
-        // server boot. A failure to count (e.g. a permission error reading
-        // `shelf_dir`) is silently ignored: this is a UX nicety, not
-        // something that should block the store from being usable.
-        if let Ok(count) = count_orphan_snapshots(&self.shelf_dir, slug, Arc::clone(&store)).await {
-            if count > 0 {
-                tracing::warn!(
-                    "outline-mcp: {count} unmigrated snapshot(s) detected for slug '{slug}'. Run: outline-mcp migrate-snapshots --shelf {}",
-                    self.shelf_dir.display()
-                );
-            }
-        }
-
-        let mut cache = self.snapshot_stores.lock().await;
-        let entry = cache.entry(slug.to_string()).or_insert(sqlite_store);
-        Ok(Arc::new(entry.store().clone()))
+        })
     }
 
-    /// Convenience wrapper: `SnapshotService` bound to `slug`'s `Store`.
-    pub(crate) async fn snapshot_service_for(
+    /// The book stored in `slug`'s snapshot at `millis`, or a
+    /// "Snapshot not found" error.
+    pub(crate) async fn load_snapshot(
         &self,
         slug: &str,
-    ) -> Result<SnapshotService, McpError> {
-        let store = self.store_for(slug).await?;
-        Ok(SnapshotService::new(
-            store,
-            self.shelf_dir.clone(),
-            slug.to_string(),
-        ))
+        millis: i64,
+    ) -> Result<outline_mcp_core::domain::model::book::TemplateBook, McpError> {
+        let ts = outline_mcp_core::domain::model::timestamp::Timestamp::from_millis(millis);
+        self.snapshots()
+            .get(slug, ts)
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to load snapshot {millis}: {e}"), None)
+            })?
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("Snapshot not found for timestamp {millis}"), None)
+            })
     }
 
-    /// slug からBookファイルパスを返す。
-    pub(crate) fn book_path(&self, slug: &str) -> PathBuf {
-        self.shelf_dir.join(format!("{slug}.json"))
-    }
-
-    /// Constructs the (ai-store-backed, JSON-history-preserving) changelog
-    /// repository for `slug`, sharing `slug`'s `Store` with the snapshot
-    /// subsystem (see `Self::store_for`). Single construction point used by
-    /// `Self::service_for` and by tool handlers that query/append changelog
-    /// entries outside of a `BookService` (e.g. `book_history`,
-    /// `node_history`, the `Restore` entries `snapshot_restore` records).
-    pub(crate) async fn changelog_for(
-        &self,
-        slug: &str,
-    ) -> Result<HistoryPreservingChangeLogRepository, McpError> {
-        let store = self.store_for(slug).await?;
-        HistoryPreservingChangeLogRepository::new(store, self.shelf_dir.clone(), slug).map_err(
-            |e| {
-                McpError::internal_error(
-                    format!("Failed to construct changelog for slug '{slug}': {e}"),
-                    None,
-                )
-            },
-        )
+    /// Whether a book `slug` exists.
+    pub(crate) async fn book_exists(&self, slug: &str) -> Result<bool, McpError> {
+        self.storage
+            .books
+            .load(slug)
+            .await
+            .map(|b| b.is_some())
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to read book '{slug}': {e}"), None)
+            })
     }
 
     /// 選択中BookのServiceを返す。未選択ならエラー。
-    pub(crate) async fn service(&self) -> Result<BookService<JsonBookRepository>, McpError> {
-        let slug = {
-            let guard = self
-                .selected
-                .read()
-                .map_err(|_| McpError::internal_error("Lock poisoned", None))?;
-            guard
-                .as_ref()
-                .ok_or_else(|| {
-                    McpError::invalid_params(
-                        "No book selected. Use `shelf` to list books and `select_book` to choose one.",
-                        None,
-                    )
-                })?
-                .clone()
-        };
+    pub(crate) async fn service(&self) -> Result<ServerService, McpError> {
+        let slug = self.selected_slug()?;
         self.service_for(&slug).await
     }
 
     /// 指定slugのServiceを返す（選択状態不要）。
-    pub(crate) async fn service_for(
-        &self,
-        slug: &str,
-    ) -> Result<BookService<JsonBookRepository>, McpError> {
-        let repo = JsonBookRepository::new(self.book_path(slug));
-        let changelog = Box::new(self.changelog_for(slug).await?);
-        Ok(BookService::new(repo).with_changelog(changelog))
+    pub(crate) async fn service_for(&self, slug: &str) -> Result<ServerService, McpError> {
+        Ok(BookService::new(Arc::clone(&self.storage.books), slug))
     }
 
-    /// Shelf内のslug一覧をソート順で返す。
-    pub(crate) fn list_book_slugs(&self) -> Result<Vec<String>, McpError> {
-        if !self.shelf_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let dir = std::fs::read_dir(&self.shelf_dir)
-            .map_err(|e| McpError::internal_error(format!("Failed to read shelf: {e}"), None))?;
-        let mut slugs: Vec<String> = dir
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let path = e.path();
-                let ext_ok = path.extension().and_then(|x| x.to_str()) == Some("json");
-                let stem_ok = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| !s.contains('.'))
-                    .unwrap_or(false);
-                ext_ok && stem_ok
-            })
-            .filter_map(|e| {
-                e.path()
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(String::from)
-            })
-            .collect();
-        slugs.sort();
-        Ok(slugs)
+    /// Every book's slug, sorted.
+    pub(crate) async fn list_book_slugs(&self) -> Result<Vec<String>, McpError> {
+        let books =
+            self.storage.books.list_books().await.map_err(|e| {
+                McpError::internal_error(format!("Failed to list books: {e}"), None)
+            })?;
+        Ok(books.into_iter().map(|b| b.slug).collect())
     }
 
     /// 番号 or slug → slug に解決する。
-    pub(crate) fn resolve_book_ref(&self, book_ref: &str) -> Result<String, McpError> {
+    pub(crate) async fn resolve_book_ref(&self, book_ref: &str) -> Result<String, McpError> {
         if let Ok(num) = book_ref.parse::<usize>() {
-            let slugs = self.list_book_slugs()?;
+            let slugs = self.list_book_slugs().await?;
             if num == 0 || num > slugs.len() {
                 return Err(McpError::invalid_params(
                     format!(
@@ -572,31 +489,31 @@ impl ServerHandler for OutlineMcpServer {
 mod tests {
     use super::*;
 
+    use outline_mcp_core::infra::memory_store::{MemoryBookStore, MemorySnapshotStore};
+
+    pub(crate) fn memory_server() -> OutlineMcpServer {
+        OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ))
+    }
+
     #[test]
     fn server_info() {
-        let server = OutlineMcpServer::new(PathBuf::from("/tmp/test-shelf"));
-        let info = server.get_info();
+        let info = memory_server().get_info();
         assert_eq!(info.server_info.name, "outline-mcp");
         assert!(!info.server_info.version.is_empty());
     }
 
     #[tokio::test]
-    async fn test_service_for_and_changelog_for_share_slug_history() {
+    async fn test_service_for_writes_land_in_store_history_and_listing() {
         use outline_mcp_core::domain::model::book::AddNodeRequest;
         use outline_mcp_core::domain::model::node::NodeType;
-        use outline_mcp_core::domain::repository::ChangeLogRepository;
         use std::collections::HashMap;
 
-        let dir = std::env::temp_dir().join("outline-mcp-server-changelog-wiring-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp shelf dir");
-
-        let server = OutlineMcpServer::new(dir.clone());
+        let server = memory_server();
         let slug = "wiring-book";
 
-        // `service_for` now backs its changelog with `changelog_for`'s
-        // ai-store-shared `Store` (Task B wiring) instead of a standalone
-        // `JsonChangeLogRepository` — this exercises that path end to end.
         let svc = server.service_for(slug).await.expect("service_for");
         svc.create_book("Wiring Test", 4)
             .await
@@ -613,21 +530,115 @@ mod tests {
             })
             .await
             .expect("add_node");
-        assert!(
-            warning.is_none(),
-            "changelog append should succeed: {warning:?}"
-        );
+        assert!(warning.is_none(), "atomic store never warns: {warning:?}");
 
-        // `changelog_for` shares `slug`'s `Store` with `service_for` (both
-        // go through `Self::store_for`) — querying it directly must see
-        // the entry `service_for`'s `BookService` just wrote.
-        let cl_repo = server.changelog_for(slug).await.expect("changelog_for");
-        let entries = ChangeLogRepository::load_all(&cl_repo)
+        // A second service over the same storage sees the write and its event.
+        let entries = server
+            .service_for(slug)
             .await
-            .expect("load_all");
+            .unwrap()
+            .history()
+            .await
+            .expect("history");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].node_id, id);
+        assert_eq!(server.list_book_slugs().await.unwrap(), vec![slug]);
+        assert!(server.book_exists(slug).await.unwrap());
+        assert_eq!(server.resolve_book_ref("1").await.unwrap(), slug);
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn selected_slug_errors_until_a_book_is_selected() {
+        let server = memory_server();
+        assert!(server.selected_slug().is_err());
+        *server.selected.write().unwrap() = Some("b".into());
+        assert_eq!(server.selected_slug().unwrap(), "b");
+    }
+
+    #[test]
+    fn new_session_starts_unselected_and_does_not_share_selection() {
+        let shared = memory_server();
+        *shared.selected.write().unwrap() = Some("x".into());
+
+        let a = shared.for_new_session();
+        let b = shared.for_new_session();
+        assert!(
+            a.selected_slug().is_err(),
+            "a new session starts unselected"
+        );
+
+        *a.selected.write().unwrap() = Some("a-book".into());
+        *b.selected.write().unwrap() = Some("b-book".into());
+        assert_eq!(a.selected_slug().unwrap(), "a-book");
+        assert_eq!(b.selected_slug().unwrap(), "b-book");
+        assert_eq!(shared.selected_slug().unwrap(), "x");
+    }
+
+    #[tokio::test]
+    async fn sessions_write_to_the_book_each_selected() {
+        use outline_mcp_core::domain::model::book::AddNodeRequest;
+        use outline_mcp_core::domain::model::node::NodeType;
+        use std::collections::HashMap;
+
+        let shared = memory_server();
+        for (slug, title) in [("a-book", "A"), ("b-book", "B")] {
+            shared
+                .service_for(slug)
+                .await
+                .unwrap()
+                .create_book(title, 4)
+                .await
+                .unwrap();
+        }
+
+        let a = shared.for_new_session();
+        let b = shared.for_new_session();
+        *a.selected.write().unwrap() = Some("a-book".into());
+        *b.selected.write().unwrap() = Some("b-book".into());
+
+        let node = |title: &str| AddNodeRequest {
+            parent: None,
+            title: title.to_string(),
+            node_type: NodeType::Content,
+            body: None,
+            placeholder: None,
+            position: usize::MAX,
+            properties: HashMap::new(),
+        };
+        a.service()
+            .await
+            .unwrap()
+            .add_node(node("from a"))
+            .await
+            .unwrap();
+        b.service()
+            .await
+            .unwrap()
+            .add_node(node("from b"))
+            .await
+            .unwrap();
+
+        let titles = |book: outline_mcp_core::domain::model::book::TemplateBook| {
+            book.all_nodes_dfs()
+                .iter()
+                .map(|n| n.title().to_string())
+                .collect::<Vec<_>>()
+        };
+        let a_book = shared
+            .service_for("a-book")
+            .await
+            .unwrap()
+            .read_tree()
+            .await
+            .unwrap();
+        let b_book = shared
+            .service_for("b-book")
+            .await
+            .unwrap()
+            .read_tree()
+            .await
+            .unwrap();
+        assert_eq!(titles(a_book), vec!["from a"]);
+        assert_eq!(titles(b_book), vec!["from b"]);
     }
 }

@@ -13,6 +13,10 @@
   Stop / remove:
     launchctl bootout gui/$(id -u)/io.github.ynishi.outline-mcp
 
+  Books live in Postgres: replace the OUTLINE_MCP_DATABASE_URL placeholder
+  below with your database URL, and run `outline-mcp migrate` against it once
+  before loading the agent (the server refuses an unmigrated database).
+
   LAN exposure requires OUTLINE_MCP_HTTP_TOKEN (startup is refused otherwise):
   add it under EnvironmentVariables and change the bind address.
 -->
@@ -20,10 +24,14 @@
 <dict>
     <key>Label</key>
     <string>io.github.ynishi.outline-mcp</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OUTLINE_MCP_DATABASE_URL</key>
+        <string>postgres://&lt;user&gt;:&lt;password&gt;@&lt;host&gt;:5432/&lt;database&gt;</string>
+    </dict>
     <key>ProgramArguments</key>
     <array>
         <string>__HOME__/.cargo/bin/outline-mcp</string>
-        <string>__HOME__/.config/outline-mcp/books</string>
         <string>--mcp-http</string>
         <string>--bind</string>
         <string>127.0.0.1:8486</string>

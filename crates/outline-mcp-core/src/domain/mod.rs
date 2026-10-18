@@ -4,3 +4,5 @@ pub mod error;
 pub mod model;
 /// Persistence-abstraction traits implemented by the `infra` layer.
 pub mod repository;
+/// The `BookStore` port: one commit of a book's state and its change events.
+pub mod store;

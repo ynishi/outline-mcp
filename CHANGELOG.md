@@ -6,16 +6,28 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **Fly.io hosting** — `contrib/fly/fly.toml` (single machine + volume, edge TLS, bearer auth via `OUTLINE_MCP_HTTP_TOKEN`; shelf directory on the mounted volume, `--bind 0.0.0.0:8486`) and `docs/runbooks/fly-io-deploy.md` (app/volume/secrets setup, deploy, smoke, non-interactive data migration from a local shelf via `fly ssh sftp put`, client registration). Backup relies on Fly's automatic daily volume snapshots plus the existing `snapshot_create` / `snapshot_restore` tools; off-Fly (S3-compatible) upload is intentionally not implemented. Verified against a real deploy (machine + volume in `nrt`, 401/no-token / 200/token smoke, 29-book shelf served after migration).
+- **Fly.io hosting** — `contrib/fly/fly.toml` (stateless machine, edge TLS, bearer auth via `OUTLINE_MCP_HTTP_TOKEN`, database URL from the `OUTLINE_MCP_DATABASE_URL` secret, `--bind 0.0.0.0:8486`; no volume, so the machine may stop when idle) and `docs/runbooks/fly-io-deploy.md` (an unmanaged Fly Postgres app in the same org, `fly postgres attach` for the secret, `migrate` and `import-shelf` through `fly proxy`, deploy, smoke, client registration, rollback, backup by volume snapshots of the database app plus `pg_dump`). The volume-based layout first written for this entry was verified against a real deploy (nrt, 401/no-token / 200/token smoke, 29-book shelf); the Postgres layout has not been deployed yet.
 - **`.dockerignore`** — the Dockerfile only COPYs `Cargo.toml` / `Cargo.lock` / `crates/`, but the build context uploaded everything (`target/` alone is multiple GB, re-uploaded on every `fly deploy` / `docker build`).
+- **`BookStore` storage port with a Postgres adapter** (groundwork for #2) — one write commits the book state and its change events together, so a write whose history entry cannot be recorded is not persisted. Ships a Postgres adapter (sqlx 0.9; `books` / `nodes` / `events` tables, optimistic locking on a per-book version, only changed node rows rewritten), an in-memory adapter for tests, and an `outline-mcp migrate [--database-url <url>]` subcommand reading `OUTLINE_MCP_DATABASE_URL` that exits with a message naming the variable when no database is configured.
+- **`outline-mcp import-shelf --shelf <dir> [--slug <slug>] [--replace]`** — imports a pre-Postgres shelf (book JSON, `{slug}.changelog.json`, the per-book event log, `{slug}.snap.*.json`) with original timestamps, then reads each book back and prints a per-book comparison (node count, content hash, history entries, snapshots), exiting non-zero on any mismatch. History is read entry by entry instead of replaying the event log, so books whose log no longer replays (#2) import with their full history. Checked on a 29-book shelf, including a 1121-node book with 5110 history entries: 29 matched.
+- **Snapshots on Postgres** (`snapshots` table, migration `0002`). `snapshot_restore` is one commit that writes the restored tree and its history entries together.
 
 ### Changed
+
+- **Docker image builds with Rust 1.97** (was 1.88). sqlx 0.9 requires rustc 1.94 or later, so the image no longer built.
+- **Storage is Postgres; `serve` / `stdio` require a database.** The server takes `OUTLINE_MCP_DATABASE_URL` (or `--database-url`) and refuses to start without one, on a database `migrate` has not brought up to date, or when the connection fails — within about 5 s, saying whether the host was unreachable, the login was rejected or the database does not exist. Every MCP tool now runs on the store, so a write and its history entry are committed together and a stale per-book version is rejected instead of overwriting a concurrent write. Fixes #2 for books served from Postgres.
+- **Bulk writes are chunked.** A commit still runs in one transaction, but node and history rows go in statements of at most 500 rows and about 1 MB each. Writing a large book in one statement per table (an 8 MB history in a single `UNNEST`) sent a 256 MB Postgres machine into crash recovery during an import; the same 29-book import now runs in chunks and still rolls back as a whole if any chunk fails.
+- **Daemon templates and runbooks target Postgres.** `contrib/systemd` and `contrib/launchd` drop the shelf path and take the database URL from their environment block; `docs/runbooks/data-migration.md` is now the `import-shelf` procedure (local shelf or a shelf on a Fly volume) and `multi-device-smoke.md` adds the startup-refusal checks.
 
 ### Deprecated
 
 ### Removed
 
+- **The shelf directory as runtime storage**, and with it the shelf path argument (passing one prints a pointer to `import-shelf`) and `migrate-snapshots`. The event-log dependency remains only inside `import-shelf` until existing shelves have been moved.
+
 ### Fixed
+
+- **Each HTTP session has its own selected book** (#6). Every streamable-HTTP session used to share one selection, so `select_book` (or `init`) in one session redirected the next write of every other session into that book. Sessions now share the storage but start with no book selected and keep their own selection; stdio is unchanged.
 
 ### Security
 

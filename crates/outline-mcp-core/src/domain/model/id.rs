@@ -16,6 +16,16 @@ impl BookId {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Wrap a stored UUID (storage adapters only).
+    pub(crate) fn from_uuid(id: uuid::Uuid) -> Self {
+        Self(id)
+    }
+
+    /// The underlying UUID (storage adapters only).
+    pub(crate) fn as_uuid(&self) -> uuid::Uuid {
+        self.0
+    }
 }
 
 impl fmt::Display for BookId {
@@ -43,6 +53,16 @@ impl NodeId {
     /// 短縮ID（UUIDの先頭8文字）
     pub fn short(&self) -> String {
         self.0.to_string()[..8].to_string()
+    }
+
+    /// Wrap a stored UUID (storage adapters only).
+    pub(crate) fn from_uuid(id: uuid::Uuid) -> Self {
+        Self(id)
+    }
+
+    /// The underlying UUID (storage adapters only).
+    pub(crate) fn as_uuid(&self) -> uuid::Uuid {
+        self.0
     }
 }
 

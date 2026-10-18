@@ -13,8 +13,9 @@
 //!
 //! ## Design
 //!
-//! - `server`: [`OutlineMcpServer`] — holds the shelf directory (multi-book
-//!   root) and the currently selected book, and implements `ServerHandler`.
+//! - `server`: [`OutlineMcpServer`] — holds the [`Storage`] (the
+//!   `BookStore` / `SnapshotStore` the books live in) and the currently
+//!   selected book, and implements `ServerHandler`.
 //! - `tools`: the `#[tool]`-annotated MCP tool handlers (node CRUD,
 //!   TOC/checklist, snapshot/history, batch operations, query).
 //! - `request`: MCP request DTOs (`schemars::JsonSchema` + `serde`) and
@@ -23,10 +24,10 @@
 //!   `server` and `tools`.
 //! - `resources`: bundled Markdown guides exposed via `outline://guides/*`.
 //!
-//! Consumers that only need to run the server as-is should call [`run`].
-//! Consumers that want to embed the server directly (e.g. as part of a
-//! larger MCP host) can construct [`OutlineMcpServer`] and drive it with
-//! any `rmcp` transport.
+//! Consumers that only need to run the server as-is should build a
+//! [`Storage`] and call [`run`] / [`run_http`]. Consumers that want to embed
+//! the server directly (e.g. as part of a larger MCP host) can construct
+//! [`OutlineMcpServer`] and drive it with any `rmcp` transport.
 
 mod helpers;
 mod request;
@@ -34,4 +35,4 @@ mod resources;
 mod server;
 mod tools;
 
-pub use server::{run, run_http, OutlineMcpServer};
+pub use server::{run, run_http, OutlineMcpServer, Storage};

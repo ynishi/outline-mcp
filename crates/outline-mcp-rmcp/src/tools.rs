@@ -23,7 +23,7 @@ use crate::server::OutlineMcpServer;
 
 use outline_mcp_core::domain::model::book::AddNodeRequest;
 use outline_mcp_core::domain::model::book::UpdateNodeRequest;
-use outline_mcp_core::domain::model::changelog::{ChangeAction, ChangeEntry, NodeStatus};
+use outline_mcp_core::domain::model::changelog::{ChangeAction, NodeStatus};
 use outline_mcp_core::domain::model::timestamp::Timestamp;
 
 #[tool_router(vis = "pub(crate)")]
@@ -370,8 +370,7 @@ impl OutlineMcpServer {
     ) -> Result<CallToolResult, McpError> {
         validate_slug(&req.slug)?;
 
-        let path = self.book_path(&req.slug);
-        if path.exists() {
+        if self.book_exists(&req.slug).await? {
             return Err(McpError::invalid_params(
                 format!(
                     "Book '{}' already exists. Choose a different slug.",
@@ -380,10 +379,6 @@ impl OutlineMcpServer {
                 None,
             ));
         }
-
-        std::fs::create_dir_all(&self.shelf_dir).map_err(|e| {
-            McpError::internal_error(format!("Failed to create shelf directory: {e}"), None)
-        })?;
 
         let svc = self.service_for(&req.slug).await?;
         let max_depth = req.max_depth.unwrap_or(4);
@@ -422,7 +417,7 @@ impl OutlineMcpServer {
         &self,
         #[allow(unused_variables)] Parameters(_req): Parameters<McpShelfRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let slugs = self.list_book_slugs()?;
+        let slugs = self.list_book_slugs().await?;
 
         if slugs.is_empty() {
             return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
@@ -493,10 +488,9 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpSelectBookRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let slug = self.resolve_book_ref(&req.book)?;
+        let slug = self.resolve_book_ref(&req.book).await?;
 
-        let path = self.book_path(&slug);
-        if !path.exists() {
+        if !self.book_exists(&slug).await? {
             return Err(McpError::invalid_params(
                 format!(
                     "Book '{}' not found in shelf. Use `shelf` to list available books.",
@@ -579,7 +573,7 @@ impl OutlineMcpServer {
         &self,
         #[allow(unused_variables)] Parameters(_req): Parameters<McpGenRoutingRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let slugs = self.list_book_slugs()?;
+        let slugs = self.list_book_slugs().await?;
 
         // Collect: (scene, book_slug, reference_text)
         let mut entries: Vec<(String, String, String)> = Vec::new();
@@ -653,7 +647,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "snapshot_create",
-        description = "Create a snapshot of the current book state. Optionally attach a label (sidecar '.meta.json'; snapshot body schema is unchanged). Use `snapshot_list` to view saved snapshots and `snapshot_restore` to revert.",
+        description = "Create a snapshot of the current book state. Optionally attach a label. Use `snapshot_list` to view saved snapshots and `snapshot_restore` to revert.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -689,19 +683,13 @@ impl OutlineMcpServer {
             None => None,
         };
 
-        let snap_svc = self.snapshot_service_for(&slug).await?;
-        let path = snap_svc
-            .create(&book, label.as_deref())
+        let info = self
+            .snapshots()
+            .create(&slug, &book, label.as_deref())
             .await
             .map_err(|e| {
                 McpError::internal_error(format!("Failed to create snapshot: {e}"), None)
             })?;
-
-        let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-
-        // ファイル名からタイムスタンプ(millis)を取得
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let millis_str = stem.rsplit('.').next().unwrap_or("");
 
         let label_note = label
             .as_deref()
@@ -711,7 +699,9 @@ impl OutlineMcpServer {
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             format!(
                 "Snapshot created: {} ({} bytes){}",
-                millis_str, size_bytes, label_note
+                info.timestamp.as_millis(),
+                info.size_bytes,
+                label_note
             ),
         )]))
     }
@@ -748,8 +738,7 @@ impl OutlineMcpServer {
                 .clone()
         };
 
-        let snap_svc = self.snapshot_service_for(&slug).await?;
-        let infos = snap_svc.list().await.map_err(|e| {
+        let infos = self.snapshots().list(&slug).await.map_err(|e| {
             McpError::internal_error(format!("Failed to list snapshots: {e}"), None)
         })?;
 
@@ -826,47 +815,26 @@ impl OutlineMcpServer {
                 .clone()
         };
 
-        let snap_svc = self.snapshot_service_for(&slug).await?;
-        let restored = snap_svc.restore(millis).await.map_err(|e| {
-            McpError::internal_error(format!("Failed to restore snapshot: {e}"), None)
-        })?;
-
+        let restored = self.load_snapshot(&slug, millis).await?;
         let node_count = restored.node_count();
 
-        // changelog に Restore エントリを記録（ベストエフォート）
-        let cl_repo = self.changelog_for(&slug).await?;
-        let ts = Timestamp::now();
-        let mut warning: Option<String> = None;
-        for id in restored.all_node_ids() {
-            let entry = ChangeEntry::new(id, ChangeAction::Restore, None, None, ts);
-            if let Err(e) =
-                outline_mcp_core::domain::repository::ChangeLogRepository::append(&cl_repo, &entry)
-                    .await
-            {
-                warning = Some(format!("changelog write failed: {e}"));
-                break;
-            }
-        }
-
-        let svc = self.service().await?;
-        svc.save_book(&restored).await.map_err(Self::to_mcp_error)?;
-
-        let mut msg = format!(
-            "Restored from snapshot {}. {} nodes.",
-            req.timestamp, node_count
-        );
-        if let Some(w) = warning {
-            msg.push_str(&format!("\n[WARNING] {w}"));
-        }
+        // The restored tree and one Restore event per node commit together.
+        let svc = self.service_for(&slug).await?;
+        svc.restore_book(&restored)
+            .await
+            .map_err(Self::to_mcp_error)?;
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            msg,
+            format!(
+                "Restored from snapshot {}. {} nodes.",
+                req.timestamp, node_count
+            ),
         )]))
     }
 
     #[tool(
         name = "snapshot_tag",
-        description = "Attach or overwrite a label on an existing snapshot. Writes only the sidecar '.meta.json'; the snapshot body is not touched. Use `snapshot_list` to find timestamps.",
+        description = "Attach or overwrite a label on an existing snapshot. Only the label changes; the snapshot's book is not touched. Use `snapshot_list` to find timestamps.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -906,19 +874,20 @@ impl OutlineMcpServer {
                 .clone()
         };
 
-        let snap_svc = self.snapshot_service_for(&slug).await?;
-        let meta_path = snap_svc
-            .tag(millis, &label)
+        let found = self
+            .snapshots()
+            .tag(&slug, Timestamp::from_millis(millis), &label)
             .await
             .map_err(|e| McpError::internal_error(format!("Failed to tag snapshot: {e}"), None))?;
+        if !found {
+            return Err(McpError::invalid_params(
+                format!("Snapshot not found for timestamp {millis}"),
+                None,
+            ));
+        }
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            format!(
-                "Snapshot {} tagged as '{}' (meta: {})",
-                millis,
-                label,
-                meta_path.display()
-            ),
+            format!("Snapshot {} tagged as '{}'", millis, label),
         )]))
     }
 
@@ -975,10 +944,8 @@ impl OutlineMcpServer {
                 .clone()
         };
 
-        let snap_svc = self.snapshot_service_for(&slug).await?;
-
-        // 両 snapshot の meta (label) を取りに行くために list を舐める
-        let infos = snap_svc.list().await.map_err(|e| {
+        // 両 snapshot の label を取りに行くために list を舐める
+        let infos = self.snapshots().list(&slug).await.map_err(|e| {
             McpError::internal_error(format!("Failed to list snapshots: {e}"), None)
         })?;
         let find_label = |ms: i64| -> Option<String> {
@@ -988,12 +955,8 @@ impl OutlineMcpServer {
                 .and_then(|i| i.label.clone())
         };
 
-        let from_book = snap_svc.restore(from_ms).await.map_err(|e| {
-            McpError::internal_error(format!("Failed to load from snapshot: {e}"), None)
-        })?;
-        let to_book = snap_svc.restore(to_ms).await.map_err(|e| {
-            McpError::internal_error(format!("Failed to load to snapshot: {e}"), None)
-        })?;
+        let from_book = self.load_snapshot(&slug, from_ms).await?;
+        let to_book = self.load_snapshot(&slug, to_ms).await?;
 
         let from_md = EjectService::render_markdown(&from_book, true, None);
         let to_md = EjectService::render_markdown(&to_book, true, None);
@@ -1093,10 +1056,8 @@ impl OutlineMcpServer {
         let format = parse_dump_format(req.format.as_deref())?;
         let overwrite = req.overwrite.unwrap_or(false);
 
-        let snap_svc = self.snapshot_service_for(&slug).await?;
-
         // list を舐めて index を確定 (01 = 最古)
-        let mut infos = snap_svc.list().await.map_err(|e| {
+        let mut infos = self.snapshots().list(&slug).await.map_err(|e| {
             McpError::internal_error(format!("Failed to list snapshots: {e}"), None)
         })?;
         infos.reverse(); // 昇順 (最古が先頭)
@@ -1109,10 +1070,7 @@ impl OutlineMcpServer {
                 McpError::invalid_params(format!("Snapshot not found for timestamp {millis}"), None)
             })?;
 
-        let book = snap_svc
-            .restore(millis)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Failed to load snapshot: {e}"), None))?;
+        let book = self.load_snapshot(&slug, millis).await?;
 
         let root = PathBuf::from(&req.output_dir);
         let subdir = subdir_name(idx + 1, total, info.timestamp.as_millis());
@@ -1167,8 +1125,7 @@ impl OutlineMcpServer {
         let format = parse_dump_format(req.format.as_deref())?;
         let overwrite = req.overwrite.unwrap_or(false);
 
-        let snap_svc = self.snapshot_service_for(&slug).await?;
-        let mut infos = snap_svc.list().await.map_err(|e| {
+        let mut infos = self.snapshots().list(&slug).await.map_err(|e| {
             McpError::internal_error(format!("Failed to list snapshots: {e}"), None)
         })?;
         if infos.is_empty() {
@@ -1185,9 +1142,7 @@ impl OutlineMcpServer {
 
         for (idx, info) in infos.iter().enumerate() {
             let millis = info.timestamp.as_millis();
-            let book = snap_svc.restore(millis).await.map_err(|e| {
-                McpError::internal_error(format!("Failed to load snapshot {millis}: {e}"), None)
-            })?;
+            let book = self.load_snapshot(&slug, millis).await?;
 
             let subdir = subdir_name(idx + 1, total, millis);
             let out_dir = root.join(&subdir);
@@ -1256,13 +1211,12 @@ impl OutlineMcpServer {
             .map(|n| n.title().to_string())
             .unwrap_or_else(|| id.short().to_string());
 
-        let cl_repo = self.changelog_for(&slug).await?;
-        let mut entries =
-            outline_mcp_core::domain::repository::ChangeLogRepository::load_by_node(&cl_repo, id)
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(format!("Failed to load history: {e}"), None)
-                })?;
+        let mut entries = self
+            .service_for(&slug)
+            .await?
+            .history_by_node(id)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to load history: {e}"), None))?;
 
         // 時系列順（古い順）
         entries.sort_by_key(|a| a.timestamp);
@@ -1349,13 +1303,10 @@ impl OutlineMcpServer {
         let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
-        let cl_repo = self.changelog_for(&slug).await?;
-        let mut entries =
-            outline_mcp_core::domain::repository::ChangeLogRepository::load_all(&cl_repo)
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(format!("Failed to load history: {e}"), None)
-                })?;
+        let mut entries = svc
+            .history()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Failed to load history: {e}"), None))?;
 
         // 時系列降順 (最新が先頭) — 後で range 絞り + limit
         entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
@@ -1372,12 +1323,9 @@ impl OutlineMcpServer {
             entries.truncate(limit);
         }
 
-        // snapshot label cross-ref (best-effort: store construction failure
+        // snapshot label cross-ref (best-effort: a snapshot listing failure
         // should not break history display)
-        let snap_infos = match self.snapshot_service_for(&slug).await {
-            Ok(svc) => svc.list().await.unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+        let snap_infos = self.snapshots().list(&slug).await.unwrap_or_default();
         let snap_label_by_millis: HashMap<i64, String> = snap_infos
             .iter()
             .filter_map(|i| {

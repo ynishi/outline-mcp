@@ -37,6 +37,21 @@ pub struct TemplateNode {
     updated_at: Option<Timestamp>,
 }
 
+/// Every stored field of a [`TemplateNode`], for adapters that keep nodes as
+/// rows rather than as one serialized book.
+pub(crate) struct NodeParts {
+    pub(crate) id: NodeId,
+    pub(crate) parent: Option<NodeId>,
+    pub(crate) children: Vec<NodeId>,
+    pub(crate) title: String,
+    pub(crate) body: Option<String>,
+    pub(crate) node_type: NodeType,
+    pub(crate) placeholder: Option<String>,
+    pub(crate) properties: HashMap<String, String>,
+    pub(crate) status: NodeStatus,
+    pub(crate) updated_at: Option<Timestamp>,
+}
+
 impl TemplateNode {
     pub(crate) fn new(
         id: NodeId,
@@ -55,6 +70,23 @@ impl TemplateNode {
             properties: HashMap::new(),
             status: NodeStatus::Active,
             updated_at: Some(Timestamp::now()),
+        }
+    }
+
+    /// Rebuild a node from stored fields (storage adapters only). No setter
+    /// runs, so `updated_at` keeps its stored value.
+    pub(crate) fn from_parts(parts: NodeParts) -> Self {
+        Self {
+            id: parts.id,
+            parent: parts.parent,
+            children: parts.children,
+            title: parts.title,
+            body: parts.body,
+            node_type: parts.node_type,
+            placeholder: parts.placeholder,
+            properties: parts.properties,
+            status: parts.status,
+            updated_at: parts.updated_at,
         }
     }
 

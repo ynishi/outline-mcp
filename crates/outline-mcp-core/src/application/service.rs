@@ -2,80 +2,75 @@ use crate::domain::model::book::{AddNodeRequest, TemplateBook, UpdateNodeRequest
 use crate::domain::model::changelog::{ChangeAction, ChangeEntry};
 use crate::domain::model::id::NodeId;
 use crate::domain::model::timestamp::Timestamp;
-use crate::domain::repository::{BookRepository, ChangeLogRepository};
+use crate::domain::store::{BookStore, StoreError, Versioned};
 
 use super::error::AppError;
 
 /// Template Bookに対するユースケース。
-/// load → mutate → save のパターンで操作する。
-pub struct BookService<R: BookRepository> {
-    repo: R,
-    changelog: Option<Box<dyn ChangeLogRepository>>,
+/// load → mutate → commit のパターンで操作する。
+///
+/// 1 操作 = 1 [`BookStore::commit`]: 変更後の book と、その操作が生んだ
+/// changelog event をまとめて渡す (batch 系は N event を 1 commit)。commit は
+/// load 時の version に対して行うので、間に別の writer が commit していれば
+/// [`AppError::Conflict`] になる (version を持たない legacy adapter を除く)。
+pub struct BookService<S: BookStore> {
+    store: S,
+    slug: String,
 }
 
-impl<R: BookRepository> BookService<R> {
-    /// Create a new service over the given repository (no changelog attached).
-    pub fn new(repo: R) -> Self {
+impl<S: BookStore> BookService<S> {
+    /// Create a service for the book `slug` in `store`.
+    pub fn new(store: S, slug: impl Into<String>) -> Self {
         Self {
-            repo,
-            changelog: None,
+            store,
+            slug: slug.into(),
         }
     }
 
-    /// ChangeLogRepository を設定する（builder パターン）。
-    pub fn with_changelog(mut self, changelog: Box<dyn ChangeLogRepository>) -> Self {
-        self.changelog = Some(changelog);
-        self
-    }
-
-    /// Bookを新規作成して永続化する。既存Bookがあれば上書き。
+    /// Bookを新規作成して永続化する。既存Bookがあれば上書き (event は記録しない)。
     pub async fn create_book(&self, title: &str, max_depth: u8) -> Result<TemplateBook, AppError> {
         let book = TemplateBook::new(title, max_depth);
-        self.repo
-            .save(&book)
-            .await
-            .map_err(|e| AppError::Storage(Box::new(e)))?;
+        let expected = self.current_version().await?;
+        self.commit(expected, &book, &[]).await?;
         Ok(book)
     }
 
     /// ノードを追加する。
     ///
-    /// 戻り値: `(NodeId, Option<String>)` — 第2要素は changelog 書き込み失敗時の警告メッセージ。
+    /// 戻り値: `(NodeId, Option<String>)` — 第2要素は store が返した警告 (legacy adapter の changelog 書き込み失敗のみ)。
     pub async fn add_node(
         &self,
         req: AddNodeRequest,
     ) -> Result<(NodeId, Option<String>), AppError> {
-        let mut book = self.load_book().await?;
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
         let id = book.add_node(req)?;
-        self.persist(&book).await?;
 
-        let after_json = book
-            .get_node(id)
-            .and_then(|n| serde_json::to_string(n).ok());
+        let after_json = node_json(&book, id);
         let entry = ChangeEntry::new(id, ChangeAction::Create, None, after_json, Timestamp::now());
-        let warning = self.append_changelog(entry).await;
+        let warnings = self.commit(Some(version), &book, &[entry]).await?;
 
-        Ok((id, warning))
+        Ok((id, join_warnings(warnings)))
     }
 
     /// ノードを更新する。
     ///
-    /// 戻り値: `((), Option<String>)` — 第2要素は changelog 書き込み失敗時の警告メッセージ。
+    /// 戻り値: `((), Option<String>)` — 第2要素は store が返した警告。
     pub async fn update_node(
         &self,
         id: NodeId,
         req: UpdateNodeRequest,
     ) -> Result<((), Option<String>), AppError> {
-        let mut book = self.load_book().await?;
-        let before_json = book
-            .get_node(id)
-            .and_then(|n| serde_json::to_string(n).ok());
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
+        let before_json = node_json(&book, id);
         book.update_node(id, req)?;
-        self.persist(&book).await?;
 
-        let after_json = book
-            .get_node(id)
-            .and_then(|n| serde_json::to_string(n).ok());
+        let after_json = node_json(&book, id);
         let entry = ChangeEntry::new(
             id,
             ChangeAction::Update,
@@ -83,30 +78,28 @@ impl<R: BookRepository> BookService<R> {
             after_json,
             Timestamp::now(),
         );
-        let warning = self.append_changelog(entry).await;
+        let warnings = self.commit(Some(version), &book, &[entry]).await?;
 
-        Ok(((), warning))
+        Ok(((), join_warnings(warnings)))
     }
 
     /// ノードを移動する。
     ///
-    /// 戻り値: `((), Option<String>)` — 第2要素は changelog 書き込み失敗時の警告メッセージ。
+    /// 戻り値: `((), Option<String>)` — 第2要素は store が返した警告。
     pub async fn move_node(
         &self,
         id: NodeId,
         new_parent: Option<NodeId>,
         position: usize,
     ) -> Result<((), Option<String>), AppError> {
-        let mut book = self.load_book().await?;
-        let before_json = book
-            .get_node(id)
-            .and_then(|n| serde_json::to_string(n).ok());
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
+        let before_json = node_json(&book, id);
         book.move_node(id, new_parent, position)?;
-        self.persist(&book).await?;
 
-        let after_json = book
-            .get_node(id)
-            .and_then(|n| serde_json::to_string(n).ok());
+        let after_json = node_json(&book, id);
         let entry = ChangeEntry::new(
             id,
             ChangeAction::Move,
@@ -114,21 +107,21 @@ impl<R: BookRepository> BookService<R> {
             after_json,
             Timestamp::now(),
         );
-        let warning = self.append_changelog(entry).await;
+        let warnings = self.commit(Some(version), &book, &[entry]).await?;
 
-        Ok(((), warning))
+        Ok(((), join_warnings(warnings)))
     }
 
     /// ノードを削除する（子孫ごと）。
     ///
-    /// 戻り値: `((), Option<String>)` — 第2要素は changelog 書き込み失敗時の警告メッセージ。
+    /// 戻り値: `((), Option<String>)` — 第2要素は store が返した警告。
     pub async fn remove_node(&self, id: NodeId) -> Result<((), Option<String>), AppError> {
-        let mut book = self.load_book().await?;
-        let before_json = book
-            .get_node(id)
-            .and_then(|n| serde_json::to_string(n).ok());
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
+        let before_json = node_json(&book, id);
         book.remove_node(id)?;
-        self.persist(&book).await?;
 
         let entry = ChangeEntry::new(
             id,
@@ -137,147 +130,199 @@ impl<R: BookRepository> BookService<R> {
             None,
             Timestamp::now(),
         );
-        let warning = self.append_changelog(entry).await;
+        let warnings = self.commit(Some(version), &book, &[entry]).await?;
 
-        Ok(((), warning))
+        Ok(((), join_warnings(warnings)))
     }
 
-    /// 複数ノードをアトミックに移動する（C案: 全成功 or 全保存なし）。
+    /// 複数ノードをアトミックに移動する（全成功 or 何も commit しない）。
     ///
     /// `moves` は `(NodeId, new_parent: Option<NodeId>, position: usize)` のリスト。
-    /// 戻り値: `(成功件数, changelog警告リスト)` — エラー時はErrを返しsaveしない。
+    /// 戻り値: `(成功件数, 警告リスト)`。警告リストは常に `moves.len()` 件で、
+    /// store の警告を先頭から詰める (event との対応は持たない。呼び出し側は flatten して使う)。
     pub async fn batch_move(
         &self,
         moves: Vec<(NodeId, Option<NodeId>, usize)>,
     ) -> Result<(usize, Vec<Option<String>>), AppError> {
-        let mut book = self.load_book().await?;
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
         let mut before_jsons: Vec<Option<String>> = Vec::with_capacity(moves.len());
 
         for (id, new_parent, position) in &moves {
-            let before_json = book
-                .get_node(*id)
-                .and_then(|n| serde_json::to_string(n).ok());
-            before_jsons.push(before_json);
+            before_jsons.push(node_json(&book, *id));
             book.move_node(*id, *new_parent, *position)?;
         }
 
-        self.persist(&book).await?;
+        let ts = Timestamp::now();
+        let entries: Vec<ChangeEntry> = moves
+            .iter()
+            .zip(before_jsons)
+            .map(|((id, _, _), before_json)| {
+                ChangeEntry::new(
+                    *id,
+                    ChangeAction::Move,
+                    before_json,
+                    node_json(&book, *id),
+                    ts,
+                )
+            })
+            .collect();
 
-        let mut warnings: Vec<Option<String>> = Vec::with_capacity(moves.len());
-        for (i, (id, _, _)) in moves.iter().enumerate() {
-            let before_json = before_jsons[i].clone();
-            let id = *id;
-            let after_json = book
-                .get_node(id)
-                .and_then(|n| serde_json::to_string(n).ok());
-            let entry = ChangeEntry::new(
-                id,
-                ChangeAction::Move,
-                before_json,
-                after_json,
-                Timestamp::now(),
-            );
-            let warning = self.append_changelog(entry).await;
-            warnings.push(warning);
+        if entries.is_empty() {
+            return Ok((0, Vec::new()));
         }
+        let warnings = self.commit(Some(version), &book, &entries).await?;
 
-        Ok((moves.len(), warnings))
+        Ok((moves.len(), spread_warnings(warnings, moves.len())))
     }
 
-    /// 複数ノードをアトミックに更新する（C案: 全成功 or 全保存なし）。
+    /// 複数ノードをアトミックに更新する（全成功 or 何も commit しない）。
     ///
     /// `updates` は `(NodeId, UpdateNodeRequest)` のリスト。
-    /// 戻り値: `(成功件数, changelog警告リスト)` — エラー時はErrを返しsaveしない。
+    /// 戻り値: `(成功件数, 警告リスト)`。警告リストの形は [`Self::batch_move`] と同じ。
     pub async fn batch_update(
         &self,
         updates: Vec<(NodeId, UpdateNodeRequest)>,
     ) -> Result<(usize, Vec<Option<String>>), AppError> {
-        let mut book = self.load_book().await?;
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
 
-        // before_jsonとnode_idを先に収集してからmutatbleな操作を実行する
         let mut before_jsons: Vec<Option<String>> = Vec::with_capacity(updates.len());
         let mut node_ids: Vec<NodeId> = Vec::with_capacity(updates.len());
 
-        for (id, req) in &updates {
-            let before_json = book
-                .get_node(*id)
-                .and_then(|n| serde_json::to_string(n).ok());
-            before_jsons.push(before_json);
-            node_ids.push(*id);
-            book.update_node(
-                *id,
-                UpdateNodeRequest {
-                    title: req.title.clone(),
-                    body: req.body.clone(),
-                    node_type: req.node_type.clone(),
-                    placeholder: req.placeholder.clone(),
-                    properties: req.properties.clone(),
-                    properties_patch: req.properties_patch.clone(),
-                    status: req.status,
-                },
-            )?;
+        for (id, req) in updates {
+            before_jsons.push(node_json(&book, id));
+            node_ids.push(id);
+            book.update_node(id, req)?;
         }
 
-        self.persist(&book).await?;
+        let ts = Timestamp::now();
+        let entries: Vec<ChangeEntry> = node_ids
+            .iter()
+            .zip(before_jsons)
+            .map(|(id, before_json)| {
+                ChangeEntry::new(
+                    *id,
+                    ChangeAction::Update,
+                    before_json,
+                    node_json(&book, *id),
+                    ts,
+                )
+            })
+            .collect();
 
-        let mut warnings: Vec<Option<String>> = Vec::with_capacity(node_ids.len());
-        for (i, id) in node_ids.iter().enumerate() {
-            let before_json = before_jsons[i].clone();
-            let id = *id;
-            let after_json = book
-                .get_node(id)
-                .and_then(|n| serde_json::to_string(n).ok());
-            let entry = ChangeEntry::new(
-                id,
-                ChangeAction::Update,
-                before_json,
-                after_json,
-                Timestamp::now(),
-            );
-            let warning = self.append_changelog(entry).await;
-            warnings.push(warning);
+        if entries.is_empty() {
+            return Ok((0, Vec::new()));
         }
+        let warnings = self.commit(Some(version), &book, &entries).await?;
 
-        Ok((node_ids.len(), warnings))
+        Ok((node_ids.len(), spread_warnings(warnings, node_ids.len())))
     }
 
     /// Tree全体または部分木を読み取る。
     pub async fn read_tree(&self) -> Result<TemplateBook, AppError> {
-        self.load_book().await
+        Ok(self.load_book().await?.value)
     }
 
-    /// インポートされたBookを保存する。
+    /// インポート / snapshot restore された Book を保存する (無ければ作成)。
+    ///
+    /// event は記録しない: 呼び出し側 (`import` / `snapshot_restore`) が
+    /// 自分の changelog entry を別途記録する現行の形を保つため。
     pub async fn save_book(&self, book: &TemplateBook) -> Result<(), AppError> {
-        self.persist(book).await
+        let expected = self.current_version().await?;
+        self.commit(expected, book, &[]).await?;
+        Ok(())
+    }
+
+    /// Replace the book with `book` (a snapshot being restored), recording a
+    /// `Restore` event for every node of `book` in the same commit.
+    ///
+    /// The book must exist: a restore goes over the version just read, so a
+    /// concurrent write between the read and this commit is a conflict rather
+    /// than being silently overwritten.
+    pub async fn restore_book(&self, book: &TemplateBook) -> Result<(), AppError> {
+        let version = self.load_book().await?.version;
+        let at = Timestamp::now();
+        let events: Vec<ChangeEntry> = book
+            .all_node_ids()
+            .map(|id| ChangeEntry::new(id, ChangeAction::Restore, None, None, at))
+            .collect();
+        self.commit(Some(version), book, &events).await?;
+        Ok(())
+    }
+
+    /// The book's recorded events, oldest first.
+    pub async fn history(&self) -> Result<Vec<ChangeEntry>, AppError> {
+        self.store.history(&self.slug).await.map_err(store_error)
+    }
+
+    /// One node's recorded events, oldest first.
+    pub async fn history_by_node(&self, id: NodeId) -> Result<Vec<ChangeEntry>, AppError> {
+        self.store
+            .history_by_node(&self.slug, id)
+            .await
+            .map_err(store_error)
     }
 
     // --- private ---
 
-    async fn load_book(&self) -> Result<TemplateBook, AppError> {
-        self.repo
-            .load()
+    async fn load_book(&self) -> Result<Versioned<TemplateBook>, AppError> {
+        self.store
+            .load(&self.slug)
             .await
-            .map_err(|e| AppError::Storage(Box::new(e)))?
+            .map_err(store_error)?
             .ok_or(AppError::BookNotFound)
     }
 
-    async fn persist(&self, book: &TemplateBook) -> Result<(), AppError> {
-        self.repo
-            .save(book)
+    async fn current_version(&self) -> Result<Option<i64>, AppError> {
+        Ok(self
+            .store
+            .load(&self.slug)
             .await
-            .map_err(|e| AppError::Storage(Box::new(e)))
+            .map_err(store_error)?
+            .map(|v| v.version))
     }
 
-    /// ChangeLog への追記をベストエフォートで実行する。
-    ///
-    /// changelog が None の場合はスキップ。失敗時は警告メッセージを返す（サイレント失敗禁止）。
-    async fn append_changelog(&self, entry: ChangeEntry) -> Option<String> {
-        let cl = self.changelog.as_ref()?;
-        cl.append(&entry)
+    async fn commit(
+        &self,
+        expected: Option<i64>,
+        book: &TemplateBook,
+        events: &[ChangeEntry],
+    ) -> Result<Vec<String>, AppError> {
+        self.store
+            .commit(&self.slug, expected, book, events)
             .await
-            .err()
-            .map(|e| format!("changelog: {e}"))
+            .map(|c| c.warnings)
+            .map_err(store_error)
     }
+}
+
+fn node_json(book: &TemplateBook, id: NodeId) -> Option<String> {
+    book.get_node(id)
+        .and_then(|n| serde_json::to_string(n).ok())
+}
+
+fn store_error(e: StoreError) -> AppError {
+    match e {
+        StoreError::Conflict { expected, actual } => AppError::Conflict { expected, actual },
+        StoreError::Backend(e) => AppError::Storage(e),
+    }
+}
+
+fn join_warnings(warnings: Vec<String>) -> Option<String> {
+    (!warnings.is_empty()).then(|| warnings.join("; "))
+}
+
+fn spread_warnings(warnings: Vec<String>, len: usize) -> Vec<Option<String>> {
+    let mut out = vec![None; len];
+    for (slot, w) in out.iter_mut().zip(warnings) {
+        *slot = Some(w);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +338,8 @@ mod tests {
     use crate::domain::model::node::NodeType;
     use crate::domain::model::timestamp::Timestamp;
     use crate::domain::repository::{BookRepository, ChangeLogRepository};
+    use crate::infra::legacy_shelf_store::LegacyShelfStore;
+    use crate::infra::memory_store::MemoryBookStore;
     use async_trait::async_trait;
     use std::sync::{Arc, Mutex};
 
@@ -393,11 +440,20 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
-    fn book_with_service() -> (TemplateBook, BookService<InMemoryBookRepo>) {
-        let book = TemplateBook::new("Test Book", 4);
-        let repo = InMemoryBookRepo::with_book(book.clone());
-        (book, BookService::new(repo))
+    type LegacyService = BookService<LegacyShelfStore<InMemoryBookRepo>>;
+
+    fn legacy(repo: InMemoryBookRepo) -> LegacyService {
+        BookService::new(LegacyShelfStore::new(repo), "test")
+    }
+
+    fn legacy_cl(repo: InMemoryBookRepo, cl: Box<dyn ChangeLogRepository>) -> LegacyService {
+        BookService::new(LegacyShelfStore::new(repo).with_changelog(cl), "test")
+    }
+
+    async fn memory_service() -> BookService<MemoryBookStore> {
+        let svc = BookService::new(MemoryBookStore::new(), "test");
+        svc.create_book("Test", 4).await.expect("create_book");
+        svc
     }
 
     fn add_req(title: &str) -> AddNodeRequest {
@@ -412,11 +468,140 @@ mod tests {
         }
     }
 
+    fn title_req(title: &str) -> UpdateNodeRequest {
+        UpdateNodeRequest {
+            title: Some(title.to_string()),
+            body: None,
+            node_type: None,
+            placeholder: None,
+            properties: None,
+            properties_patch: None,
+            status: None,
+        }
+    }
+
+    // ---- atomic store (MemoryBookStore) ----
+
+    #[tokio::test]
+    async fn test_memory_each_write_commits_its_event() {
+        let svc = memory_service().await;
+        let (a, w) = svc.add_node(add_req("A")).await.expect("add A");
+        assert!(w.is_none());
+        let (b, _) = svc.add_node(add_req("B")).await.expect("add B");
+        svc.update_node(a, title_req("A2")).await.expect("update");
+        svc.move_node(a, Some(b), 0).await.expect("move");
+
+        let actions: Vec<_> = svc
+            .history()
+            .await
+            .expect("history")
+            .into_iter()
+            .map(|e| (e.node_id, e.action))
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                (a, ChangeAction::Create),
+                (b, ChangeAction::Create),
+                (a, ChangeAction::Update),
+                (a, ChangeAction::Move),
+            ]
+        );
+        let a_history = svc.history_by_node(a).await.expect("history_by_node");
+        assert_eq!(a_history.len(), 3);
+        assert!(a_history.iter().all(|e| e.node_id == a));
+    }
+
+    #[tokio::test]
+    async fn test_memory_batch_is_one_commit_with_n_events() {
+        let svc = memory_service().await;
+        let (a, _) = svc.add_node(add_req("A")).await.expect("add A");
+        let (b, _) = svc.add_node(add_req("B")).await.expect("add B");
+        let before = svc.store.load("test").await.unwrap().unwrap().version;
+
+        let (count, warnings) = svc
+            .batch_update(vec![(a, title_req("A2")), (b, title_req("B2"))])
+            .await
+            .expect("batch_update");
+        assert_eq!(count, 2);
+        assert_eq!(warnings, vec![None, None]);
+
+        let after = svc.store.load("test").await.unwrap().unwrap().version;
+        assert_eq!(after, before + 1, "one batch must be one commit");
+        let updates = svc
+            .history()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == ChangeAction::Update)
+            .count();
+        assert_eq!(updates, 2);
+    }
+
+    #[tokio::test]
+    async fn test_memory_failed_batch_commits_nothing() {
+        let svc = memory_service().await;
+        let (a, _) = svc.add_node(add_req("A")).await.expect("add A");
+        let events_before = svc.history().await.unwrap().len();
+
+        let result = svc
+            .batch_move(vec![(a, None, 0), (NodeId::new(), None, 0)])
+            .await;
+        assert!(result.is_err());
+        assert_eq!(svc.history().await.unwrap().len(), events_before);
+    }
+
+    #[tokio::test]
+    async fn test_memory_stale_writer_gets_conflict() {
+        let store = MemoryBookStore::new();
+        let svc = BookService::new(store, "test");
+        svc.create_book("Test", 4).await.expect("create_book");
+        let (a, _) = svc.add_node(add_req("A")).await.expect("add A");
+
+        // A writer that read version n, while another writer commits n + 1.
+        let stale = svc.store.load("test").await.unwrap().unwrap();
+        svc.update_node(a, title_req("winner"))
+            .await
+            .expect("winner");
+        let err = svc
+            .store
+            .commit("test", Some(stale.version), &stale.value, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }));
+        assert!(matches!(
+            store_error(err),
+            AppError::Conflict {
+                expected: Some(_),
+                actual: Some(_)
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_memory_create_book_overwrites_existing() {
+        let svc = memory_service().await;
+        svc.add_node(add_req("A")).await.expect("add A");
+        let book = svc.create_book("Fresh", 3).await.expect("recreate");
+        let tree = svc.read_tree().await.expect("read_tree");
+        assert_eq!(tree.id(), book.id());
+        assert_eq!(tree.node_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_memory_book_not_found() {
+        let svc = BookService::new(MemoryBookStore::new(), "missing");
+        let err = svc.add_node(add_req("x")).await.unwrap_err();
+        assert!(matches!(err, AppError::BookNotFound));
+    }
+
+    // ---- legacy shelf store (today's server behavior) ----
+
     #[tokio::test]
     async fn test_add_node_no_changelog_returns_none_warning() {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
-        let svc = BookService::new(repo);
+        let svc = legacy(repo);
         let (_, warning) = svc.add_node(add_req("Node A")).await.expect("add_node");
         assert!(warning.is_none(), "no changelog should produce no warning");
     }
@@ -451,7 +636,7 @@ mod tests {
             }
         }
 
-        let svc = BookService::new(repo).with_changelog(Box::new(ArcChangeLog(cl_clone)));
+        let svc = legacy_cl(repo, Box::new(ArcChangeLog(cl_clone)));
         let (id, warning) = svc.add_node(add_req("Node A")).await.expect("add_node");
 
         assert!(
@@ -471,7 +656,7 @@ mod tests {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
         let cl = RecordingChangeLog::failing();
-        let svc = BookService::new(repo).with_changelog(Box::new(cl));
+        let svc = legacy_cl(repo, Box::new(cl));
         let (_, warning) = svc.add_node(add_req("Node A")).await.expect("add_node");
         assert!(
             warning.is_some(),
@@ -488,19 +673,13 @@ mod tests {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
         let cl = RecordingChangeLog::new();
-        let svc = BookService::new(repo).with_changelog(Box::new(cl));
+        let svc = legacy_cl(repo, Box::new(cl));
 
         let (id, _) = svc.add_node(add_req("original title")).await.expect("add");
-        let update_req = UpdateNodeRequest {
-            title: Some("updated title".to_string()),
-            body: None,
-            node_type: None,
-            placeholder: None,
-            properties: None,
-            properties_patch: None,
-            status: None,
-        };
-        let ((), warning) = svc.update_node(id, update_req).await.expect("update");
+        let ((), warning) = svc
+            .update_node(id, title_req("updated title"))
+            .await
+            .expect("update");
         assert!(warning.is_none());
     }
 
@@ -509,7 +688,7 @@ mod tests {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
         let cl = RecordingChangeLog::new();
-        let svc = BookService::new(repo).with_changelog(Box::new(cl));
+        let svc = legacy_cl(repo, Box::new(cl));
 
         let (id, _) = svc.add_node(add_req("to be removed")).await.expect("add");
         let ((), warning) = svc.remove_node(id).await.expect("remove");
@@ -521,7 +700,7 @@ mod tests {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
         let cl = RecordingChangeLog::new();
-        let svc = BookService::new(repo).with_changelog(Box::new(cl));
+        let svc = legacy_cl(repo, Box::new(cl));
 
         let (id, _) = svc.add_node(add_req("node to move")).await.expect("add");
         let ((), warning) = svc.move_node(id, None, 0).await.expect("move");
@@ -531,17 +710,16 @@ mod tests {
     #[tokio::test]
     async fn test_book_not_found_error() {
         let repo = InMemoryBookRepo::empty();
-        let svc = BookService::new(repo);
+        let svc = legacy(repo);
         let err = svc.add_node(add_req("x")).await.unwrap_err();
         assert!(matches!(err, AppError::BookNotFound));
     }
 
     #[tokio::test]
-    async fn test_with_changelog_builder_does_not_break_existing_new() {
-        // with_changelog を呼ばない場合でも動作すること
+    async fn test_without_changelog_still_works() {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
-        let svc = BookService::new(repo); // with_changelog なし
+        let svc = legacy(repo);
         let (id, _) = svc.add_node(add_req("x")).await.expect("add");
         let tree = svc.read_tree().await.expect("read_tree");
         assert!(tree.get_node(id).is_some());
@@ -560,7 +738,7 @@ mod tests {
     async fn test_batch_move_empty_succeeds() {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
-        let svc = BookService::new(repo);
+        let svc = legacy(repo);
         let (count, warnings) = svc.batch_move(vec![]).await.expect("batch_move empty");
         assert_eq!(count, 0);
         assert!(warnings.is_empty());
@@ -570,7 +748,7 @@ mod tests {
     async fn test_batch_move_single_node() {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
-        let svc = BookService::new(repo);
+        let svc = legacy(repo);
 
         let (id_a, _) = svc.add_node(add_req("Node A")).await.expect("add_node A");
         let (id_b, _) = svc.add_node(add_req("Node B")).await.expect("add_node B");
@@ -588,7 +766,7 @@ mod tests {
     async fn test_batch_move_invalid_node_returns_error_no_save() {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
-        let svc = BookService::new(repo);
+        let svc = legacy(repo);
 
         let (id_a, _) = svc.add_node(add_req("Node A")).await.expect("add_node A");
 
@@ -610,17 +788,17 @@ mod tests {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
         let cl = RecordingChangeLog::new();
-        let svc = BookService::new(repo).with_changelog(Box::new(cl));
+        let svc = legacy_cl(repo, Box::new(cl));
 
         let (id_a, _) = svc.add_node(add_req("Node A")).await.expect("add_node A");
         let (id_b, _) = svc.add_node(add_req("Node B")).await.expect("add_node B");
 
-        let (count, _warnings) = svc
+        let (count, warnings) = svc
             .batch_move(vec![(id_a, Some(id_b), 0)])
             .await
             .expect("batch_move");
         assert_eq!(count, 1);
-        // No warning expected for successful changelog
+        assert_eq!(warnings, vec![None]);
     }
 
     // ---- batch_update tests ----
@@ -629,7 +807,7 @@ mod tests {
     async fn test_batch_update_empty_succeeds() {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
-        let svc = BookService::new(repo);
+        let svc = legacy(repo);
         let (count, warnings) = svc.batch_update(vec![]).await.expect("batch_update empty");
         assert_eq!(count, 0);
         assert!(warnings.is_empty());
@@ -639,21 +817,12 @@ mod tests {
     async fn test_batch_update_single_node_title() {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
-        let svc = BookService::new(repo);
+        let svc = legacy(repo);
 
         let (id, _) = svc.add_node(add_req("Original")).await.expect("add_node");
 
-        let req = UpdateNodeRequest {
-            title: Some("Updated".to_string()),
-            body: None,
-            node_type: None,
-            placeholder: None,
-            properties: None,
-            properties_patch: None,
-            status: None,
-        };
         let (count, warnings) = svc
-            .batch_update(vec![(id, req)])
+            .batch_update(vec![(id, title_req("Updated"))])
             .await
             .expect("batch_update");
         assert_eq!(count, 1);
@@ -667,37 +836,14 @@ mod tests {
     async fn test_batch_update_multiple_nodes() {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
-        let svc = BookService::new(repo);
+        let svc = legacy(repo);
 
         let (id_a, _) = svc.add_node(add_req("Alpha")).await.expect("add_node A");
         let (id_b, _) = svc.add_node(add_req("Beta")).await.expect("add_node B");
 
-        let updates = vec![
-            (
-                id_a,
-                UpdateNodeRequest {
-                    title: Some("Alpha Updated".to_string()),
-                    body: None,
-                    node_type: None,
-                    placeholder: None,
-                    properties: None,
-                    properties_patch: None,
-                    status: None,
-                },
-            ),
-            (
-                id_b,
-                UpdateNodeRequest {
-                    title: Some("Beta Updated".to_string()),
-                    body: None,
-                    node_type: None,
-                    placeholder: None,
-                    properties: None,
-                    properties_patch: None,
-                    status: Some(NodeStatus::Draft),
-                },
-            ),
-        ];
+        let mut beta = title_req("Beta Updated");
+        beta.status = Some(NodeStatus::Draft);
+        let updates = vec![(id_a, title_req("Alpha Updated")), (id_b, beta)];
 
         let (count, warnings) = svc.batch_update(updates).await.expect("batch_update");
         assert_eq!(count, 2);
@@ -715,7 +861,7 @@ mod tests {
     async fn test_batch_update_invalid_node_returns_error() {
         let book = TemplateBook::new("Test", 4);
         let repo = InMemoryBookRepo::with_book(book);
-        let svc = BookService::new(repo);
+        let svc = legacy(repo);
 
         let (id_a, _) = svc.add_node(add_req("Node A")).await.expect("add_node A");
 
@@ -726,30 +872,8 @@ mod tests {
 
         let result = svc
             .batch_update(vec![
-                (
-                    id_a,
-                    UpdateNodeRequest {
-                        title: Some("A Updated".to_string()),
-                        body: None,
-                        node_type: None,
-                        placeholder: None,
-                        properties: None,
-                        properties_patch: None,
-                        status: None,
-                    },
-                ),
-                (
-                    fake_id,
-                    UpdateNodeRequest {
-                        title: Some("Fake".to_string()),
-                        body: None,
-                        node_type: None,
-                        placeholder: None,
-                        properties: None,
-                        properties_patch: None,
-                        status: None,
-                    },
-                ),
+                (id_a, title_req("A Updated")),
+                (fake_id, title_req("Fake")),
             ])
             .await;
         assert!(
