@@ -1,6 +1,10 @@
 target
-.claude
 .worktrees
 .ryo
 .mcp.json
 workspace
+# Claude Code's working directory and personal instruction files stay local; the only tracked
+# file under .claude/ is the CLAUDE.md symlink to AGENTS.md.
+.claude/*
+CLAUDE*.md
+!.claude/CLAUDE.md
