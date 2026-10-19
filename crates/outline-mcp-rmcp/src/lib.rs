@@ -29,6 +29,7 @@
 //! the server directly (e.g. as part of a larger MCP host) can construct
 //! [`OutlineMcpServer`] and drive it with any `rmcp` transport.
 
+mod health;
 mod helpers;
 mod request;
 mod resources;

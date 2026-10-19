@@ -1,5 +1,7 @@
 /// Domain error types (`DomainError`).
 pub mod error;
+/// Read-only book health checks: `lint` and `stats`.
+pub mod health;
 /// Domain model types: `TemplateBook`, nodes, IDs, changelog entries.
 pub mod model;
 /// Persistence-abstraction traits implemented by the `infra` layer.

@@ -71,6 +71,7 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
                                    checklist / import / init / book_update / book_delete / gen_routing
                                    snapshot_create / snapshot_list / snapshot_restore / snapshot_delete
                                    node_history / dump
+                                   book_lint / book_stats (read-only health)
 ```
 
 1. **`init`** — Create a new empty book
@@ -90,6 +91,8 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 15. **`dump`** — Export full book as JSON file
 16. **`book_delete`** — Delete a book with its nodes, history and snapshots (cannot be undone). The slug is required; a book with any nodes, history or snapshots needs `force: true`, and `dry_run: true` only reports what would be removed. A write to the book between the check and the delete makes the delete fail without removing anything
 17. **`book_update`** — Change a book's title and / or `max_depth` (slug required). Lowering `max_depth` below an existing node's depth is refused and names that node; the change appears in `book_history` as a `book_update` entry
+18. **`book_lint`** — Read-only structural checks on a book (`slug` defaults to the selected book): content nodes at the root, similar titles (Jaccard over title words; character pairs for CJK; `threshold` default 0.6; pairs where both titles are a single token are skipped unless the titles are identical), property keys differing only by case / `_` / `-` / spaces, sections without children, drafts not updated for `stale_days` (default 90). `checks` runs a subset; `limit` (default 50) caps findings per check and counts the rest; `format: "json"` for programs
+19. **`book_stats`** — Read-only numbers for a book: node counts, max / mean depth, children per section (max, mean, histogram), counts by status, injected nodes, update recency, distinct property keys; `format: "json"` for programs
 
 ### Node IDs
 

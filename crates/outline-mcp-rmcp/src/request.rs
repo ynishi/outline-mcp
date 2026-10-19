@@ -281,6 +281,38 @@ pub(crate) struct McpBookUpdateRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpBookLintRequest {
+    #[schemars(description = "Book to check (from `shelf`). Omit to check the selected book.")]
+    pub slug: Option<String>,
+    #[schemars(
+        description = "Checks to run (default: all): root_content, similar_titles, property_key_variants, empty_sections, stale_drafts"
+    )]
+    pub checks: Option<Vec<String>>,
+    #[schemars(
+        description = "Minimum title similarity for similar_titles, 0 < t <= 1 (Jaccard over title words; CJK titles use character pairs). Default 0.6"
+    )]
+    pub threshold: Option<f64>,
+    #[schemars(
+        description = "Maximum findings reported per check (default 50); the rest are counted"
+    )]
+    pub limit: Option<usize>,
+    #[schemars(
+        description = "A draft not updated for more than this many days is stale (default 90)"
+    )]
+    pub stale_days: Option<u32>,
+    #[schemars(description = "Output format: 'text' (default) or 'json'")]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpBookStatsRequest {
+    #[schemars(description = "Book to measure (from `shelf`). Omit to measure the selected book.")]
+    pub slug: Option<String>,
+    #[schemars(description = "Output format: 'text' (default) or 'json'")]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct McpBookDeleteRequest {
     #[schemars(
         description = "Slug of the book to delete (from `shelf`). Required: the selected book is never deleted implicitly."

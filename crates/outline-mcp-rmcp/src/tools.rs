@@ -15,13 +15,13 @@ use crate::helpers::{
 use crate::request::{
     normalize_text, parse_node_id, parse_node_status, parse_node_type, sanitize_for_filename,
     unescape_newlines, validate_filename, validate_import_path, validate_slug, McpBatchMoveRequest,
-    McpBatchUpdateRequest, McpBookDeleteRequest, McpBookHistoryRequest, McpBookUpdateRequest,
-    McpDumpRequest, McpEjectRequest, McpGenRoutingRequest, McpImportRequest, McpInitRequest,
-    McpNodeCreateRequest, McpNodeHistoryRequest, McpNodeMoveRequest, McpNodeQueryRequest,
-    McpNodeUpdateRequest, McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest,
-    McpSnapshotDeleteRequest, McpSnapshotDiffRequest, McpSnapshotDumpAllRequest,
-    McpSnapshotDumpRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest,
-    McpSnapshotTagRequest, McpTocRequest,
+    McpBatchUpdateRequest, McpBookDeleteRequest, McpBookHistoryRequest, McpBookLintRequest,
+    McpBookStatsRequest, McpBookUpdateRequest, McpDumpRequest, McpEjectRequest,
+    McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpNodeCreateRequest,
+    McpNodeHistoryRequest, McpNodeMoveRequest, McpNodeQueryRequest, McpNodeUpdateRequest,
+    McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest, McpSnapshotDeleteRequest,
+    McpSnapshotDiffRequest, McpSnapshotDumpAllRequest, McpSnapshotDumpRequest,
+    McpSnapshotListRequest, McpSnapshotRestoreRequest, McpSnapshotTagRequest, McpTocRequest,
 };
 use crate::server::OutlineMcpServer;
 
@@ -523,6 +523,64 @@ impl OutlineMcpServer {
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             msg,
         )]))
+    }
+
+    #[tool(
+        name = "book_lint",
+        description = "Check a book for structural smells, read-only: content nodes at the root (root_content), pairs of nodes with similar titles (similar_titles; Jaccard over title words, character pairs for CJK; two single-token titles are paired only when identical), property keys that differ only by case / `_` / `-` / spaces (property_key_variants), sections without children (empty_sections), and drafts not updated for `stale_days` (stale_drafts). Reports node toc IDs and UUIDs; changes nothing. `slug` defaults to the selected book. Use `format: \"json\"` when a program reads the result.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn book_lint(
+        &self,
+        Parameters(req): Parameters<McpBookLintRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let format = parse_query_format(req.format.as_deref())?;
+        let opts = crate::health::lint_options(&req)?;
+        let (slug, book) = self.report_target(req.slug.as_deref()).await?;
+        let report = outline_mcp_core::domain::health::lint(&book, &opts);
+        Ok(match format {
+            QueryFormat::Json => {
+                CallToolResult::structured(crate::health::lint_json(&book, &slug, &report))
+            }
+            QueryFormat::Text => CallToolResult::success(vec![rmcp::model::Content::text(
+                crate::health::lint_text(&book, &slug, &report),
+            )]),
+        })
+    }
+
+    #[tool(
+        name = "book_stats",
+        description = "Measure a book, read-only: node counts (sections / content), max and mean depth, children per section (max, mean, histogram), counts by status, injected nodes (inject=true), how recently nodes were updated (≤7d / 7–30d / 30–90d / older / unknown), and distinct property keys. Changes nothing. `slug` defaults to the selected book. Use `format: \"json\"` when a program reads the result.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn book_stats(
+        &self,
+        Parameters(req): Parameters<McpBookStatsRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let format = parse_query_format(req.format.as_deref())?;
+        let (slug, book) = self.report_target(req.slug.as_deref()).await?;
+        let stats = outline_mcp_core::domain::health::stats(
+            &book,
+            outline_mcp_core::domain::model::timestamp::Timestamp::now(),
+        );
+        Ok(match format {
+            QueryFormat::Json => {
+                CallToolResult::structured(crate::health::stats_json(&book, &slug, &stats))
+            }
+            QueryFormat::Text => CallToolResult::success(vec![rmcp::model::Content::text(
+                crate::health::stats_text(&book, &slug, &stats),
+            )]),
+        })
     }
 
     #[tool(
@@ -2958,5 +3016,200 @@ mod ergonomics_tool_tests {
             .filter(|e| e.action == ChangeAction::Delete)
             .count();
         assert_eq!(deletes, 3);
+    }
+}
+
+#[cfg(test)]
+mod health_tool_tests {
+    use std::sync::Arc;
+
+    use outline_mcp_core::domain::model::id::NodeId;
+    use outline_mcp_core::domain::model::node::NodeType;
+    use outline_mcp_core::domain::store::BookStore;
+    use outline_mcp_core::infra::memory_store::{MemoryBookStore, MemorySnapshotStore};
+
+    use super::*;
+    use crate::server::Storage;
+
+    fn add_req(parent: Option<NodeId>, title: &str, ty: NodeType) -> AddNodeRequest {
+        AddNodeRequest {
+            parent,
+            title: title.to_string(),
+            node_type: ty,
+            body: None,
+            placeholder: None,
+            position: usize::MAX,
+            properties: HashMap::new(),
+        }
+    }
+
+    async fn server_with_book() -> (OutlineMcpServer, Arc<MemoryBookStore>) {
+        let books = Arc::new(MemoryBookStore::new());
+        let server = OutlineMcpServer::new(Storage::new(
+            books.clone(),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        let svc = server.service_for("h").await.unwrap();
+        svc.create_book("Health", 4).await.unwrap();
+        svc.add_node(add_req(None, "Loose note", NodeType::Content))
+            .await
+            .unwrap();
+        svc.add_node(add_req(None, "Empty section", NodeType::Section))
+            .await
+            .unwrap();
+        let (g, _) = svc
+            .add_node(add_req(None, "Git", NodeType::Section))
+            .await
+            .unwrap();
+        svc.add_node(add_req(
+            Some(g),
+            "Git branching strategy",
+            NodeType::Content,
+        ))
+        .await
+        .unwrap();
+        svc.add_node(add_req(
+            Some(g),
+            "git branching strategy v2",
+            NodeType::Content,
+        ))
+        .await
+        .unwrap();
+        (server, books)
+    }
+
+    fn lint_req(slug: Option<&str>, format: Option<&str>) -> McpBookLintRequest {
+        McpBookLintRequest {
+            slug: slug.map(str::to_string),
+            checks: None,
+            threshold: None,
+            limit: None,
+            stale_days: None,
+            format: format.map(str::to_string),
+        }
+    }
+
+    fn text(r: &CallToolResult) -> String {
+        r.content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn lint_and_stats_change_nothing_and_report_findings() {
+        let (server, books) = server_with_book().await;
+        let before = books.load("h").await.unwrap().unwrap().version;
+        let history_before = books.history("h").await.unwrap().len();
+
+        let r = server
+            .book_lint(Parameters(lint_req(Some("h"), None)))
+            .await
+            .expect("lint");
+        let t = text(&r);
+        assert!(t.contains("## root_content (1)"), "{t}");
+        assert!(t.contains("## empty_sections (1)"), "{t}");
+        assert!(t.contains("## similar_titles (1)"), "{t}");
+        assert!(t.contains("## stale_drafts: none"), "{t}");
+
+        let j = server
+            .book_lint(Parameters(lint_req(Some("h"), Some("json"))))
+            .await
+            .expect("lint json");
+        let v = j.structured_content.expect("structured");
+        assert_eq!(v["book"], "h");
+        let kinds: Vec<&str> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"similar_titles"), "{kinds:?}");
+        let sim = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["kind"] == "similar_titles")
+            .unwrap();
+        assert_eq!(sim["nodes"].as_array().unwrap().len(), 2);
+        assert!(sim["nodes"][0]["toc_id"].is_string());
+
+        let s = server
+            .book_stats(Parameters(McpBookStatsRequest {
+                slug: Some("h".into()),
+                format: Some("json".into()),
+            }))
+            .await
+            .expect("stats");
+        let sv = s.structured_content.expect("structured");
+        assert_eq!(sv["nodes"], 5);
+        assert_eq!(sv["sections"], 2);
+        assert_eq!(sv["max_depth"], 2);
+        let st = server
+            .book_stats(Parameters(McpBookStatsRequest {
+                slug: Some("h".into()),
+                format: None,
+            }))
+            .await
+            .expect("stats text");
+        assert!(
+            text(&st).contains("Nodes: 5 (2 sections, 3 content)"),
+            "{}",
+            text(&st)
+        );
+
+        assert_eq!(books.load("h").await.unwrap().unwrap().version, before);
+        assert_eq!(books.history("h").await.unwrap().len(), history_before);
+    }
+
+    #[tokio::test]
+    async fn selected_book_is_the_default_and_unknown_slug_errors() {
+        let (server, _) = server_with_book().await;
+        let err = server
+            .book_lint(Parameters(lint_req(None, None)))
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("No book selected"), "{}", err.message);
+
+        *server.selected.write().unwrap() = Some("h".into());
+        assert!(server
+            .book_lint(Parameters(lint_req(None, None)))
+            .await
+            .is_ok());
+
+        let err = server
+            .book_stats(Parameters(McpBookStatsRequest {
+                slug: Some("missing".into()),
+                format: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("Book 'missing' not found"),
+            "{}",
+            err.message
+        );
+
+        let mut bad = lint_req(Some("h"), None);
+        bad.checks = Some(vec!["nope".into()]);
+        assert!(server.book_lint(Parameters(bad)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn lint_limit_reports_how_many_more() {
+        let (server, _) = server_with_book().await;
+        let svc = server.service_for("h").await.unwrap();
+        for i in 0..3 {
+            svc.add_node(add_req(None, &format!("Empty {i}"), NodeType::Section))
+                .await
+                .unwrap();
+        }
+        let mut req = lint_req(Some("h"), None);
+        req.checks = Some(vec!["empty_sections".into()]);
+        req.limit = Some(2);
+        let t = text(&server.book_lint(Parameters(req)).await.unwrap());
+        assert!(t.contains("## empty_sections (4)"), "{t}");
+        assert!(t.contains("… 2 more not shown"), "{t}");
     }
 }
