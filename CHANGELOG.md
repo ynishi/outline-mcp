@@ -15,6 +15,14 @@ All notable changes to this project will be documented in this file.
 - **`snapshot_delete`** (#10) — deletes one snapshot of the selected book, by the timestamp `snapshot_list` shows. A labeled snapshot is refused without `force: true`; an unknown timestamp is an error. The book is not changed, so nothing is added to its history.
 - **`book_update`** (#9) — changes a book's title and / or `max_depth` (slug required, at least one field). Lowering `max_depth` below an existing node's depth is refused and names the deepest node; an empty title is refused. The change is one commit with a new `book_update` history entry (a book-level entry: no node, before / after `{"title","max_depth"}`), listed by `book_history`; setting the values a book already has commits nothing. `snapshot_restore` and `import` record the same entry when the restored or imported book's title or `max_depth` differs from the current one. Earlier versions cannot read `book_update` entries: after downgrading, `book_history` of a book that has one fails to load.
 
+- **Agent ergonomics** (#3):
+  - `node_query` takes `text`, a case-insensitive substring of title or body (CJK included), combined with the other filters; results carry a snippet around the first body match (`Match:` line, or `snippet` in JSON).
+  - `toc` takes `max_depth` (depth from the book root, `1` = root level only, also under `subtree_root`) and `limit`, and closes with a line counting the nodes left out.
+  - `node_create`, `node_move` and `node_batch_move` result lines end with ` (id: <uuid>)` — always the last element of the line — which the UUID-only batch tools accept directly.
+  - `node_move` and `node_batch_move` name the descendants that moved or were removed with a node (up to ten titles), before the id: `Moved → 2-1. Git with 2 descendants: a, b (id: …)`. The remove result changes wording: `Removed: 2-1. Git and 2 descendants: a, b (id: …)`, or `Removed: 2-1. Git (id: …)` without descendants (it used to end with `(and descendants)` in every case).
+  - Both take `dry_run` to list every node that would move or be removed, old → new position, without changing anything; in a batch each node is listed once even when a moved node's descendant is itself in the batch.
+  - A rejected move or remove (cycle, depth limit, unknown node) is an invalid-params error in both dry and real runs.
+
 ### Changed
 
 - **Docker image builds with Rust 1.97** (was 1.88). sqlx 0.9 requires rustc 1.94 or later, so the image no longer built.
@@ -32,6 +40,7 @@ All notable changes to this project will be documented in this file.
 
 - **Each HTTP session has its own selected book** (#6). Every streamable-HTTP session used to share one selection, so `select_book` (or `init`) in one session redirected the next write of every other session into that book. Sessions now share the storage but start with no book selected and keep their own selection; stdio is unchanged.
 - **`import` records the replacement in history** (#11). The tool replaced the selected book without writing any history, so `book_history` / `node_history` showed nothing of it. It now commits the new tree together with a delete entry per removed node and a create entry per imported node, and reports how many entries were recorded. Imported nodes get new ids, so re-importing an unchanged export still records every node as deleted and created; the deleted nodes' history stays readable through `node_history` with their full UUID. No MCP tool changes a book's nodes without recording it any more (the book's title and `max_depth` are not part of history; see #9).
+- **Removing a node records every removed node** (#3). `node_move` with `action: "remove"` deleted the node's descendants too but recorded a history entry only for the node itself, so a descendant's `node_history` never showed its deletion. Each removed node now gets a delete entry, with its content before removal, in the same commit. A move still records a move for the moved node only; its descendants keep their parent.
 
 ### Security
 

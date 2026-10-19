@@ -44,6 +44,113 @@ pub(crate) fn format_toc(book: &TemplateBook, nodes: &[&TemplateNode]) -> String
     output
 }
 
+/// The toc of `nodes` limited to `max_depth` (from the book root) and
+/// `limit` nodes, with a closing line counting what was left out.
+pub(crate) fn format_toc_limited(
+    book: &TemplateBook,
+    nodes: &[&TemplateNode],
+    max_depth: Option<u8>,
+    limit: Option<usize>,
+) -> String {
+    let within_depth: Vec<&TemplateNode> = nodes
+        .iter()
+        .copied()
+        .filter(|n| max_depth.is_none_or(|d| book.depth_of(n.id()) <= d))
+        .collect();
+    let shown: Vec<&TemplateNode> = match limit {
+        Some(l) => within_depth.iter().copied().take(l).collect(),
+        None => within_depth,
+    };
+    let hidden = nodes.len() - shown.len();
+    let mut out = format_toc(book, &shown);
+    if hidden > 0 {
+        out.push_str(&format!(
+            "… {hidden} more nodes not shown (raise max_depth / limit)\n"
+        ));
+    }
+    out
+}
+
+/// ` (id: <uuid>)` — appended to result lines so the id can go straight into
+/// the UUID-only batch tools.
+pub(crate) fn id_suffix(id: NodeId) -> String {
+    format!(" (id: {id})")
+}
+
+/// At most this many descendant titles are listed in a result line.
+const DESCENDANT_TITLES_SHOWN: usize = 10;
+
+/// ` <connector> N descendants: a, b, …` (e.g. ` with 2 descendants: a, b`)
+/// for the descendants of `id` in `book` (titles capped at ten), or an empty
+/// string when it has none. Result lines put this before [`id_suffix`], so
+/// ` (id: <uuid>)` stays the last element of the line.
+pub(crate) fn describe_descendants(book: &TemplateBook, id: NodeId, connector: &str) -> String {
+    let desc = book.descendant_ids(id);
+    if desc.is_empty() {
+        return String::new();
+    }
+    let titles: Vec<&str> = desc
+        .iter()
+        .take(DESCENDANT_TITLES_SHOWN)
+        .filter_map(|d| book.get_node(*d).map(|n| n.title()))
+        .collect();
+    let more = desc.len().saturating_sub(DESCENDANT_TITLES_SHOWN);
+    let noun = if desc.len() == 1 {
+        "descendant"
+    } else {
+        "descendants"
+    };
+    let mut s = format!(" {connector} {} {noun}: {}", desc.len(), titles.join(", "));
+    if more > 0 {
+        s.push_str(&format!(", … (+{more} more)"));
+    }
+    s
+}
+
+/// One line per node of the subtree rooted at `id` — the node and each
+/// descendant — as `old → new` hierarchical positions between two versions of
+/// the book. A node missing from `after` is shown as removed.
+pub(crate) fn describe_subtree_change(
+    before: &TemplateBook,
+    after: &TemplateBook,
+    id: NodeId,
+) -> String {
+    describe_subtrees_change(before, after, &[id])
+}
+
+/// [`describe_subtree_change`] for several subtree roots at once (a batch):
+/// every node of every subtree is listed once, in first-seen order, even when
+/// one root is a descendant of another. Positions come from `after`, the
+/// book with every operation applied in order, so they match the real result.
+pub(crate) fn describe_subtrees_change(
+    before: &TemplateBook,
+    after: &TemplateBook,
+    roots: &[NodeId],
+) -> String {
+    let before_ids = build_hierarchical_ids(before);
+    let after_ids = build_hierarchical_ids(after);
+    let pos = |ids: &[(String, NodeId)], n: NodeId| {
+        ids.iter().find(|(_, x)| *x == n).map(|(h, _)| h.clone())
+    };
+    let mut seen = std::collections::HashSet::new();
+    let nodes: Vec<NodeId> = roots
+        .iter()
+        .flat_map(|&r| std::iter::once(r).chain(before.descendant_ids(r)))
+        .filter(|n| seen.insert(*n))
+        .collect();
+    let mut out = String::new();
+    for n in nodes {
+        let title = before.get_node(n).map(|x| x.title()).unwrap_or("?");
+        let old = pos(&before_ids, n).unwrap_or_else(|| "?".into());
+        let line = match pos(&after_ids, n) {
+            Some(new) => format!("  {old}. {title} → {new}{}\n", id_suffix(n)),
+            None => format!("  {old}. {title} → removed{}\n", id_suffix(n)),
+        };
+        out.push_str(&line);
+    }
+    out
+}
+
 /// 階層番号かどうか判定（`1`, `2-3`, `1-2-1` 等）
 pub(crate) fn is_hierarchical_id(s: &str) -> bool {
     !s.is_empty()

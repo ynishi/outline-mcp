@@ -548,6 +548,9 @@ impl OutlineMcpServer {
             AppError::BookNotFound | AppError::Conflict { actual: None, .. } => {
                 McpError::invalid_params(BOOK_GONE, None)
             }
+            // A rejected request (cycle, depth, unknown node, …) is the
+            // caller's input, whether it came from a dry run or a real run.
+            e @ AppError::Domain(_) => McpError::invalid_params(format!("{e}"), None),
             e => McpError::internal_error(format!("{e}"), None),
         }
     }
@@ -697,8 +700,11 @@ impl ServerHandler for OutlineMcpServer {
                  `checklist` for task export. `init` for new book, `book_update` to retitle or change max_depth, `book_delete` to remove one.\n\
                  History: `snapshot_create`/`snapshot_list`/`snapshot_restore`/`snapshot_delete` for versioning. \
                  `node_history` for change tracking. `dump` for full export.\n\
-                 Batch: `node_batch_move`/`node_batch_update` for bulk operations (UUID required). \
-                 Query: `node_query` for searching nodes by properties/status/type.\n\
+                 Batch: `node_batch_move`/`node_batch_update` for bulk operations (UUID required; \
+                 `node_create` and `node_move` return it). `node_move`/`node_batch_move` take \
+                 `dry_run` to preview what moves along with a node.\n\
+                 Query: `node_query` for searching nodes by properties/status/type/`text`. \
+                 On a large book use `toc` with `max_depth`/`limit`.\n\
                  Resources: read guides via `outline://guides/<name>` (see `resources/list`).",
             )
     }
