@@ -38,6 +38,33 @@ pub enum DomainError {
     )]
     InvalidLinkRel(String),
 
+    /// A revision must change at least one of title, body, properties.
+    #[error("a revision must change the title, the body or the properties")]
+    EmptyRevision,
+
+    /// The proposed revision would leave the node exactly as it is.
+    #[error("node {0}: the revision would change nothing")]
+    RevisionChangesNothing(NodeId),
+
+    /// The node already has a pending revision.
+    #[error("node {0} already has a pending revision; review it, or propose with replace: true")]
+    ProposalExists(NodeId),
+
+    /// The node has no pending revision.
+    #[error("node {0} has no pending revision")]
+    NoProposal(NodeId),
+
+    /// The node changed after the revision was proposed.
+    #[error(
+        "node {0} changed after the revision was proposed; review it with revision_show, \
+         then approve with force: true or reject it"
+    )]
+    StaleProposal(NodeId),
+
+    /// Revisions are not proposed for, or applied to, archived nodes.
+    #[error("node {0} is archived (or under an archived section); revisions do not apply to it")]
+    RevisionOnArchived(NodeId),
+
     /// A book title must not be empty (or whitespace only).
     #[error("book title must not be empty")]
     EmptyBookTitle,

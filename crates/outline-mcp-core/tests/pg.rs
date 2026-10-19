@@ -7,7 +7,7 @@ use outline_mcp_core::application::error::AppError;
 use outline_mcp_core::application::service::BookService;
 use outline_mcp_core::domain::model::book::{AddNodeRequest, TemplateBook, UpdateNodeRequest};
 use outline_mcp_core::domain::model::changelog::{ChangeAction, ChangeEntry};
-use outline_mcp_core::domain::model::node::NodeType;
+use outline_mcp_core::domain::model::node::{BodyChange, NodeType, Revision};
 use outline_mcp_core::domain::model::timestamp::Timestamp;
 use outline_mcp_core::domain::store::{BookStore, SnapshotDelete, SnapshotStore, StoreError};
 use outline_mcp_core::infra::pg_store::PgBookStore;
@@ -911,4 +911,65 @@ async fn links_round_trip_and_follow_removal_against_postgres() {
         .unwrap()
         .version;
     assert!(BookStore::delete(&store, &slug, v).await.unwrap());
+}
+
+#[tokio::test]
+async fn proposals_round_trip_and_approve_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!("OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres proposals test did NOT run");
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate (incl. 0005)");
+    let slug = format!("_test-proposals-{}", std::process::id());
+
+    let svc = BookService::new(store.clone(), slug.clone());
+    svc.create_book("Proposals", 4).await.expect("create_book");
+    let mut req = add_req(None, "n");
+    req.body = Some("v1".to_string());
+    let (n, _) = svc.add_node(req).await.unwrap();
+
+    // A proposal-only change must reach the row (NodeRow equality covers it)
+    // and come back intact.
+    let v0 = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    let revision = Revision {
+        title: Some("n2".to_string()),
+        body: Some(BodyChange::Set("v2".to_string())),
+        properties: None,
+        properties_patch: Some([("scope".to_string(), "x".to_string())].into()),
+        base: String::new(),
+        by: Some("alice".to_string()),
+        note: Some("why".to_string()),
+        at: Timestamp::now(),
+    };
+    let stored = svc
+        .propose_revision(n, revision, false)
+        .await
+        .expect("propose");
+    let loaded = BookStore::load(&store, &slug).await.unwrap().unwrap();
+    assert_eq!(loaded.version, v0 + 1);
+    let node = loaded.value.get_node(n).unwrap().clone();
+    assert_eq!(node.body(), Some("v1"), "content unchanged");
+    assert_eq!(node.proposal(), Some(&stored), "proposal round-trips");
+
+    // Approve: one commit, one update entry, content applied, proposal gone.
+    let base = svc.history().await.unwrap().len();
+    svc.approve_revision(n, false).await.expect("approve");
+    let h = svc.history().await.unwrap();
+    assert_eq!(h.len(), base + 1);
+    assert_eq!((h[base].node_id, h[base].action), (n, ChangeAction::Update));
+    let loaded = BookStore::load(&store, &slug).await.unwrap().unwrap();
+    assert_eq!(loaded.version, v0 + 2);
+    let node = loaded.value.get_node(n).unwrap();
+    assert_eq!((node.title(), node.body()), ("n2", Some("v2")));
+    assert_eq!(node.get_property("scope"), Some("x"));
+    assert!(node.proposal().is_none());
+
+    assert!(BookStore::delete(&store, &slug, loaded.version)
+        .await
+        .unwrap());
 }

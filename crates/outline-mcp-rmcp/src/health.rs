@@ -148,7 +148,8 @@ pub(crate) fn stats_text(book: &TemplateBook, slug: &str, s: &BookStats) -> Stri
          Injected (inject=true): {}\n\
          Updated: ≤7d {}, 7–30d {}, 30–90d {}, >90d {}, unknown {}\n\
          Distinct property keys: {}\n\
-         Links: {}\n",
+         Links: {}\n\
+         Pending revisions: {}\n",
         book.title(),
         s.nodes,
         s.sections,
@@ -170,6 +171,7 @@ pub(crate) fn stats_text(book: &TemplateBook, slug: &str, s: &BookStats) -> Stri
         s.updated.unknown,
         s.property_keys,
         s.links,
+        s.pending_proposals,
     )
 }
 

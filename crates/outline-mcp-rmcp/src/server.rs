@@ -741,6 +741,10 @@ impl ServerHandler for OutlineMcpServer {
                  Links: `link_add`/`link_remove` keep typed links between nodes (e.g. `supersedes`, \
                  `see_also`); `links` lists a node's outgoing links and backlinks; `node_query` \
                  `linked_to` finds the nodes pointing at one.\n\
+                 Review: `revision_propose` attaches a proposed change to a node without changing it \
+                 (reads and injection keep the current content); `revision_show` diffs it, \
+                 `revision_approve` applies it as one history entry, `revision_reject` drops it, \
+                 `revisions_pending` lists them.\n\
                  \n\
                  Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`. \
                  `checklist` for task export. `init` for new book, `book_update` to retitle or change max_depth, `book_delete` to remove one.\n\

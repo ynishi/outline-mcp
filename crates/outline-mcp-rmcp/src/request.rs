@@ -611,6 +611,71 @@ pub(crate) struct McpLinksRequest {
     pub rel: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpRevisionProposeRequest {
+    #[schemars(description = "Node to revise: toc ID (e.g. '2-3') or UUID.")]
+    pub node_id: String,
+    #[schemars(description = "Proposed title (omit to keep).")]
+    pub title: Option<String>,
+    #[schemars(
+        description = "Proposed body (omit to keep; use `clear_body` to remove it). An empty string proposes an empty body, which is the same as no body."
+    )]
+    pub body: Option<String>,
+    #[schemars(description = "Propose removing the body. Cannot be combined with `body`.")]
+    #[serde(default)]
+    pub clear_body: bool,
+    #[schemars(
+        description = "Proposed replacement property map. Cannot be combined with `properties_patch`."
+    )]
+    pub properties: Option<HashMap<String, String>>,
+    #[schemars(
+        description = "Proposed properties to merge in (listed keys set, others kept). Cannot be combined with `properties`."
+    )]
+    pub properties_patch: Option<HashMap<String, String>>,
+    #[schemars(description = "Who proposes it (free text). Optional.")]
+    pub by: Option<String>,
+    #[schemars(description = "Why: a short note for the reviewer. Optional.")]
+    pub note: Option<String>,
+    #[schemars(
+        description = "Replace a revision already pending on the node. Default: false (refused when one exists)."
+    )]
+    #[serde(default)]
+    pub replace: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpRevisionShowRequest {
+    #[schemars(description = "Node with a pending revision: toc ID or UUID.")]
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpRevisionApproveRequest {
+    #[schemars(description = "Node with a pending revision: toc ID or UUID.")]
+    pub node_id: String,
+    #[schemars(description = "Who approves (free text, shown in the result). Optional.")]
+    pub by: Option<String>,
+    #[schemars(
+        description = "Apply even though the node changed after the revision was proposed. Review it with `revision_show` first. Default: false."
+    )]
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpRevisionRejectRequest {
+    #[schemars(description = "Node with a pending revision: toc ID or UUID.")]
+    pub node_id: String,
+    #[schemars(description = "Who rejects (free text, shown in the result). Optional.")]
+    pub by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpRevisionsPendingRequest {
+    #[schemars(description = "Only under this node (toc ID or UUID). Omit for the whole book.")]
+    pub subtree_root: Option<String>,
+}
+
 // =============================================================================
 // Tests
 // =============================================================================

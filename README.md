@@ -74,6 +74,8 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
                                    book_lint / book_stats (read-only health)
                                    node_verify (curation: verification dates)
                                    link_add / link_remove / links (curation: typed links)
+                                   revision_propose / revision_show / revision_approve /
+                                   revision_reject / revisions_pending (curation: review)
 ```
 
 1. **`init`** — Create a new empty book
@@ -97,6 +99,7 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 19. **`book_stats`** — Read-only numbers for a book: node counts, max / mean depth, children per section (max, mean, histogram), counts by status, injected nodes, update recency, distinct property keys, links; `format: "json"` for programs
 20. **`node_verify`** — Record that nodes were confirmed to still match reality (`node_ids`, optional `by`): sets their verification time to now without touching content or last-edited time; one history entry per node, one commit. Pair with `node_query` `verified_before` to list what nobody has confirmed lately
 21. **`link_add`** / **`link_remove`** / **`links`** — Typed links between nodes of a book (`rel` such as `supersedes`, `superseded_by`, `see_also`, `merged_from`; any 1–40 of `a-z 0-9 _ -`). Links follow the target's id, so moving it keeps them; removing a node drops the links pointing at it (each holder gets an update in history, in the same commit, and the result says how many were dropped). `links` lists outgoing links and backlinks; `node_query` takes `linked_to` (+ `link_rel`) and its JSON carries `links` / `backlinks` (with each endpoint's status, `archived` included). A link change is recorded in history but, like `node_verify`, leaves the node's `updated_at` alone
+22. **`revision_propose`** / **`revision_show`** / **`revision_approve`** / **`revision_reject`** / **`revisions_pending`** — Changes under review. `revision_propose` attaches a proposed title / body / properties change (`by`, `note` optional) to a node without changing it: injection, `toc`, `dump` and every read keep the current content until approval. One pending revision per node (`replace: true` swaps it); archived nodes take none. `revision_show` gives a diff against the current content (title, unified body diff, properties added / changed / removed) and warns when the node changed since; `revision_approve` applies it (validated like `node_update`) as one history entry, refusing a stale one unless `force: true`; `revision_reject` drops it; `revisions_pending` lists them. Proposing and rejecting are recorded in history without touching `updated_at`. `node_query` shows a pending revision's summary, `book_lint` reports `stale_proposals` (older than `stale_days`, outdated, or left on a node archived since — those can only be rejected), `book_stats` counts them
 
 ### Node IDs
 
