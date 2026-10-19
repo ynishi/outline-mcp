@@ -29,6 +29,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - **Each HTTP session has its own selected book** (#6). Every streamable-HTTP session used to share one selection, so `select_book` (or `init`) in one session redirected the next write of every other session into that book. Sessions now share the storage but start with no book selected and keep their own selection; stdio is unchanged.
+- **`import` records the replacement in history** (#11). The tool replaced the selected book without writing any history, so `book_history` / `node_history` showed nothing of it. It now commits the new tree together with a delete entry per removed node and a create entry per imported node, and reports how many entries were recorded. Imported nodes get new ids, so re-importing an unchanged export still records every node as deleted and created; the deleted nodes' history stays readable through `node_history` with their full UUID. No MCP tool changes a book's nodes without recording it any more (the book's title and `max_depth` are not part of history; see #9).
 
 ### Security
 

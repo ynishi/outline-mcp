@@ -228,14 +228,65 @@ impl<S: BookStore> BookService<S> {
         Ok(self.load_book().await?.value)
     }
 
-    /// インポート / snapshot restore された Book を保存する (無ければ作成)。
+    /// Book をそのまま保存する (無ければ作成)。**event を記録しない。**
     ///
-    /// event は記録しない: 呼び出し側 (`import` / `snapshot_restore`) が
-    /// 自分の changelog entry を別途記録する現行の形を保つため。
+    /// 履歴を別途持ち込む embedder 向けの低レベル経路で、MCP tool からは
+    /// 呼ばない: book を置き換える tool は [`Self::import_book`] /
+    /// [`Self::restore_book`] を使い、置き換えを同じ commit で履歴に残す。
     pub async fn save_book(&self, book: &TemplateBook) -> Result<(), AppError> {
         let expected = self.current_version().await?;
         self.commit(expected, book, &[]).await?;
         Ok(())
+    }
+
+    /// Replace the book with `book` (an imported tree) and record the
+    /// replacement in the same commit: a `Delete` entry for every current node
+    /// that `book` does not have, a `Create` entry for every node of `book`
+    /// that is new, and an `Update` entry for a node present in both whose
+    /// content differs. Returns the number of entries recorded.
+    ///
+    /// The commit goes over the version just read, so a concurrent write in
+    /// between is a conflict. A book that does not exist yet is created, with a
+    /// `Create` entry per node.
+    pub async fn import_book(&self, book: &TemplateBook) -> Result<usize, AppError> {
+        let current = self.store.load(&self.slug).await.map_err(store_error)?;
+        let at = Timestamp::now();
+        let mut events = Vec::new();
+
+        if let Some(cur) = &current {
+            for id in cur.value.all_node_ids() {
+                if book.get_node(id).is_none() {
+                    events.push(ChangeEntry::new(
+                        id,
+                        ChangeAction::Delete,
+                        node_json(&cur.value, id),
+                        None,
+                        at,
+                    ));
+                }
+            }
+        }
+        for id in book.all_node_ids() {
+            let after = node_json(book, id);
+            let before = current
+                .as_ref()
+                .filter(|cur| cur.value.get_node(id).is_some())
+                .map(|cur| &cur.value);
+            match before {
+                None => events.push(ChangeEntry::new(id, ChangeAction::Create, None, after, at)),
+                // Compare as JSON values, not strings: `properties` is a
+                // HashMap, so two equal nodes can serialize with their keys in
+                // a different order.
+                Some(cur) if node_value(cur, id) != node_value(book, id) => events.push(
+                    ChangeEntry::new(id, ChangeAction::Update, node_json(cur, id), after, at),
+                ),
+                Some(_) => {}
+            }
+        }
+
+        self.commit(current.map(|v| v.version), book, &events)
+            .await?;
+        Ok(events.len())
     }
 
     /// Replace the book with `book` (a snapshot being restored), recording a
@@ -304,6 +355,12 @@ impl<S: BookStore> BookService<S> {
 fn node_json(book: &TemplateBook, id: NodeId) -> Option<String> {
     book.get_node(id)
         .and_then(|n| serde_json::to_string(n).ok())
+}
+
+/// The node as a JSON value, for an order-insensitive comparison of its
+/// content (object keys compare as a map, not by position).
+fn node_value(book: &TemplateBook, id: NodeId) -> Option<serde_json::Value> {
+    book.get_node(id).and_then(|n| serde_json::to_value(n).ok())
 }
 
 fn store_error(e: StoreError) -> AppError {
@@ -880,6 +937,79 @@ mod tests {
             result.is_err(),
             "batch_update with invalid node should fail"
         );
+    }
+
+    #[tokio::test]
+    async fn test_import_book_records_the_replacement_in_one_commit() {
+        let svc = memory_service().await;
+        let (a, _) = svc.add_node(add_req("A")).await.expect("add A");
+        let (b, _) = svc.add_node(add_req("B")).await.expect("add B");
+        let before_len = svc.history().await.unwrap().len();
+        let before_version = svc.store.load("test").await.unwrap().unwrap().version;
+
+        // Imported tree: A kept but retitled, B gone, C new.
+        let mut imported = svc.read_tree().await.unwrap();
+        imported.update_node(a, title_req("A2")).unwrap();
+        imported.remove_node(b).unwrap();
+        let c = imported.add_node(add_req("C")).unwrap();
+
+        let recorded = svc.import_book(&imported).await.expect("import");
+        assert_eq!(recorded, 3);
+
+        let after_version = svc.store.load("test").await.unwrap().unwrap().version;
+        assert_eq!(after_version, before_version + 1, "one commit");
+
+        let new_entries: Vec<_> = svc.history().await.unwrap()[before_len..]
+            .iter()
+            .map(|e| (e.node_id, e.action))
+            .collect();
+        assert!(new_entries.contains(&(a, ChangeAction::Update)));
+        assert!(new_entries.contains(&(b, ChangeAction::Delete)));
+        assert!(new_entries.contains(&(c, ChangeAction::Create)));
+        assert_eq!(new_entries.len(), 3);
+
+        let b_history = svc.history_by_node(b).await.unwrap();
+        assert_eq!(b_history.last().unwrap().action, ChangeAction::Delete);
+        assert!(b_history.last().unwrap().before.is_some());
+        let tree = svc.read_tree().await.unwrap();
+        assert!(tree.get_node(b).is_none());
+        assert_eq!(tree.get_node(a).unwrap().title(), "A2");
+    }
+
+    #[tokio::test]
+    async fn test_import_book_unchanged_tree_records_nothing() {
+        let svc = memory_service().await;
+        svc.add_node(add_req("A")).await.expect("add A");
+        let same = svc.read_tree().await.unwrap();
+        assert_eq!(svc.import_book(&same).await.expect("import"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_import_book_unchanged_node_with_many_properties_records_nothing() {
+        // `properties` is a HashMap: the same keys can serialize in a
+        // different order from two instances, which must not read as a change.
+        let svc = memory_service().await;
+        let mut req = add_req("P");
+        for i in 0..16 {
+            req.properties.insert(format!("k{i}"), format!("v{i}"));
+        }
+        svc.add_node(req).await.expect("add P");
+        let same = svc.read_tree().await.unwrap();
+        // A round trip through JSON rebuilds every HashMap with a fresh seed.
+        let copy: TemplateBook =
+            serde_json::from_str(&serde_json::to_string(&same).unwrap()).unwrap();
+        assert_eq!(svc.import_book(&copy).await.expect("import"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_import_book_into_a_missing_book_creates_it_with_create_entries() {
+        let svc = BookService::new(MemoryBookStore::new(), "fresh");
+        let mut book = TemplateBook::new("Fresh", 4);
+        let x = book.add_node(add_req("X")).unwrap();
+        assert_eq!(svc.import_book(&book).await.expect("import"), 1);
+        let h = svc.history().await.unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!((h[0].node_id, h[0].action), (x, ChangeAction::Create));
     }
 
     #[tokio::test]

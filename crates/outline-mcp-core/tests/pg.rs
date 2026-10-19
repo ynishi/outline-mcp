@@ -460,3 +460,63 @@ async fn delete_cascades_to_nodes_events_and_snapshots_against_postgres() {
         .version;
     assert!(BookStore::delete(&store, &kept, v).await.unwrap());
 }
+
+#[tokio::test]
+async fn import_book_commits_tree_and_history_together_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!(
+            "OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres import_book test did NOT run"
+        );
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = sqlx::PgPool::connect(&url).await.expect("count connect");
+    let slug = format!("_test-import-hist-{}", std::process::id());
+
+    let svc = BookService::new(store.clone(), slug.clone());
+    svc.create_book("Imp", 4).await.expect("create_book");
+    let (a, _) = svc.add_node(add_req(None, "a")).await.expect("add a");
+    let (b, _) = svc.add_node(add_req(None, "b")).await.expect("add b");
+    let events_before: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE book = $1")
+        .bind(&slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let version_before = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+
+    let mut imported = svc.read_tree().await.unwrap();
+    imported.update_node(a, title_req("a2")).unwrap();
+    imported.remove_node(b).unwrap();
+    let c = imported.add_node(add_req(None, "c")).unwrap();
+    assert_eq!(svc.import_book(&imported).await.expect("import"), 3);
+
+    let events_after: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE book = $1")
+        .bind(&slug)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(events_after, events_before + 3);
+    let version_after = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert_eq!(version_after, version_before + 1, "one commit");
+
+    let tail: Vec<_> = svc.history().await.unwrap()[events_before as usize..]
+        .iter()
+        .map(|e| (e.node_id, e.action))
+        .collect();
+    assert!(tail.contains(&(a, ChangeAction::Update)));
+    assert!(tail.contains(&(b, ChangeAction::Delete)));
+    assert!(tail.contains(&(c, ChangeAction::Create)));
+
+    assert!(BookStore::delete(&store, &slug, version_after)
+        .await
+        .unwrap());
+}
