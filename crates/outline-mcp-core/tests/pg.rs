@@ -462,6 +462,66 @@ async fn delete_cascades_to_nodes_events_and_snapshots_against_postgres() {
 }
 
 #[tokio::test]
+async fn remove_records_every_removed_node_in_one_commit_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!(
+            "OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres remove-history test did NOT run"
+        );
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let slug = format!("_test-remove-hist-{}", std::process::id());
+
+    let svc = BookService::new(store.clone(), slug.clone());
+    svc.create_book("Rm", 4).await.expect("create_book");
+    let (root, _) = svc.add_node(add_req(None, "root")).await.unwrap();
+    let (child, _) = svc.add_node(add_req(Some(root), "child")).await.unwrap();
+    let (grand, _) = svc.add_node(add_req(Some(child), "grand")).await.unwrap();
+    let events_before = svc.history().await.unwrap().len();
+    let version_before = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+
+    svc.remove_node(root).await.expect("remove");
+
+    let history = svc.history().await.unwrap();
+    let tail: Vec<_> = history[events_before..]
+        .iter()
+        .map(|e| (e.node_id, e.action, e.before.is_some()))
+        .collect();
+    assert_eq!(
+        tail,
+        vec![
+            (root, ChangeAction::Delete, true),
+            (child, ChangeAction::Delete, true),
+            (grand, ChangeAction::Delete, true),
+        ]
+    );
+    let version_after = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert_eq!(version_after, version_before + 1, "one commit");
+    assert_eq!(
+        svc.history_by_node(grand)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .action,
+        ChangeAction::Delete
+    );
+
+    assert!(BookStore::delete(&store, &slug, version_after)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
 async fn import_book_commits_tree_and_history_together_against_postgres() {
     let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
         eprintln!(

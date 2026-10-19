@@ -74,15 +74,15 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 ```
 
 1. **`init`** — Create a new empty book
-2. **`node_create`** — Add sections and content nodes (with optional `properties`)
-3. **`toc`** — View the table of contents with numbered IDs (e.g. `1`, `2-3`). Supports `filter` by properties
+2. **`node_create`** — Add sections and content nodes (with optional `properties`); the result carries the new node's UUID, ready for the batch tools
+3. **`toc`** — View the table of contents with numbered IDs (e.g. `1`, `2-3`). Supports `filter` by properties, `max_depth` (depth from the book root; `1` = root level only) and `limit`; a last line counts the nodes left out
 4. **`select_book`** — Select a book. Nodes with `inject=true` property have their body auto-appended (draft nodes excluded)
 5. **`checklist`** — Export a section (or the whole book) as a Markdown checklist with checkboxes
 6. **`node_update`** — Edit title, body, type, placeholder, properties, or status (`active`/`draft`) of a node
-7. **`node_move`** — Relocate or delete nodes (with descendants)
-8. **`node_batch_move`** — Move multiple nodes in a single atomic call (requires UUID or UUID-prefix IDs; to delete a node, use `node_move` with `action: "remove"`)
+7. **`node_move`** — Relocate or delete nodes; descendants go along and are listed in the result. `dry_run: true` shows every node that would move or be removed (old → new positions) without changing anything. A remove records a delete in history for the node and each descendant
+8. **`node_batch_move`** — Move multiple nodes in a single atomic call (requires UUID or UUID-prefix IDs; to delete a node, use `node_move` with `action: "remove"`); also takes `dry_run`
 9. **`node_batch_update`** — Update title/body/type/properties/status on multiple nodes atomically
-10. **`node_query`** — Search nodes by property values, status (`active`/`draft`), or type (`section`/`content`); optionally include body in results
+10. **`node_query`** — Search nodes by property values, status (`active`/`draft`), type (`section`/`content`), or `text` (case-insensitive substring of title or body, CJK included, with a snippet of the first body match); optionally include body in results
 11. **`import`** — Import a book from a previously exported JSON file
 12. **`gen_routing`** — Generate a Markdown routing table from nodes with `routing` property across all books
 13. **`snapshot_create`** / **`snapshot_list`** / **`snapshot_restore`** / **`snapshot_delete`** — Full book versioning (create, list, restore, delete one snapshot; a labeled snapshot needs `force: true` to delete)

@@ -205,6 +205,11 @@ pub(crate) struct McpNodeMoveRequest {
     pub new_parent: Option<String>,
     #[schemars(description = "Position among new siblings (0-based). Default: append at end.")]
     pub position: Option<usize>,
+    #[schemars(
+        description = "Report what would move or be removed (the node and every descendant, with old → new positions) without changing anything. Default: false."
+    )]
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -215,6 +220,14 @@ pub(crate) struct McpTocRequest {
         description = "Filter by properties (e.g. {\"inject\": \"true\"}). Only matching nodes shown."
     )]
     pub filter: Option<HashMap<String, String>>,
+    #[schemars(
+        description = "Show only nodes at most this deep, counted from the book root (1 = root-level nodes only), also under `subtree_root`. Omit for all depths."
+    )]
+    pub max_depth: Option<u8>,
+    #[schemars(
+        description = "Show at most this many nodes (in toc order). A last line says how many were left out."
+    )]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -413,6 +426,11 @@ pub(crate) struct McpBatchMoveItem {
 pub(crate) struct McpBatchMoveRequest {
     #[schemars(description = "List of move operations. All nodes are identified by UUID.")]
     pub moves: Vec<McpBatchMoveItem>,
+    #[schemars(
+        description = "Report what would move (each node and its descendants, old → new positions) without changing anything. Default: false."
+    )]
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -468,6 +486,10 @@ pub(crate) struct McpNodeQueryRequest {
     pub status: Option<String>,
     #[schemars(description = "Subtree root ID (toc ID or UUID). Only search within this subtree.")]
     pub subtree_root: Option<String>,
+    #[schemars(
+        description = "Case-insensitive substring to find in a node's title or body (CJK works). Combined with the other filters (all must match). Results include a short snippet around the first body match."
+    )]
+    pub text: Option<String>,
     #[schemars(
         description = "Output format: 'text' (default) or 'json'. Use 'json' when a program \
                        reads the result: the text rendering puts each node's properties on one \

@@ -298,6 +298,12 @@ impl TemplateBook {
         Ok(())
     }
 
+    /// The ids of every descendant of `id` (not `id` itself), depth-first.
+    /// Empty when the node has no children or does not exist.
+    pub fn descendant_ids(&self, id: NodeId) -> Vec<NodeId> {
+        self.collect_descendants(id)
+    }
+
     /// 指定ノードを含むサブツリーのノード一覧（DFS順）
     pub fn subtree_nodes(&self, root: NodeId) -> Vec<&TemplateNode> {
         let mut result = Vec::new();

@@ -9,7 +9,8 @@ use rmcp::{
 use outline_mcp_core::application::eject::{EjectConfig, EjectFormat, EjectService, EjectTree};
 
 use crate::helpers::{
-    build_hierarchical_ids, describe_book_update, find_hierarchical_id, format_toc,
+    build_hierarchical_ids, describe_book_update, describe_descendants, describe_subtree_change,
+    describe_subtrees_change, find_hierarchical_id, format_toc, format_toc_limited, id_suffix,
 };
 use crate::request::{
     normalize_text, parse_node_id, parse_node_status, parse_node_type, sanitize_for_filename,
@@ -28,6 +29,10 @@ use outline_mcp_core::domain::model::book::AddNodeRequest;
 use outline_mcp_core::domain::model::book::UpdateNodeRequest;
 use outline_mcp_core::domain::model::changelog::{ChangeAction, NodeStatus};
 use outline_mcp_core::domain::model::timestamp::Timestamp;
+use outline_mcp_core::domain::search::TextQuery;
+
+/// Length of the excerpt `node_query` shows around a `text` match.
+const SNIPPET_CHARS: usize = 80;
 
 #[tool_router(vis = "pub(crate)")]
 impl OutlineMcpServer {
@@ -69,9 +74,10 @@ impl OutlineMcpServer {
         let hier = find_hierarchical_id(&book, id).unwrap_or_else(|| id.short().to_string());
 
         let mut msg = format!(
-            "Created: {}. {}",
+            "Created: {}. {}{}",
             hier,
-            book.get_node(id).map(|n| n.title()).unwrap_or("?")
+            book.get_node(id).map(|n| n.title()).unwrap_or("?"),
+            id_suffix(id)
         );
         if let Some(w) = warning {
             msg.push_str(&format!("\n[WARNING] {w}"));
@@ -134,7 +140,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "node_move",
-        description = "Move or delete a node (and its descendants). Specify node by ID from `toc` output (e.g. '2-3'). Action 'move' relocates, 'remove' deletes.",
+        description = "Move or delete a node together with all of its descendants. Specify node by ID from `toc` output (e.g. '2-3'). Action 'move' relocates, 'remove' deletes. The result names the descendants that went with it. Pass `dry_run: true` to see exactly which nodes would move or be removed (old → new positions) without changing anything. History: a remove records a delete for the node and every descendant; a move records a move for the node only (its descendants keep their parent).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -156,19 +162,50 @@ impl OutlineMcpServer {
                     None => None,
                 };
                 let position = req.position.unwrap_or(usize::MAX);
+
+                if req.dry_run {
+                    let (before, after) = svc
+                        .preview(|b| b.move_node(id, new_parent, position))
+                        .await
+                        .map_err(Self::to_mcp_error)?;
+                    let n = 1 + before.descendant_ids(id).len();
+                    let msg = format!(
+                        "Dry run: would move {n} node(s):\n{}Nothing changed.",
+                        describe_subtree_change(&before, &after, id)
+                    );
+                    return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                        msg,
+                    )]));
+                }
+
                 let ((), warning) = svc
                     .move_node(id, new_parent, position)
                     .await
                     .map_err(Self::to_mcp_error)?;
 
-                let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
-                let hier =
-                    find_hierarchical_id(&book, id).unwrap_or_else(|| id.short().to_string());
-                let mut msg = format!(
-                    "Moved → {}. {}",
-                    hier,
-                    book.get_node(id).map(|n| n.title()).unwrap_or("?")
-                );
+                // The move is committed; a failure to read the tree back for
+                // the report must not turn it into an error the caller would
+                // retry.
+                let mut msg = match svc.read_tree().await {
+                    Ok(book) => {
+                        let hier = find_hierarchical_id(&book, id)
+                            .unwrap_or_else(|| id.short().to_string());
+                        format!(
+                            "Moved → {}. {}{}{}",
+                            hier,
+                            book.get_node(id).map(|n| n.title()).unwrap_or("?"),
+                            describe_descendants(&book, id, "with"),
+                            id_suffix(id)
+                        )
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "node_move: committed, but reading the tree back failed");
+                        format!(
+                            "Moved{} (committed; the new position could not be read back: {e})",
+                            id_suffix(id)
+                        )
+                    }
+                };
                 if let Some(w) = warning {
                     msg.push_str(&format!("\n[WARNING] {w}"));
                 }
@@ -185,9 +222,31 @@ impl OutlineMcpServer {
                     .get_node(id)
                     .map(|n| n.title().to_string())
                     .unwrap_or_default();
+                let descendants = describe_descendants(&book, id, "and");
+
+                if req.dry_run {
+                    let (before, after) = svc
+                        .preview(|b| b.remove_node(id))
+                        .await
+                        .map_err(Self::to_mcp_error)?;
+                    let n = 1 + before.descendant_ids(id).len();
+                    let msg = format!(
+                        "Dry run: would remove {n} node(s):\n{}Nothing changed.",
+                        describe_subtree_change(&before, &after, id)
+                    );
+                    return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                        msg,
+                    )]));
+                }
 
                 let ((), warning) = svc.remove_node(id).await.map_err(Self::to_mcp_error)?;
-                let mut msg = format!("Removed: {}. {} (and descendants)", hier, title);
+                let mut msg = format!(
+                    "Removed: {}. {}{}{}",
+                    hier,
+                    title,
+                    descendants,
+                    id_suffix(id)
+                );
                 if let Some(w) = warning {
                     msg.push_str(&format!("\n[WARNING] {w}"));
                 }
@@ -204,7 +263,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "toc",
-        description = "Show table of contents with numbered IDs (e.g. 1, 1-1, 2-3). Run this first — use the returned IDs to specify nodes in `checklist`, `node_create`, and other tools.",
+        description = "Show table of contents with numbered IDs (e.g. 1, 1-1, 2-3). Run this first — use the returned IDs to specify nodes in `checklist`, `node_create`, and other tools. On a large book, `max_depth: 1` shows only the root-level nodes and `limit` caps the count; a last line says how many nodes were left out.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -215,6 +274,18 @@ impl OutlineMcpServer {
         &self,
         Parameters(req): Parameters<McpTocRequest>,
     ) -> Result<CallToolResult, McpError> {
+        // Validate the arguments before anything can return early (an empty
+        // book or an empty filter result must not hide a bad argument).
+        if req.max_depth == Some(0) {
+            return Err(McpError::invalid_params(
+                "max_depth must be at least 1 (1 = root-level nodes only)",
+                None,
+            ));
+        }
+        if req.limit == Some(0) {
+            return Err(McpError::invalid_params("limit must be at least 1", None));
+        }
+
         let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
@@ -245,7 +316,7 @@ impl OutlineMcpServer {
             )]));
         }
 
-        let output = format_toc(&book, &nodes);
+        let output = format_toc_limited(&book, &nodes, req.max_depth, req.limit);
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             output,
         )]))
@@ -1547,7 +1618,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "node_batch_move",
-        description = "Move multiple nodes in a single atomic operation. All nodes must be specified by UUID (not toc ID). Use `node_query` or `dump` to find UUIDs. All moves succeed or none are saved.",
+        description = "Move multiple nodes in a single atomic operation. All nodes must be specified by UUID (not toc ID); `node_create`, `node_move` and `node_query` return them. All moves succeed or none are saved. Each moved node takes its descendants along; the result lists them. Pass `dry_run: true` to see every node that would move (old → new positions) without changing anything.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1597,11 +1668,70 @@ impl OutlineMcpServer {
         }
 
         let svc = self.service().await?;
+
+        if req.dry_run {
+            let plan = resolved.clone();
+            let (before, after) = svc
+                .preview(|b| {
+                    for (id, new_parent, position) in plan {
+                        b.move_node(id, new_parent, position)?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|e| {
+                    McpError::invalid_params(
+                        format!("Batch move would fail: {e}. Nothing changed."),
+                        None,
+                    )
+                })?;
+            let roots: Vec<_> = resolved.iter().map(|(id, _, _)| *id).collect();
+            let mut msg = format!("Dry run: {total} move(s) would succeed:\n");
+            msg.push_str(&describe_subtrees_change(&before, &after, &roots));
+            msg.push_str("Nothing changed.");
+            return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                msg,
+            )]));
+        }
+
+        let ids: Vec<_> = resolved.iter().map(|(id, _, _)| *id).collect();
         let (count, warnings) = svc.batch_move(resolved).await.map_err(|e| {
-            McpError::internal_error(format!("Batch move failed: {e}. No changes saved."), None)
+            // Same error code as the dry run for the same rejected input.
+            let msg = format!("Batch move failed: {e}. No changes saved.");
+            match e {
+                outline_mcp_core::application::error::AppError::Domain(_) => {
+                    McpError::invalid_params(msg, None)
+                }
+                _ => McpError::internal_error(msg, None),
+            }
         })?;
 
         let mut msg = format!("Batch move complete: {count}/{total} operations succeeded.");
+        // The batch is committed; a failed read-back only degrades the report.
+        match svc.read_tree().await {
+            Ok(book) => {
+                for id in ids {
+                    let hier =
+                        find_hierarchical_id(&book, id).unwrap_or_else(|| id.short().to_string());
+                    msg.push_str(&format!(
+                        "\n- Moved → {}. {}{}{}",
+                        hier,
+                        book.get_node(id).map(|n| n.title()).unwrap_or("?"),
+                        describe_descendants(&book, id, "with"),
+                        id_suffix(id)
+                    ));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "node_batch_move: committed, but reading the tree back failed");
+                msg.push_str(&format!(
+                    "\n(committed; new positions could not be read back: {e})"
+                ));
+                for id in ids {
+                    msg.push_str(&format!("\n- Moved{}", id_suffix(id)));
+                }
+            }
+        }
         for w in warnings.into_iter().flatten() {
             msg.push_str(&format!("\n[WARNING] {w}"));
         }
@@ -1685,7 +1815,7 @@ impl OutlineMcpServer {
     }
 
     #[tool(
-        description = "Query nodes by properties, status, type, or subtree. Returns UUIDs needed for batch operations. Use `include_body: true` to include node content. Programs should pass `format: \"json\"` — the default text rendering is lossy for property values containing newlines and for bodies starting with a fence.",
+        description = "Query nodes by properties, status, type, subtree, or `text` (case-insensitive substring of title or body; CJK works; results show a snippet of the first body match). All given filters must match. Returns UUIDs needed for batch operations. Use `include_body: true` to include node content. Programs should pass `format: \"json\"` — the default text rendering is lossy for property values containing newlines and for bodies starting with a fence.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1731,6 +1861,22 @@ impl OutlineMcpServer {
             nodes.retain(|n| n.status() == st);
         }
 
+        let text_query = match req.text.as_deref() {
+            Some(t) => Some(
+                TextQuery::new(t)
+                    .ok_or_else(|| McpError::invalid_params("text must not be empty", None))?,
+            ),
+            None => None,
+        };
+        if let Some(ref q) = text_query {
+            nodes.retain(|n| q.matches(n));
+        }
+        let snippet = |node: &outline_mcp_core::domain::model::node::TemplateNode| {
+            text_query
+                .as_ref()
+                .and_then(|q| q.snippet(node, SNIPPET_CHARS))
+        };
+
         // Before the empty check on purpose. Zero matches is the ordinary
         // outcome for a poller (the placement gate asks "is there anything
         // pending" every three hours and the answer is usually no), so a
@@ -1762,6 +1908,11 @@ impl OutlineMcpServer {
                     // body" and "the body is empty" stay distinguishable.
                     if req.include_body {
                         o["body"] = serde_json::json!(node.body());
+                    }
+                    // Present whenever `text` was given; null when only the
+                    // title matched.
+                    if text_query.is_some() {
+                        o["snippet"] = serde_json::json!(snippet(node));
                     }
                     o
                 }).collect::<Vec<_>>(),
@@ -1804,6 +1955,9 @@ impl OutlineMcpServer {
                     .collect::<Vec<_>>()
                     .join(", ");
                 output.push_str(&format!("   Properties: {}\n", props_str));
+            }
+            if let Some(s) = snippet(node) {
+                output.push_str(&format!("   Match: {}\n", s));
             }
             if req.include_body {
                 if let Some(body) = node.body() {
@@ -2343,5 +2497,466 @@ mod book_update_tool_tests {
             .filter(|e| e.action == ChangeAction::BookUpdate)
             .count();
         assert_eq!(book_updates, 1);
+    }
+}
+
+#[cfg(test)]
+mod ergonomics_tool_tests {
+    use std::sync::Arc;
+
+    use outline_mcp_core::infra::memory_store::{MemoryBookStore, MemorySnapshotStore};
+
+    use super::*;
+    use crate::request::McpBatchMoveItem;
+    use crate::server::Storage;
+
+    async fn server_with_book() -> OutlineMcpServer {
+        let s = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        s.service_for("e")
+            .await
+            .unwrap()
+            .create_book("E", 4)
+            .await
+            .unwrap();
+        *s.selected.write().unwrap() = Some("e".into());
+        s
+    }
+
+    fn text(r: &CallToolResult) -> String {
+        r.content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Creates a node through the tool and returns (toc id, uuid) parsed from
+    /// the result line `Created: <toc>. <title> (id: <uuid>)`.
+    async fn create(
+        s: &OutlineMcpServer,
+        parent: Option<&str>,
+        title: &str,
+        body: Option<&str>,
+    ) -> (String, String) {
+        let r = s
+            .node_create(Parameters(McpNodeCreateRequest {
+                parent: parent.map(str::to_string),
+                title: title.into(),
+                node_type: "section".into(),
+                body: body.map(str::to_string),
+                placeholder: None,
+                position: None,
+                properties: None,
+            }))
+            .await
+            .expect("create");
+        let t = text(&r);
+        let toc = t
+            .strip_prefix("Created: ")
+            .and_then(|r| r.split('.').next())
+            .expect("toc id")
+            .to_string();
+        (toc, trailing_uuid(&t).expect("uuid in result"))
+    }
+
+    /// The uuid of a result line's final ` (id: <uuid>)` — the last element of
+    /// every result line, so a title containing "(id: " cannot confuse it.
+    fn trailing_uuid(line: &str) -> Option<String> {
+        let rest = line.trim_end().strip_suffix(')')?;
+        let uuid = rest.get(rest.len().checked_sub(36)?..)?;
+        let head = rest.get(..rest.len() - 36)?;
+        (head.ends_with(" (id: ") && crate::request::parse_node_id(uuid).is_ok())
+            .then(|| uuid.to_string())
+    }
+
+    async fn book_version(s: &OutlineMcpServer) -> i64 {
+        s.storage.books.load("e").await.unwrap().unwrap().version
+    }
+
+    #[test]
+    fn trailing_uuid_ignores_id_text_inside_the_title() {
+        let u = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let line = format!("Created: 1. odd (id: title) (id: {u})");
+        assert_eq!(trailing_uuid(&line).as_deref(), Some(u));
+        assert_eq!(trailing_uuid("Created: 1. no id"), None);
+    }
+
+    fn query(text: &str) -> McpNodeQueryRequest {
+        McpNodeQueryRequest {
+            filter: None,
+            include_body: false,
+            kind: None,
+            status: None,
+            subtree_root: None,
+            text: Some(text.into()),
+            format: None,
+        }
+    }
+
+    async fn version(s: &OutlineMcpServer) -> usize {
+        s.service_for("e")
+            .await
+            .unwrap()
+            .history()
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn text_query_matches_body_only_cjk_and_ignores_case() {
+        let s = server_with_book().await;
+        create(&s, None, "Git", Some("ブランチ運用ルールの説明")).await;
+        create(&s, None, "Branch Strategy", None).await;
+        create(&s, None, "unrelated", Some("nothing here")).await;
+
+        let r = text(&s.node_query(Parameters(query("運用"))).await.unwrap());
+        assert!(r.contains("(1 matches)") && r.contains("Git"), "{r}");
+        assert!(r.contains("Match: ブランチ運用ルールの説明"), "{r}");
+
+        let r = text(&s.node_query(Parameters(query("branch"))).await.unwrap());
+        assert!(
+            r.contains("(1 matches)") && r.contains("Branch Strategy"),
+            "{r}"
+        );
+
+        let blank = s.node_query(Parameters(query("  "))).await;
+        assert!(blank.unwrap_err().message.contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn text_query_respects_subtree_and_reports_snippet_in_json() {
+        let s = server_with_book().await;
+        let (a, _) = create(&s, None, "A", None).await;
+        create(&s, Some(&a), "inside", Some("needle in A")).await;
+        create(&s, None, "outside", Some("needle elsewhere")).await;
+
+        let mut q = query("NEEDLE");
+        q.subtree_root = Some(a);
+        q.format = Some("json".into());
+        let r = s.node_query(Parameters(q)).await.unwrap();
+        let v = r.structured_content.expect("json");
+        assert_eq!(v["matches"], 1);
+        assert_eq!(v["nodes"][0]["title"], "inside");
+        assert_eq!(v["nodes"][0]["snippet"], "needle in A");
+    }
+
+    #[tokio::test]
+    async fn title_only_match_has_a_null_snippet_in_json() {
+        let s = server_with_book().await;
+        create(&s, None, "Needle title", Some("body without it")).await;
+        let mut q = query("needle");
+        q.format = Some("json".into());
+        let v = s
+            .node_query(Parameters(q))
+            .await
+            .unwrap()
+            .structured_content
+            .expect("json");
+        assert_eq!(v["matches"], 1);
+        assert!(v["nodes"][0]["snippet"].is_null(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn toc_max_depth_and_limit_report_hidden_nodes() {
+        let s = server_with_book().await;
+        let (a, _) = create(&s, None, "A", None).await;
+        create(&s, Some(&a), "A1", None).await;
+        create(&s, None, "B", None).await;
+
+        let toc = |max_depth, limit| McpTocRequest {
+            subtree_root: None,
+            filter: None,
+            max_depth,
+            limit,
+        };
+        let r = text(&s.toc(Parameters(toc(Some(1), None))).await.unwrap());
+        assert!(
+            r.contains("1. A") && r.contains("2. B") && !r.contains("A1"),
+            "{r}"
+        );
+        assert!(r.contains("… 1 more nodes not shown"), "{r}");
+
+        let r = text(&s.toc(Parameters(toc(None, Some(2)))).await.unwrap());
+        assert!(r.contains("1-1. A1") && !r.contains("2. B"), "{r}");
+        assert!(r.contains("… 1 more nodes not shown"), "{r}");
+
+        let r = text(&s.toc(Parameters(toc(None, None))).await.unwrap());
+        assert!(!r.contains("not shown"), "{r}");
+
+        let zero = s.toc(Parameters(toc(Some(0), None))).await;
+        assert!(zero.unwrap_err().message.contains("at least 1"));
+    }
+
+    #[tokio::test]
+    async fn uuid_from_node_create_is_accepted_by_node_batch_move() {
+        let s = server_with_book().await;
+        let (_, a) = create(&s, None, "A", None).await;
+        let (_, b) = create(&s, None, "B", None).await;
+
+        let r = s
+            .node_batch_move(Parameters(McpBatchMoveRequest {
+                moves: vec![McpBatchMoveItem {
+                    node_id: a.clone(),
+                    new_parent: Some(b.clone()),
+                    position: None,
+                }],
+                dry_run: false,
+            }))
+            .await
+            .expect("batch move with the uuids node_create returned");
+        let t = text(&r);
+        assert!(
+            t.contains("1/1") && t.contains(&format!("(id: {a})")),
+            "{t}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_dry_run_lists_descendants_and_changes_nothing() {
+        let s = server_with_book().await;
+        let (a, a_id) = create(&s, None, "A", None).await;
+        create(&s, Some(&a), "A1", None).await;
+        create(&s, Some(&a), "A2", None).await;
+        let (b, _) = create(&s, None, "B", None).await;
+        let v = version(&s).await;
+
+        let mv = |dry_run| McpNodeMoveRequest {
+            node_id: a.clone(),
+            action: "move".into(),
+            new_parent: Some(b.clone()),
+            position: None,
+            dry_run,
+        };
+        let r = text(&s.node_move(Parameters(mv(true))).await.unwrap());
+        assert!(r.contains("would move 3 node(s)"), "{r}");
+        assert!(
+            r.contains("1. A → 1-1") && r.contains("1-1. A1 → 1-1-1"),
+            "{r}"
+        );
+        assert!(r.contains("Nothing changed"), "{r}");
+        assert_eq!(version(&s).await, v, "dry run wrote history");
+
+        let r = text(&s.node_move(Parameters(mv(false))).await.unwrap());
+        assert_eq!(
+            r,
+            format!("Moved → 1-1. A with 2 descendants: A1, A2 (id: {a_id})")
+        );
+        assert_eq!(trailing_uuid(&r), Some(a_id));
+    }
+
+    #[tokio::test]
+    async fn remove_without_descendants_ends_with_the_id() {
+        let s = server_with_book().await;
+        let (a, a_id) = create(&s, None, "Leaf", None).await;
+        let r = text(
+            &s.node_move(Parameters(McpNodeMoveRequest {
+                node_id: a,
+                action: "remove".into(),
+                new_parent: None,
+                position: None,
+                dry_run: false,
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(r, format!("Removed: 1. Leaf (id: {a_id})"));
+    }
+
+    #[tokio::test]
+    async fn rejected_move_is_invalid_params_in_dry_run_and_real_run() {
+        let s = server_with_book().await;
+        let (a, _) = create(&s, None, "A", None).await;
+        let (a1, _) = create(&s, Some(&a), "A1", None).await;
+        // Moving A under its own child is a cycle.
+        for dry_run in [true, false] {
+            let e = s
+                .node_move(Parameters(McpNodeMoveRequest {
+                    node_id: a.clone(),
+                    action: "move".into(),
+                    new_parent: Some(a1.clone()),
+                    position: None,
+                    dry_run,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                e.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "dry_run={dry_run}: {e:?}"
+            );
+        }
+    }
+
+    fn batch(moves: Vec<(String, Option<String>)>, dry_run: bool) -> McpBatchMoveRequest {
+        McpBatchMoveRequest {
+            moves: moves
+                .into_iter()
+                .map(|(node_id, new_parent)| McpBatchMoveItem {
+                    node_id,
+                    new_parent,
+                    position: None,
+                })
+                .collect(),
+            dry_run,
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_dry_run_commits_nothing_on_success_or_failure() {
+        let s = server_with_book().await;
+        let (_, a) = create(&s, None, "A", None).await;
+        let (_, b) = create(&s, None, "B", None).await;
+        let v = book_version(&s).await;
+
+        let ok = s
+            .node_batch_move(Parameters(batch(vec![(a.clone(), Some(b.clone()))], true)))
+            .await
+            .unwrap();
+        assert!(text(&ok).contains("would succeed"), "{}", text(&ok));
+        assert_eq!(book_version(&s).await, v, "successful dry run committed");
+
+        // A under B, then B under A: a cycle on the second operation.
+        let err = s
+            .node_batch_move(Parameters(batch(
+                vec![(a.clone(), Some(b.clone())), (b.clone(), Some(a.clone()))],
+                true,
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(book_version(&s).await, v, "failed dry run committed");
+
+        // The real run of the same failing batch: same code, nothing saved.
+        let err = s
+            .node_batch_move(Parameters(batch(
+                vec![(a.clone(), Some(b.clone())), (b, Some(a))],
+                false,
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+        assert_eq!(book_version(&s).await, v);
+    }
+
+    #[tokio::test]
+    async fn batch_moving_a_parent_and_its_child_previews_what_runs() {
+        let s = server_with_book().await;
+        let (a_toc, a) = create(&s, None, "A", None).await;
+        let (_, a1) = create(&s, Some(&a_toc), "A1", None).await;
+        let (_, b) = create(&s, None, "B", None).await;
+        let (_, c) = create(&s, None, "C", None).await;
+        // A (with A1) under B, then A1 alone under C.
+        let moves = vec![(a.clone(), Some(b.clone())), (a1.clone(), Some(c.clone()))];
+
+        let preview = text(
+            &s.node_batch_move(Parameters(batch(moves.clone(), true)))
+                .await
+                .unwrap(),
+        );
+        // A1 is both a descendant of A and a batch item: listed once.
+        assert_eq!(
+            preview.matches(&format!("(id: {a1})")).count(),
+            1,
+            "{preview}"
+        );
+
+        s.node_batch_move(Parameters(batch(moves, false)))
+            .await
+            .unwrap();
+        let toc = text(
+            &s.toc(Parameters(McpTocRequest {
+                subtree_root: None,
+                filter: None,
+                max_depth: None,
+                limit: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        // The preview's destinations are the real ones.
+        assert!(
+            preview.contains("1. A → 1-1") && toc.contains("1-1. A"),
+            "{preview}\n{toc}"
+        );
+        assert!(
+            preview.contains("1-1. A1 → 2-1") && toc.contains("2-1. A1"),
+            "{preview}\n{toc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn toc_rejects_zero_before_looking_at_the_book() {
+        let s = server_with_book().await; // empty book
+        let toc = |max_depth, limit| McpTocRequest {
+            subtree_root: None,
+            filter: None,
+            max_depth,
+            limit,
+        };
+        let e = s.toc(Parameters(toc(Some(0), None))).await.unwrap_err();
+        assert!(e.message.contains("max_depth"), "{e:?}");
+        let e = s.toc(Parameters(toc(None, Some(0)))).await.unwrap_err();
+        assert!(e.message.contains("limit"), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn toc_subtree_root_with_max_depth_counts_from_the_book_root() {
+        let s = server_with_book().await;
+        let (a, _) = create(&s, None, "A", None).await;
+        let (a1, _) = create(&s, Some(&a), "A1", None).await;
+        create(&s, Some(&a1), "A1x", None).await;
+        let r = text(
+            &s.toc(Parameters(McpTocRequest {
+                subtree_root: Some(a),
+                filter: None,
+                max_depth: Some(2),
+                limit: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(r.contains("1. A") && r.contains("1-1. A1"), "{r}");
+        assert!(!r.contains("A1x"), "{r}");
+        assert!(r.contains("… 1 more nodes not shown"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn remove_reports_descendants_and_records_every_delete() {
+        let s = server_with_book().await;
+        let (a, _) = create(&s, None, "A", None).await;
+        create(&s, Some(&a), "A1", None).await;
+        create(&s, Some(&a), "A2", None).await;
+        let rm = |dry_run| McpNodeMoveRequest {
+            node_id: a.clone(),
+            action: "remove".into(),
+            new_parent: None,
+            position: None,
+            dry_run,
+        };
+
+        let v = version(&s).await;
+        let r = text(&s.node_move(Parameters(rm(true))).await.unwrap());
+        assert!(
+            r.contains("would remove 3 node(s)") && r.contains("→ removed"),
+            "{r}"
+        );
+        assert_eq!(version(&s).await, v);
+
+        let r = text(&s.node_move(Parameters(rm(false))).await.unwrap());
+        assert!(
+            r.starts_with("Removed: 1. A and 2 descendants: A1, A2 (id: "),
+            "{r}"
+        );
+        assert!(trailing_uuid(&r).is_some(), "{r}");
+        let history = s.service_for("e").await.unwrap().history().await.unwrap();
+        let deletes = history[v..]
+            .iter()
+            .filter(|e| e.action == ChangeAction::Delete)
+            .count();
+        assert_eq!(deletes, 3);
     }
 }

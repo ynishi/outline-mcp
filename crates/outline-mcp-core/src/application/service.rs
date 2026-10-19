@@ -1,3 +1,4 @@
+use crate::domain::error::DomainError;
 use crate::domain::model::book::{AddNodeRequest, TemplateBook, UpdateNodeRequest};
 use crate::domain::model::changelog::{ChangeAction, ChangeEntry};
 use crate::domain::model::id::NodeId;
@@ -164,25 +165,40 @@ impl<S: BookStore> BookService<S> {
 
     /// ノードを削除する（子孫ごと）。
     ///
+    /// Records a `Delete` entry, with the node as it was, for the node and for
+    /// every descendant removed with it — all in the same commit — so each
+    /// removed node's `node_history` ends with its deletion.
+    ///
     /// 戻り値: `((), Option<String>)` — 第2要素は store が返した警告。
     pub async fn remove_node(&self, id: NodeId) -> Result<((), Option<String>), AppError> {
         let Versioned {
             value: mut book,
             version,
         } = self.load_book().await?;
-        let before_json = node_json(&book, id);
+        let removed: Vec<NodeId> = std::iter::once(id).chain(book.descendant_ids(id)).collect();
+        let at = Timestamp::now();
+        let entries: Vec<ChangeEntry> = removed
+            .iter()
+            .map(|&n| ChangeEntry::new(n, ChangeAction::Delete, node_json(&book, n), None, at))
+            .collect();
         book.remove_node(id)?;
 
-        let entry = ChangeEntry::new(
-            id,
-            ChangeAction::Delete,
-            before_json,
-            None,
-            Timestamp::now(),
-        );
-        let warnings = self.commit(Some(version), &book, &[entry]).await?;
+        let warnings = self.commit(Some(version), &book, &entries).await?;
 
         Ok(((), join_warnings(warnings)))
+    }
+
+    /// Apply `change` to a copy of the current book without committing, and
+    /// return the book before and after. For dry runs: the same validation as
+    /// the real operation, nothing written.
+    pub async fn preview<F>(&self, change: F) -> Result<(TemplateBook, TemplateBook), AppError>
+    where
+        F: FnOnce(&mut TemplateBook) -> Result<(), DomainError>,
+    {
+        let before = self.load_book().await?.value;
+        let mut after = before.clone();
+        change(&mut after)?;
+        Ok((before, after))
     }
 
     /// 複数ノードをアトミックに移動する（全成功 or 何も commit しない）。
@@ -830,6 +846,70 @@ mod tests {
         let (id, _) = svc.add_node(add_req("to be removed")).await.expect("add");
         let ((), warning) = svc.remove_node(id).await.expect("remove");
         assert!(warning.is_none());
+    }
+
+    fn child_of(parent: NodeId, title: &str) -> AddNodeRequest {
+        AddNodeRequest {
+            parent: Some(parent),
+            ..add_req(title)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remove_records_a_delete_for_every_removed_node_in_one_commit() {
+        let svc = memory_service().await;
+        let (root, _) = svc.add_node(add_req("root")).await.unwrap();
+        let (child, _) = svc.add_node(child_of(root, "child")).await.unwrap();
+        let (grand, _) = svc.add_node(child_of(child, "grand")).await.unwrap();
+        let (keep, _) = svc.add_node(add_req("keep")).await.unwrap();
+        let before = svc.history().await.unwrap().len();
+
+        svc.remove_node(root).await.expect("remove");
+
+        let history = svc.history().await.unwrap();
+        let deletes: Vec<_> = history[before..].iter().collect();
+        assert_eq!(deletes.len(), 3, "one commit, three deletes: {deletes:?}");
+        assert!(deletes.iter().all(|e| e.action == ChangeAction::Delete));
+        assert!(deletes
+            .iter()
+            .all(|e| e.before.is_some() && e.after.is_none()));
+        let ids: Vec<_> = deletes.iter().map(|e| e.node_id).collect();
+        assert_eq!(ids, vec![root, child, grand]);
+        for id in [root, child, grand] {
+            let h = svc.history_by_node(id).await.unwrap();
+            assert_eq!(h.last().unwrap().action, ChangeAction::Delete);
+        }
+        let tree = svc.read_tree().await.unwrap();
+        assert_eq!(tree.node_count(), 1);
+        assert!(tree.get_node(keep).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_preview_validates_and_commits_nothing() {
+        let svc = memory_service().await;
+        let (a, _) = svc.add_node(add_req("a")).await.unwrap();
+        let (b, _) = svc.add_node(add_req("b")).await.unwrap();
+        let (c, _) = svc.add_node(child_of(a, "c")).await.unwrap();
+        let history_before = svc.history().await.unwrap().len();
+
+        let (before, after) = svc
+            .preview(|book| book.move_node(a, Some(b), usize::MAX))
+            .await
+            .expect("preview");
+        assert_eq!(before.get_node(a).unwrap().parent(), None);
+        assert_eq!(after.get_node(a).unwrap().parent(), Some(b));
+        assert_eq!(after.get_node(c).unwrap().parent(), Some(a));
+
+        // Nothing was written: tree and history unchanged.
+        let tree = svc.read_tree().await.unwrap();
+        assert_eq!(tree.get_node(a).unwrap().parent(), None);
+        assert_eq!(svc.history().await.unwrap().len(), history_before);
+
+        // An invalid change is refused the same way the real one is.
+        let cyclic = svc.preview(|book| book.move_node(b, Some(c), 0)).await;
+        assert!(cyclic.is_ok(), "b under c is fine");
+        let cycle = svc.preview(|book| book.move_node(a, Some(c), 0)).await;
+        assert!(matches!(cycle, Err(AppError::Domain(_))));
     }
 
     #[tokio::test]
