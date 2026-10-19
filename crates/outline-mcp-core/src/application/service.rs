@@ -21,6 +21,22 @@ pub struct BookUpdate {
     pub changed: bool,
 }
 
+/// What [`BookService::import_book_counted`] did to the book.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImportCounts {
+    /// Nodes in the import that the book did not have.
+    pub created: usize,
+    /// Nodes in both whose content differs.
+    pub updated: usize,
+    /// Nodes the book had that the import does not (deleted by it).
+    pub deleted: usize,
+    /// Whether the book's title or max depth changed.
+    pub book_fields_changed: bool,
+    /// History entries recorded (one per counted node, plus one when the
+    /// title or max depth changed).
+    pub entries: usize,
+}
+
 /// Template Bookに対するユースケース。
 /// load → mutate → commit のパターンで操作する。
 ///
@@ -473,14 +489,45 @@ impl<S: BookStore> BookService<S> {
     /// between is a conflict. A book that does not exist yet is created, with a
     /// `Create` entry per node.
     pub async fn import_book(&self, book: &TemplateBook) -> Result<usize, AppError> {
+        self.import_book_counted(book).await.map(|c| c.entries)
+    }
+
+    /// [`Self::import_book`], reporting what the replacement did: how many
+    /// nodes it created, updated and deleted, whether the book's title or
+    /// max depth changed, and how many history entries it recorded.
+    pub async fn import_book_counted(&self, book: &TemplateBook) -> Result<ImportCounts, AppError> {
+        let book = book.clone();
+        self.import_with(move |_| Ok(book), |b| b)
+            .await
+            .map(|(counts, _)| counts)
+    }
+
+    /// [`Self::import_book_counted`] for an import that depends on the book
+    /// it replaces: the book is loaded once, `build` turns that snapshot into
+    /// whatever it produces (`book_of` picks the replacement book out of it),
+    /// and the commit goes over the same snapshot's version. A write between
+    /// the load and the commit is a conflict, so `build` never decides from a
+    /// book other than the one being replaced.
+    pub async fn import_with<R>(
+        &self,
+        build: impl FnOnce(Option<&TemplateBook>) -> Result<R, AppError>,
+        book_of: impl Fn(&R) -> &TemplateBook,
+    ) -> Result<(ImportCounts, R), AppError> {
         let current = self.store.load(&self.slug).await.map_err(store_error)?;
+        let built = build(current.as_ref().map(|v| &v.value))?;
+        let book = book_of(&built);
         let at = Timestamp::now();
         let mut events = Vec::new();
+        let mut counts = ImportCounts::default();
 
         if let Some(cur) = &current {
-            events.extend(book_fields_change(&cur.value, book, at));
+            if let Some(entry) = book_fields_change(&cur.value, book, at) {
+                counts.book_fields_changed = true;
+                events.push(entry);
+            }
             for id in cur.value.all_node_ids() {
                 if book.get_node(id).is_none() {
+                    counts.deleted += 1;
                     events.push(ChangeEntry::new(
                         id,
                         ChangeAction::Delete,
@@ -498,20 +545,31 @@ impl<S: BookStore> BookService<S> {
                 .filter(|cur| cur.value.get_node(id).is_some())
                 .map(|cur| &cur.value);
             match before {
-                None => events.push(ChangeEntry::new(id, ChangeAction::Create, None, after, at)),
+                None => {
+                    counts.created += 1;
+                    events.push(ChangeEntry::new(id, ChangeAction::Create, None, after, at))
+                }
                 // Compare as JSON values, not strings: `properties` is a
                 // HashMap, so two equal nodes can serialize with their keys in
                 // a different order.
-                Some(cur) if node_value(cur, id) != node_value(book, id) => events.push(
-                    ChangeEntry::new(id, ChangeAction::Update, node_json(cur, id), after, at),
-                ),
+                Some(cur) if node_value(cur, id) != node_value(book, id) => {
+                    counts.updated += 1;
+                    events.push(ChangeEntry::new(
+                        id,
+                        ChangeAction::Update,
+                        node_json(cur, id),
+                        after,
+                        at,
+                    ))
+                }
                 Some(_) => {}
             }
         }
 
         self.commit(current.map(|v| v.version), book, &events)
             .await?;
-        Ok(events.len())
+        counts.entries = events.len();
+        Ok((counts, built))
     }
 
     /// Replace the book with `book` (a snapshot being restored), recording a
@@ -1573,6 +1631,50 @@ mod tests {
         assert!(matches!(err, AppError::Conflict { .. }), "{err:?}");
         let book = svc.read_tree().await.unwrap();
         assert_eq!(book.title(), "C", "the conflicting change was not stored");
+    }
+
+    #[tokio::test]
+    async fn test_import_with_builds_from_the_committed_snapshot_and_conflicts() {
+        let store = InterleavingStore {
+            inner: MemoryBookStore::new(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let svc = BookService::new(store, "imp");
+        svc.create_book("Imp", 3).await.unwrap();
+        svc.add_node(add_req("A")).await.unwrap();
+        let v0 = svc.current_version().await.unwrap();
+
+        // Another writer commits right after the import loaded the book: the
+        // import, built from that load, must not land over the newer version.
+        svc.store
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = svc
+            .import_with(
+                |current| {
+                    let mut book = current.expect("book exists").clone();
+                    book.add_node(add_req("B")).unwrap();
+                    Ok(book)
+                },
+                |b| b,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict { .. }), "{err:?}");
+        assert_ne!(
+            svc.current_version().await.unwrap(),
+            v0,
+            "the other write landed"
+        );
+        let titles: Vec<String> = svc
+            .read_tree()
+            .await
+            .unwrap()
+            .all_nodes_dfs()
+            .iter()
+            .map(|n| n.title().to_string())
+            .collect();
+        assert_eq!(titles, vec!["A"], "the import was not stored");
     }
 
     #[tokio::test]

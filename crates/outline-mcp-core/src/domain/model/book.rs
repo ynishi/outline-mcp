@@ -280,6 +280,50 @@ impl TemplateBook {
         replace: bool,
     ) -> Result<(), DomainError> {
         let node = self.nodes.get(&id).ok_or(DomainError::NodeNotFound(id))?;
+        if node.proposal().is_some() && !replace {
+            return Err(DomainError::ProposalExists(id));
+        }
+        self.check_revision(id, &revision)?;
+        revision.base = content_fingerprint(node);
+        self.nodes
+            .get_mut(&id)
+            .ok_or(DomainError::NodeNotFound(id))?
+            .set_proposal(Some(revision));
+        Ok(())
+    }
+
+    /// Set a node's last-edited stamp. Import-only: everything else stamps
+    /// through the operation that changed the node.
+    pub(crate) fn restamp(&mut self, id: NodeId, at: Timestamp) -> Result<(), DomainError> {
+        self.nodes
+            .get_mut(&id)
+            .ok_or(DomainError::NodeNotFound(id))?
+            .set_updated_at(Some(at));
+        Ok(())
+    }
+
+    /// Put back a pending revision read from an export, unchanged (its
+    /// `base`, proposer and time are kept, so one that was stale stays
+    /// stale), after the same checks [`Self::propose_revision`] makes.
+    pub(crate) fn restore_proposal(
+        &mut self,
+        id: NodeId,
+        revision: Revision,
+    ) -> Result<(), DomainError> {
+        self.check_revision(id, &revision)?;
+        self.nodes
+            .get_mut(&id)
+            .ok_or(DomainError::NodeNotFound(id))?
+            .set_proposal(Some(revision));
+        Ok(())
+    }
+
+    /// The rules every pending revision obeys: the node exists and is not
+    /// archived (or under an archived section), the revision changes at
+    /// least one field, does not combine `properties` with
+    /// `properties_patch`, and would change the node's content.
+    fn check_revision(&self, id: NodeId, revision: &Revision) -> Result<(), DomainError> {
+        let node = self.nodes.get(&id).ok_or(DomainError::NodeNotFound(id))?;
         if self.is_archived_or_under_archived(id) {
             return Err(DomainError::RevisionOnArchived(id));
         }
@@ -289,19 +333,11 @@ impl TemplateBook {
         if revision.properties.is_some() && revision.properties_patch.is_some() {
             return Err(DomainError::ConflictingPropertyUpdate(id));
         }
-        if node.proposal().is_some() && !replace {
-            return Err(DomainError::ProposalExists(id));
-        }
         let mut applied = node.clone();
-        apply_revision_content(&mut applied, &revision);
+        apply_revision_content(&mut applied, revision);
         if content_fingerprint(&applied) == content_fingerprint(node) {
             return Err(DomainError::RevisionChangesNothing(id));
         }
-        revision.base = content_fingerprint(node);
-        self.nodes
-            .get_mut(&id)
-            .ok_or(DomainError::NodeNotFound(id))?
-            .set_proposal(Some(revision));
         Ok(())
     }
 

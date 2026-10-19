@@ -88,7 +88,7 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 8. **`node_batch_move`** — Move multiple nodes in a single atomic call (requires UUID or UUID-prefix IDs; to delete a node, use `node_move` with `action: "remove"`); also takes `dry_run`
 9. **`node_batch_update`** — Update title/body/type/properties/status on multiple nodes atomically
 10. **`node_query`** — Search nodes by property values, status (`active`/`draft`/`archived`), type (`section`/`content`), `text` (case-insensitive substring of title or body, CJK included, with a snippet of the first body match), or `verified_before` (nodes never verified or last verified before a date / datetime / millis); optionally include body in results. Archived nodes come back only with `status: "archived"` or `include_archived: true`
-11. **`import`** — Import a book from a previously exported JSON file
+11. **`import`** — Import a book from a previously exported JSON file, restoring status, verification, links and pending revisions. Node ids in the file are kept, so re-importing a book's own export changes only what differs; `new_ids: true` imports a copy with fresh ids (links between imported nodes are remapped). Links to nodes not in the file, and pending revisions that break the revision rules, are dropped and reported. The result counts nodes created, updated and deleted (nodes of the book that are not in the file are deleted). A file exported from one section (marked in the file, or recognized from its node ids for exports older than the marker) is refused unless `force: true`, since it would replace the whole book
 12. **`gen_routing`** — Generate a Markdown routing table from nodes with `routing` property across all books
 13. **`snapshot_create`** / **`snapshot_list`** / **`snapshot_restore`** / **`snapshot_delete`** — Full book versioning (create, list, restore, delete one snapshot; a labeled snapshot needs `force: true` to delete)
 14. **`node_history`** — View per-node change log with before/after diffs
@@ -189,7 +189,7 @@ outline-mcp-core = "0.12"
 
 ### JSON
 
-Tree-structured format that can be re-imported:
+Tree-structured format that can be re-imported with `import`:
 
 ```json
 {
@@ -197,13 +197,26 @@ Tree-structured format that can be re-imported:
   "max_depth": 4,
   "nodes": [
     {
+      "id": "0b8c…-uuid",
       "title": "Design",
       "node_type": "section",
+      "updated_at": "2026-10-19T08:00:00.000Z",
       "children": [...]
+    },
+    {
+      "id": "5d1e…-uuid",
+      "title": "Old design",
+      "node_type": "content",
+      "status": "archived",
+      "verified_at": "2026-09-01T00:00:00.000Z",
+      "verified_by": "alice",
+      "links": [{ "rel": "superseded_by", "target": "0b8c…-uuid" }]
     }
   ]
 }
 ```
+
+Besides title, type, body, placeholder, children and properties, each node carries its `status` (left out when active), `updated_at`, `verified_at` / `verified_by`, `links` (targets are `id`s in the same file) and a pending `proposal`, each left out when empty, so files from earlier versions still import. For a complete round trip, export with `dump` (or `checklist` with `include_archived: true`): `checklist` leaves archived nodes out by default, and importing such a file deletes them from the book (the import result says how many). An export of one section records it as `subtree_root`; `import` refuses such a file unless `force: true`.
 
 ## Upgrading
 

@@ -305,26 +305,22 @@ fn import_rejects_deep_nesting() {
         id: "leaf".into(),
         title: "Leaf".into(),
         node_type: "content".into(),
-        body: None,
-        placeholder: None,
-        children: vec![],
-        properties: std::collections::HashMap::new(),
+        ..Default::default()
     };
     for i in (0..40).rev() {
         node = EjectTreeNode {
             id: format!("level-{i}"),
             title: format!("Level {i}"),
             node_type: "section".into(),
-            body: None,
-            placeholder: None,
             children: vec![node],
-            properties: std::collections::HashMap::new(),
+            ..Default::default()
         };
     }
 
     let tree = EjectTree {
         title: "Deep".into(),
         max_depth: 50, // Bookのmax_depthは広くてもimportの再帰制限で弾く
+        subtree_root: None,
         nodes: vec![node],
     };
 

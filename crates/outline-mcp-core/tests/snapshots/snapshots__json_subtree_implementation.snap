@@ -5,6 +5,10 @@ expression: stable
 {
   "title": "Implementation",
   "max_depth": 4,
+  "subtree_root": {
+    "id": "stable-subtree-root",
+    "title": "Implementation"
+  },
   "nodes": [
     {
       "id": "stable-id-1",
