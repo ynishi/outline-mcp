@@ -1060,7 +1060,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "book_update",
-        description = "Change a book's title and / or max_depth. The slug must be given explicitly; pass at least one of `title` / `max_depth`. Lowering max_depth below the depth of an existing node is refused and names that node (move or remove it first). The change is one commit and appears in `book_history` as a `book_update` entry.",
+        description = "Change a book's title, max_depth and / or archived flag. The slug must be given explicitly; pass at least one of `title` / `max_depth` / `archived`. `archived: true` retires the book without deleting anything: it stays readable and writable, `shelf` and `gen_routing` leave it out, and `select_book` injects nothing from it; snapshot_restore and import keep the flag as it is. Lowering max_depth below the depth of an existing node is refused and names that node (move or remove it first). The change is one commit and appears in `book_history` as a `book_update` entry.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1074,7 +1074,7 @@ impl OutlineMcpServer {
     ) -> Result<CallToolResult, McpError> {
         validate_slug(&req.slug)?;
         let msg = self
-            .update_book(&req.slug, req.title, req.max_depth)
+            .update_book(&req.slug, req.title, req.max_depth, req.archived)
             .await?;
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             msg,
@@ -1162,7 +1162,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "shelf",
-        description = "List all books in the shelf. Shows book slugs, titles, and node counts. The currently selected book is marked with ★.",
+        description = "List the books in the shelf. Shows book slugs, titles, and node counts. The currently selected book is marked with ★. Archived books are left out (a last line counts them) unless `include_archived: true`; the numbers stay the same either way.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1171,7 +1171,7 @@ impl OutlineMcpServer {
     )]
     async fn shelf(
         &self,
-        #[allow(unused_variables)] Parameters(_req): Parameters<McpShelfRequest>,
+        Parameters(req): Parameters<McpShelfRequest>,
     ) -> Result<CallToolResult, McpError> {
         let slugs = self.list_book_slugs().await?;
 
@@ -1191,37 +1191,61 @@ impl OutlineMcpServer {
             guard.clone()
         };
 
-        let mut entries: Vec<(String, String, usize)> = Vec::new();
+        // (slug, title, node count, archived)
+        let mut entries: Vec<(String, String, usize, bool)> = Vec::new();
         for slug in &slugs {
             match self.service_for(slug).await {
                 Ok(svc) => match svc.read_tree().await {
                     Ok(book) => {
-                        entries.push((slug.clone(), book.title().to_string(), book.node_count()));
+                        entries.push((
+                            slug.clone(),
+                            book.title().to_string(),
+                            book.node_count(),
+                            book.is_archived(),
+                        ));
                     }
                     Err(_) => {
-                        entries.push((slug.clone(), "(failed to load)".to_string(), 0));
+                        entries.push((slug.clone(), "(failed to load)".to_string(), 0, false));
                     }
                 },
                 Err(_) => {
-                    entries.push((slug.clone(), "(failed to load)".to_string(), 0));
+                    entries.push((slug.clone(), "(failed to load)".to_string(), 0, false));
                 }
             }
         }
 
-        let mut output = format!("# Shelf ({} books)\n\n", entries.len());
-        for (i, (slug, title, count)) in entries.iter().enumerate() {
+        let hidden = if req.include_archived {
+            0
+        } else {
+            entries.iter().filter(|e| e.3).count()
+        };
+        let mut output = format!("# Shelf ({} books)\n\n", entries.len() - hidden);
+        // Numbers are positions in the full list, archived books included, so
+        // `select_book` resolves the same number whether they are shown or not.
+        for (i, (slug, title, count, archived)) in entries.iter().enumerate() {
+            if *archived && !req.include_archived {
+                continue;
+            }
             let marker = if selected.as_deref() == Some(slug.as_str()) {
                 " ★"
             } else {
                 ""
             };
             output.push_str(&format!(
-                "{}. {} — \"{}\" ({} nodes){}\n",
+                "{}. {} — \"{}\" ({} nodes){}{}\n",
                 i + 1,
                 slug,
                 title,
                 count,
+                if *archived { " [archived]" } else { "" },
                 marker
+            ));
+        }
+        if hidden > 0 {
+            output.push_str(&format!(
+                "\n({hidden} archived {} hidden; pass `include_archived: true` to list {})\n",
+                if hidden == 1 { "book" } else { "books" },
+                if hidden == 1 { "it" } else { "them" },
             ));
         }
 
@@ -1295,15 +1319,19 @@ impl OutlineMcpServer {
         };
         // Only active nodes outside archived sections: archiving a section
         // retires everything under it, including active inject=true children.
+        // An archived book injects nothing.
         let injected_nodes: Vec<_> = book
             .nodes_matching(&inject_filter)
             .into_iter()
             .filter(|node| {
-                node.status() == NodeStatus::Active
+                !book.is_archived()
+                    && node.status() == NodeStatus::Active
                     && !book.is_archived_or_under_archived(node.id())
             })
             .collect();
-        let inject_section = if injected_nodes.is_empty() {
+        let inject_section = if book.is_archived() {
+            String::from("\n\n(book is archived: no context injected; `book_update` with `archived: false` to restore it)")
+        } else if injected_nodes.is_empty() {
             String::new()
         } else {
             let mut buf = format!(
@@ -1322,10 +1350,15 @@ impl OutlineMcpServer {
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             format!(
-                "Selected: {} — \"{}\" ({} nodes){}{}",
+                "Selected: {} — \"{}\" ({} nodes){}{}{}",
                 slug,
                 book.title(),
                 book.node_count(),
+                if book.is_archived() {
+                    " [archived]"
+                } else {
+                    ""
+                },
                 toc_section,
                 inject_section
             ),
@@ -1334,7 +1367,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "gen_routing",
-        description = "Generate a Markdown routing table from nodes with `routing` property across all books. Set `routing` property on nodes to define work scenarios (e.g. routing=\"Git操作\"). Use `|` separator for multiple scenarios. Optional `routing_ref` property overrides the default §ID reference (e.g. routing_ref=\"select_book で全体参照\").",
+        description = "Generate a Markdown routing table from nodes with `routing` property across all books (archived books and archived nodes are skipped). Set `routing` property on nodes to define work scenarios (e.g. routing=\"Git操作\"). Use `|` separator for multiple scenarios. Optional `routing_ref` property overrides the default §ID reference (e.g. routing_ref=\"select_book で全体参照\").",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1359,6 +1392,9 @@ impl OutlineMcpServer {
                 Ok(b) => b,
                 Err(_) => continue,
             };
+            if book.is_archived() {
+                continue;
+            }
 
             let id_map = build_hierarchical_ids(&book);
 
@@ -3567,6 +3603,7 @@ mod book_update_tool_tests {
             slug: slug.into(),
             title: title.map(str::to_string),
             max_depth,
+            archived: None,
         }
     }
 
@@ -3670,6 +3707,71 @@ mod book_update_tool_tests {
             .filter(|e| e.action == ChangeAction::BookUpdate)
             .count();
         assert_eq!(book_updates, 1);
+    }
+
+    #[tokio::test]
+    async fn archived_book_leaves_shelf_and_injects_nothing() {
+        let s = server();
+        book_with_depth_two_node(&s, "a").await;
+        let svc = s.service_for("b").await.unwrap();
+        svc.create_book("B", 3).await.unwrap();
+        let mut props = HashMap::new();
+        props.insert("inject".to_string(), "true".to_string());
+        svc.add_node(AddNodeRequest {
+            parent: None,
+            title: "Rule".into(),
+            node_type: NodeType::Content,
+            body: Some("rule body".into()),
+            placeholder: None,
+            position: usize::MAX,
+            properties: props,
+        })
+        .await
+        .unwrap();
+
+        let mut archive = req("b", None, None);
+        archive.archived = Some(true);
+        let r = text(&s.book_update(Parameters(archive.clone())).await.unwrap());
+        assert!(r.contains("archived"), "{r}");
+        let again = text(&s.book_update(Parameters(archive)).await.unwrap());
+        assert!(again.contains("No change"), "{again}");
+
+        let shelf = |include_archived| McpShelfRequest { include_archived };
+        let listed = text(&s.shelf(Parameters(shelf(false))).await.unwrap());
+        assert!(listed.contains("1. a"), "{listed}");
+        assert!(!listed.contains("2. b"), "{listed}");
+        assert!(listed.contains("1 archived book hidden"), "{listed}");
+        let all = text(&s.shelf(Parameters(shelf(true))).await.unwrap());
+        assert!(
+            all.contains(r#"2. b — \"B\" (1 nodes) [archived]"#),
+            "{all}"
+        );
+
+        // The number from the full list still selects it; nothing is injected.
+        let sel = text(
+            &s.select_book(Parameters(McpSelectBookRequest {
+                book: "2".into(),
+                quiet: true,
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(
+            sel.contains("Selected: b") && sel.contains("[archived]"),
+            "{sel}"
+        );
+        assert!(!sel.contains("Injected Context"), "{sel}");
+
+        let h = text(
+            &s.book_history(Parameters(McpBookHistoryRequest {
+                limit: None,
+                since: None,
+                until: None,
+            }))
+            .await
+            .unwrap(),
+        );
+        assert!(h.contains("book_update") && h.contains("archived"), "{h}");
     }
 }
 

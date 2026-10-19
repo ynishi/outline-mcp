@@ -7,7 +7,7 @@
 //!
 //! | route (GET) | shows |
 //! |---|---|
-//! | `/ui/` | the shelf (slug, title, node count, last update) and a search form |
+//! | `/ui/` | the shelf (slug, title, active node count — `active/all` with `?totals=1` —, last update) and a search form; archived books hidden unless `?archived=1` |
 //! | `/ui/search?book=&q=` | `303 See Other` to the book's search page (the shelf form posts here) |
 //! | `/ui/book/{slug}` | the book's table of contents with markers; archived subtrees hidden unless `?archived=1` |
 //! | `/ui/book/{slug}/node/{uuid}` | one node: breadcrumbs, meta, properties, rendered body, links both ways, pending revision with its diff, children, history |
@@ -301,8 +301,34 @@ async fn load(ui: &Ui, slug: &str) -> Result<Versioned<TemplateBook>, UiError> {
 
 // --- handlers ---------------------------------------------------------------
 
-async fn index(State(ui): State<Ui>) -> UiResult {
+#[derive(Debug, Default, Deserialize)]
+struct ShelfQuery {
+    totals: Option<String>,
+    archived: Option<String>,
+}
+
+/// The shelf's URL with its two toggles.
+fn shelf_url(totals: bool, archived: bool) -> String {
+    match (totals, archived) {
+        (false, false) => "/ui/".to_string(),
+        (true, false) => "/ui/?totals=1".to_string(),
+        (false, true) => "/ui/?archived=1".to_string(),
+        (true, true) => "/ui/?totals=1&amp;archived=1".to_string(),
+    }
+}
+
+/// Nodes that are `active` and not under an archived section.
+fn active_count(book: &TemplateBook) -> usize {
+    book.all_nodes_dfs()
+        .iter()
+        .filter(|n| n.status() == NodeStatus::Active && !book.is_archived_or_under_archived(n.id()))
+        .count()
+}
+
+async fn index(State(ui): State<Ui>, Query(q): Query<ShelfQuery>) -> UiResult {
     let books = ui.storage.books.list_books().await?;
+    let totals = flag_on(q.totals.as_deref());
+    let archived = flag_on(q.archived.as_deref());
     let mut body = String::from("<h1>outline</h1>");
     body.push_str(&shelf_search_form(
         &books.iter().map(|b| b.slug.as_str()).collect::<Vec<_>>(),
@@ -313,17 +339,38 @@ async fn index(State(ui): State<Ui>) -> UiResult {
         body.push_str("<p>No books yet.</p>");
         return Ok(page("outline", &body));
     }
-    body.push_str(
-        r#"<table><thead><tr><th>book</th><th>title</th><th class="n">nodes</th><th>last update</th></tr></thead><tbody>"#,
-    );
+    let hidden = if archived {
+        0
+    } else {
+        books.iter().filter(|b| b.archived).count()
+    };
+    let books: Vec<_> = books.iter().filter(|b| archived || !b.archived).collect();
+    body.push_str(&format!(
+        r#"<p class="meta"><a href="{}">{} totals</a> · <a href="{}">{} archived books</a></p>"#,
+        shelf_url(!totals, archived),
+        if totals { "hide" } else { "show" },
+        shelf_url(totals, !archived),
+        if archived { "hide" } else { "show" },
+    ));
+    body.push_str(&format!(
+        r#"<table><thead><tr><th>book</th><th>title</th><th class="n">{}</th><th>last update</th></tr></thead><tbody>"#,
+        if totals { "active / all" } else { "active" }
+    ));
     for (i, b) in books.iter().enumerate() {
+        let title = if b.archived {
+            format!(
+                r#"{} <span class="tag archived">archived</span>"#,
+                escape(&b.title)
+            )
+        } else {
+            escape(&b.title)
+        };
         // Node counts need the whole book; past SHELF_LOAD_MAX books, list
         // the rest without them so one page view stays bounded.
         if i >= SHELF_LOAD_MAX {
             body.push_str(&format!(
                 r#"<tr><td><a href="/ui/book/{slug}">{slug}</a></td><td>{title}</td><td class="n"></td><td></td></tr>"#,
                 slug = escape(&b.slug),
-                title = escape(&b.title),
             ));
             continue;
         }
@@ -335,18 +382,29 @@ async fn index(State(ui): State<Ui>) -> UiResult {
                     .iter()
                     .filter_map(|n| n.updated_at())
                     .max();
-                (v.value.node_count(), last)
+                let active = active_count(&v.value);
+                let count = if totals {
+                    format!("{active}/{}", v.value.node_count())
+                } else {
+                    active.to_string()
+                };
+                (count, last)
             }
-            None => (0, None),
+            None => ("0".to_string(), None),
         };
         body.push_str(&format!(
             r#"<tr><td><a href="/ui/book/{slug}">{slug}</a></td><td>{title}</td><td class="n">{count}</td><td>{last}</td></tr>"#,
             slug = escape(&b.slug),
-            title = escape(&b.title),
             last = last.map(fmt_time).unwrap_or_default(),
         ));
     }
     body.push_str("</tbody></table>");
+    if hidden > 0 {
+        body.push_str(&format!(
+            r#"<p class="meta">… {hidden} archived books hidden (<a href="{}">show</a>)</p>"#,
+            shelf_url(totals, true)
+        ));
+    }
     if books.len() > SHELF_LOAD_MAX {
         body.push_str(&format!(
             r#"<p class="meta">Node counts and update times are shown for the first {SHELF_LOAD_MAX} books only.</p>"#
@@ -379,7 +437,7 @@ struct BookQuery {
     archived: Option<String>,
 }
 
-fn show_archived(flag: Option<&str>) -> bool {
+fn flag_on(flag: Option<&str>) -> bool {
     matches!(flag, Some("1" | "true" | "yes"))
 }
 
@@ -390,7 +448,7 @@ async fn book(
 ) -> UiResult {
     let v = load(&ui, &slug).await?;
     let book = &v.value;
-    let archived = show_archived(q.archived.as_deref());
+    let archived = flag_on(q.archived.as_deref());
     let mut body = format!(
         r#"<nav><a href="/ui/">outline</a></nav><h1>{title}</h1><p class="meta">{slug} · {count} nodes · max depth {depth} · version {version}</p><p class="meta"><code class="ref">outline:{slug}</code></p>"#,
         title = escape(book.title()),
@@ -575,7 +633,7 @@ async fn book_search(
 ) -> UiResult {
     let v = load(&ui, &slug).await?;
     let book = &v.value;
-    let archived = show_archived(sq.archived.as_deref());
+    let archived = flag_on(sq.archived.as_deref());
     let text = sq.q.unwrap_or_default();
     let mut body = format!(
         r#"<nav><a href="/ui/">outline</a> / <a href="/ui/book/{slug}">{slug}</a></nav><h1>Search</h1>"#,
@@ -1063,11 +1121,38 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert!(body.contains(r#"<a href="/ui/book/b">b</a>"#), "{body}");
         assert!(body.contains("The &lt;Book&gt;"), "{body}");
-        assert!(body.contains(r#"<td class="n">4</td>"#), "{body}");
+        // Rules and Live are active; Attic is archived, Old sits under it.
+        assert!(body.contains(r#"<td class="n">2</td>"#), "{body}");
+        assert!(body.contains(r#"href="/ui/?totals=1""#), "{body}");
         assert!(body.contains(r#"action="/ui/search""#), "{body}");
         assert_headers(&r, "/ui/");
         let (s, _, _) = open(&f, "/ui").await;
         assert_eq!(s, StatusCode::OK);
+        let (s, body, _) = open(&f, "/ui/?totals=1").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains(r#"<td class="n">2/4</td>"#), "{body}");
+        assert!(body.contains(r#"<a href="/ui/">hide totals</a>"#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn shelf_hides_archived_books_unless_asked() {
+        let f = fixture().await;
+        let svc = BookService::new(f.storage.books.clone(), "b");
+        svc.update_book(None, None, Some(true)).await.unwrap();
+        let (_, body, _) = open(&f, "/ui/").await;
+        assert!(!body.contains(r#"<a href="/ui/book/b">b</a>"#), "{body}");
+        assert!(body.contains("1 archived books hidden"), "{body}");
+        let (_, body, _) = open(&f, "/ui/?archived=1&totals=1").await;
+        assert!(body.contains(r#"<a href="/ui/book/b">b</a>"#), "{body}");
+        assert!(
+            body.contains(r#"<span class="tag archived">archived</span>"#),
+            "{body}"
+        );
+        assert!(body.contains(r#"<td class="n">2/4</td>"#), "{body}");
+        assert!(
+            body.contains(r#"href="/ui/?totals=1">hide archived books"#),
+            "{body}"
+        );
     }
 
     #[tokio::test]

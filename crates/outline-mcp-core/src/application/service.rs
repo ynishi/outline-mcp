@@ -8,14 +8,46 @@ use crate::domain::store::{BookStore, StoreError, Versioned};
 
 use super::error::AppError;
 
-/// The result of [`BookService::update_book`]: the book's (title, max depth)
-/// before and after, and whether anything was committed.
+/// A book's own fields, as [`BookService::update_book`] reports them and a
+/// `book_update` history entry records them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookFields {
+    /// The book's title.
+    pub title: String,
+    /// The book's maximum tree depth.
+    pub max_depth: u8,
+    /// Whether the book is archived.
+    pub archived: bool,
+}
+
+impl BookFields {
+    /// The fields of `book`.
+    pub fn of(book: &TemplateBook) -> Self {
+        Self {
+            title: book.title().to_string(),
+            max_depth: book.max_depth(),
+            archived: book.is_archived(),
+        }
+    }
+
+    fn json(&self) -> String {
+        serde_json::json!({
+            "title": self.title,
+            "max_depth": self.max_depth,
+            "archived": self.archived,
+        })
+        .to_string()
+    }
+}
+
+/// The result of [`BookService::update_book`]: the book's fields before and
+/// after, and whether anything was committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookUpdate {
-    /// (title, max depth) before the call.
-    pub before: (String, u8),
-    /// (title, max depth) after the call.
-    pub after: (String, u8),
+    /// The fields before the call.
+    pub before: BookFields,
+    /// The fields after the call.
+    pub after: BookFields,
     /// False when the requested values were already in place (nothing
     /// committed, no history entry).
     pub changed: bool,
@@ -144,27 +176,31 @@ impl<S: BookStore> BookService<S> {
         Ok(at)
     }
 
-    /// Change the book's own fields: title and / or max depth (`None` keeps
-    /// the current value). One commit over the version just read, carrying a
-    /// [`ChangeAction::BookUpdate`] entry; when nothing would change, nothing
-    /// is committed and the result says so.
+    /// Change the book's own fields: title, max depth and / or archived
+    /// (`None` keeps the current value). One commit over the version just
+    /// read, carrying a [`ChangeAction::BookUpdate`] entry; when nothing would
+    /// change, nothing is committed and the result says so.
     pub async fn update_book(
         &self,
         title: Option<String>,
         max_depth: Option<u8>,
+        archived: Option<bool>,
     ) -> Result<BookUpdate, AppError> {
         let Versioned {
             value: mut book,
             version,
         } = self.load_book().await?;
-        let before = (book.title().to_string(), book.max_depth());
+        let before = BookFields::of(&book);
         if let Some(title) = title {
             book.set_title(title)?;
         }
         if let Some(max_depth) = max_depth {
             book.set_max_depth(max_depth)?;
         }
-        let after = (book.title().to_string(), book.max_depth());
+        if let Some(archived) = archived {
+            book.set_archived(archived);
+        }
+        let after = BookFields::of(&book);
         if before == after {
             return Ok(BookUpdate {
                 before,
@@ -483,7 +519,8 @@ impl<S: BookStore> BookService<S> {
     /// that `book` does not have, a `Create` entry for every node of `book`
     /// that is new, an `Update` entry for a node present in both whose
     /// content differs, and a [`ChangeAction::BookUpdate`] entry when the
-    /// title or max depth changes. Returns the number of entries recorded.
+    /// title or max depth changes. An existing book keeps its archived flag.
+    /// Returns the number of entries recorded.
     ///
     /// The commit goes over the version just read, so a concurrent write in
     /// between is a conflict. A book that does not exist yet is created, with a
@@ -515,7 +552,11 @@ impl<S: BookStore> BookService<S> {
     ) -> Result<(ImportCounts, R), AppError> {
         let current = self.store.load(&self.slug).await.map_err(store_error)?;
         let built = build(current.as_ref().map(|v| &v.value))?;
-        let book = book_of(&built);
+        let book = match &current {
+            Some(cur) => keep_archived(&cur.value, book_of(&built)),
+            None => std::borrow::Cow::Borrowed(book_of(&built)),
+        };
+        let book = book.as_ref();
         let at = Timestamp::now();
         let mut events = Vec::new();
         let mut counts = ImportCounts::default();
@@ -575,13 +616,16 @@ impl<S: BookStore> BookService<S> {
     /// Replace the book with `book` (a snapshot being restored), recording a
     /// `Restore` event for every node of `book` in the same commit, plus a
     /// [`ChangeAction::BookUpdate`] entry when the restored title or max depth
-    /// differs from the current one.
+    /// differs from the current one. The book stays archived or not as it is
+    /// now, whatever the snapshot says.
     ///
     /// The book must exist: a restore goes over the version just read, so a
     /// concurrent write between the read and this commit is a conflict rather
     /// than being silently overwritten.
     pub async fn restore_book(&self, book: &TemplateBook) -> Result<(), AppError> {
         let current = self.load_book().await?;
+        let book = keep_archived(&current.value, book);
+        let book = book.as_ref();
         let at = Timestamp::now();
         let mut events: Vec<ChangeEntry> = book_fields_change(&current.value, book, at)
             .into_iter()
@@ -658,24 +702,38 @@ pub fn links_into(book: &TemplateBook, targets: &std::collections::HashSet<NodeI
 }
 
 /// A [`ChangeAction::BookUpdate`] entry for the book's own fields.
-fn book_fields_entry(before: &(String, u8), after: &(String, u8), at: Timestamp) -> ChangeEntry {
-    let fields = |(title, max_depth): &(String, u8)| {
-        serde_json::json!({ "title": title, "max_depth": max_depth }).to_string()
-    };
-    ChangeEntry::book_update(fields(before), fields(after), at)
+fn book_fields_entry(before: &BookFields, after: &BookFields, at: Timestamp) -> ChangeEntry {
+    ChangeEntry::book_update(before.json(), after.json(), at)
 }
 
 /// The book-level entry for replacing `current` with `next`, when their
 /// title or max depth differ (restore / import carry the book's own fields
-/// along with the tree).
+/// along with the tree; `next` has already been given `current`'s archived
+/// flag by [`keep_archived`]).
 fn book_fields_change(
     current: &TemplateBook,
     next: &TemplateBook,
     at: Timestamp,
 ) -> Option<ChangeEntry> {
-    let before = (current.title().to_string(), current.max_depth());
-    let after = (next.title().to_string(), next.max_depth());
+    let before = BookFields::of(current);
+    let after = BookFields::of(next);
     (before != after).then(|| book_fields_entry(&before, &after, at))
+}
+
+/// `next` with `current`'s archived flag: archiving is the book's lifecycle,
+/// not its content, so replacing the tree (restore / import) never archives
+/// or unarchives it. Borrowed when the flags already agree.
+fn keep_archived<'a>(
+    current: &TemplateBook,
+    next: &'a TemplateBook,
+) -> std::borrow::Cow<'a, TemplateBook> {
+    if current.is_archived() == next.is_archived() {
+        std::borrow::Cow::Borrowed(next)
+    } else {
+        let mut b = next.clone();
+        b.set_archived(current.is_archived());
+        std::borrow::Cow::Owned(b)
+    }
 }
 
 /// The node as a JSON value, for an order-insensitive comparison of its
@@ -1468,7 +1526,7 @@ mod tests {
         let svc = memory_service().await;
         svc.add_node(add_req("A")).await.expect("add A");
         let old = svc.read_tree().await.unwrap(); // max_depth 4, title "Test"
-        svc.update_book(None, Some(6)).await.expect("raise");
+        svc.update_book(None, Some(6), None).await.expect("raise");
 
         svc.restore_book(&old).await.expect("restore");
         let book_level: Vec<_> = svc
@@ -1520,12 +1578,15 @@ mod tests {
         let v0 = svc.current_version().await.unwrap().unwrap();
 
         let up = svc
-            .update_book(Some("Renamed".into()), Some(6))
+            .update_book(Some("Renamed".into()), Some(6), None)
             .await
             .expect("update_book");
         assert!(up.changed);
-        assert_eq!(up.before, ("Test".to_string(), 4));
-        assert_eq!(up.after, ("Renamed".to_string(), 6));
+        assert_eq!((up.before.title.as_str(), up.before.max_depth), ("Test", 4));
+        assert_eq!(
+            (up.after.title.as_str(), up.after.max_depth),
+            ("Renamed", 6)
+        );
         assert_eq!(svc.current_version().await.unwrap(), Some(v0 + 1));
 
         let h = svc.history().await.unwrap();
@@ -1536,10 +1597,13 @@ mod tests {
             serde_json::from_str(last.before.as_deref().unwrap()).unwrap();
         let after: serde_json::Value =
             serde_json::from_str(last.after.as_deref().unwrap()).unwrap();
-        assert_eq!(before, serde_json::json!({"title": "Test", "max_depth": 4}));
+        assert_eq!(
+            before,
+            serde_json::json!({"title": "Test", "max_depth": 4, "archived": false})
+        );
         assert_eq!(
             after,
-            serde_json::json!({"title": "Renamed", "max_depth": 6})
+            serde_json::json!({"title": "Renamed", "max_depth": 6, "archived": false})
         );
 
         let book = svc.read_tree().await.unwrap();
@@ -1551,7 +1615,10 @@ mod tests {
         let svc = memory_service().await;
         let v0 = svc.current_version().await.unwrap();
         let n0 = svc.history().await.unwrap().len();
-        let up = svc.update_book(Some("Test".into()), Some(4)).await.unwrap();
+        let up = svc
+            .update_book(Some("Test".into()), Some(4), Some(false))
+            .await
+            .unwrap();
         assert!(!up.changed);
         assert_eq!(svc.current_version().await.unwrap(), v0);
         assert_eq!(svc.history().await.unwrap().len(), n0);
@@ -1561,9 +1628,40 @@ mod tests {
     async fn test_update_book_refused_change_commits_nothing() {
         let svc = memory_service().await;
         let v0 = svc.current_version().await.unwrap();
-        let err = svc.update_book(Some("".into()), None).await.unwrap_err();
+        let err = svc
+            .update_book(Some("".into()), None, Some(true))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Domain(DomainError::EmptyBookTitle)));
         assert_eq!(svc.current_version().await.unwrap(), v0);
+    }
+
+    #[tokio::test]
+    async fn test_archived_book_survives_restore_and_import() {
+        let svc = memory_service().await;
+        svc.add_node(add_req("A")).await.expect("add A");
+        let old = svc.read_tree().await.unwrap();
+
+        let up = svc.update_book(None, None, Some(true)).await.unwrap();
+        assert!(up.changed && !up.before.archived && up.after.archived);
+        let last = svc.history().await.unwrap().pop().unwrap();
+        assert_eq!(last.action, ChangeAction::BookUpdate);
+        assert!(last.after.as_deref().unwrap().contains("\"archived\":true"));
+        assert!(svc.read_tree().await.unwrap().is_archived());
+
+        // `old` predates the archive; replacing the tree with it keeps the flag
+        // and records no book-level change.
+        let n0 = svc.history().await.unwrap().len();
+        svc.restore_book(&old).await.expect("restore");
+        assert!(svc.read_tree().await.unwrap().is_archived());
+        svc.import_book(&old).await.expect("import");
+        assert!(svc.read_tree().await.unwrap().is_archived());
+        assert!(svc.history().await.unwrap()[n0..]
+            .iter()
+            .all(|e| e.action != ChangeAction::BookUpdate));
+
+        svc.update_book(None, None, Some(false)).await.unwrap();
+        assert!(!svc.read_tree().await.unwrap().is_archived());
     }
 
     /// A store that lets one other writer commit right after `update_book`
@@ -1625,7 +1723,7 @@ mod tests {
             .armed
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let err = svc
-            .update_book(Some("Other".into()), None)
+            .update_book(Some("Other".into()), None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Conflict { .. }), "{err:?}");

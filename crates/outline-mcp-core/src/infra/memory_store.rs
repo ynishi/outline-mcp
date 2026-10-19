@@ -106,6 +106,7 @@ impl BookStore for MemoryBookStore {
             .map(|(slug, s)| BookSummary {
                 slug: slug.clone(),
                 title: s.book.title().to_string(),
+                archived: s.book.is_archived(),
             })
             .collect())
     }

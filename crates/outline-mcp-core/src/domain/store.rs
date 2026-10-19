@@ -40,6 +40,8 @@ pub struct BookSummary {
     pub slug: String,
     /// The book's title.
     pub title: String,
+    /// Whether the book is archived.
+    pub archived: bool,
 }
 
 /// Errors a [`BookStore`] reports.

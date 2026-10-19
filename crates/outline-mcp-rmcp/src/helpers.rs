@@ -330,8 +330,8 @@ pub(crate) fn find_hierarchical_id(book: &TemplateBook, target: NodeId) -> Optio
 }
 
 /// The changed fields of a `book_update` history entry, from its
-/// `{"title":…,"max_depth":…}` before / after JSON: e.g.
-/// `title "A" → "B", max_depth 3 → 4`. Unchanged fields are left out.
+/// `{"title":…,"max_depth":…,"archived":…}` before / after JSON: e.g.
+/// `title "A" → "B", max_depth 3 → 4, archived`. Unchanged fields are left out.
 pub(crate) fn describe_book_update(before: Option<&str>, after: Option<&str>) -> String {
     let parse = |s: Option<&str>| {
         s.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
@@ -344,6 +344,18 @@ pub(crate) fn describe_book_update(before: Option<&str>, after: Option<&str>) ->
     }
     if b["max_depth"] != a["max_depth"] {
         parts.push(format!("max_depth {} → {}", b["max_depth"], a["max_depth"]));
+    }
+    // Entries written before books could be archived have no `archived`.
+    let archived = |v: &serde_json::Value| v["archived"].as_bool().unwrap_or(false);
+    if archived(&b) != archived(&a) {
+        parts.push(
+            if archived(&a) {
+                "archived"
+            } else {
+                "unarchived"
+            }
+            .to_string(),
+        );
     }
     if parts.is_empty() {
         "no change".to_string()
@@ -366,6 +378,13 @@ mod book_update_tests {
         assert_eq!(
             describe_book_update(Some(before), Some(r#"{"title":"A","max_depth":5}"#)),
             "max_depth 3 → 5"
+        );
+        assert_eq!(
+            describe_book_update(
+                Some(before),
+                Some(r#"{"title":"A","max_depth":3,"archived":true}"#)
+            ),
+            "archived"
         );
     }
 }

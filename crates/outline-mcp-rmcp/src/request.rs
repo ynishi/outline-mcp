@@ -299,6 +299,11 @@ pub(crate) struct McpBookUpdateRequest {
     )]
     #[serde(default)]
     pub max_depth: Option<u8>,
+    #[schemars(
+        description = "true archives the book, false unarchives it (omit to keep). An archived book stays readable and writable, but `shelf` and `gen_routing` leave it out and `select_book` injects nothing from it."
+    )]
+    #[serde(default)]
+    pub archived: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -352,7 +357,13 @@ pub(crate) struct McpBookDeleteRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(crate) struct McpShelfRequest {}
+pub(crate) struct McpShelfRequest {
+    #[schemars(
+        description = "List archived books too (marked `[archived]`). Default false: they are left out, with a last line saying how many."
+    )]
+    #[serde(default)]
+    pub include_archived: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct McpGenRoutingRequest {}
