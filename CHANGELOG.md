@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.15.0] - 2026-10-19
+
+### Added
+
 - **Fly.io hosting** — `contrib/fly/fly.toml` (stateless machine, edge TLS, bearer auth via `OUTLINE_MCP_HTTP_TOKEN`, database URL from the `OUTLINE_MCP_DATABASE_URL` secret, `--bind 0.0.0.0:8486`; no volume, so the machine may stop when idle) and `docs/runbooks/fly-io-deploy.md` (an unmanaged Fly Postgres app in the same org, `fly postgres attach` for the secret, `migrate` and `import-shelf` through `fly proxy`, deploy, smoke, client registration, rollback, backup by volume snapshots of the database app plus `pg_dump`). Verified against a real deploy of the Postgres layout (nrt): 401 without a token / 200 with one, the 29 imported books listed, writes recorded in history.
 - **`.dockerignore`** — the Dockerfile only COPYs `Cargo.toml` / `Cargo.lock` / `crates/`, but the build context uploaded everything (`target/` alone is multiple GB, re-uploaded on every `fly deploy` / `docker build`).
 - **`BookStore` storage port with a Postgres adapter** (groundwork for #2) — one write commits the book state and its change events together, so a write whose history entry cannot be recorded is not persisted. Ships a Postgres adapter (sqlx 0.9; `books` / `nodes` / `events` tables, optimistic locking on a per-book version, only changed node rows rewritten), an in-memory adapter for tests, and an `outline-mcp migrate [--database-url <url>]` subcommand reading `OUTLINE_MCP_DATABASE_URL` that exits with a message naming the variable when no database is configured.
@@ -48,6 +62,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Crate metadata for the release**: the crates declare `rust-version = "1.94"` (what sqlx 0.9 requires) and ship the README; `outline-mcp-core` / `outline-mcp-rmcp` carry docs.rs metadata; `server.json` lists `OUTLINE_MCP_DATABASE_URL` as a required environment variable of the package.
 - **Output additions for programs reading results** (nothing removed or renamed): `book_lint`'s default check set gains `dangling_links` and `stale_proposals`; `node_query` JSON always carries `proposal` (null when none) alongside `links` / `backlinks`; `book_stats` JSON gains `links` and `pending_proposals`.
 - **Docker image builds with Rust 1.97** (was 1.88). sqlx 0.9 requires rustc 1.94 or later, so the image no longer built.
 - **Storage is Postgres; `serve` / `stdio` require a database.** The server takes `OUTLINE_MCP_DATABASE_URL` (or `--database-url`) and refuses to start without one, on a database `migrate` has not brought up to date, or when the connection fails — within about 5 s, saying whether the host was unreachable, the login was rejected or the database does not exist. Every MCP tool now runs on the store, so a write and its history entry are committed together and a stale per-book version is rejected instead of overwriting a concurrent write. Fixes #2 for books served from Postgres.

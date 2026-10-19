@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
+rust-version.workspace = true
+readme.workspace = true
 description = "Tree-structured session guide & checklist as an MCP server"
 keywords = ["mcp", "outline", "checklist", "tree"]
 categories = ["command-line-utilities"]
@@ -17,7 +19,7 @@ categories = ["command-line-utilities"]
 formula = "outline-mcp"
 
 [dependencies]
-outline-mcp-rmcp = { path = "../outline-mcp-rmcp", version = "0.14.0" }
-outline-mcp-core = { path = "../outline-mcp-core", version = "0.14.0" }
+outline-mcp-rmcp = { path = "../outline-mcp-rmcp", version = "0.15.0" }
+outline-mcp-core = { path = "../outline-mcp-core", version = "0.15.0" }
 tokio = { workspace = true }
 anyhow = { workspace = true }

@@ -7,12 +7,18 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
+rust-version.workspace = true
+readme.workspace = true
 description = "rmcp (MCP) interface layer for outline-mcp: ServerHandler, tool_router, and stdio / streamable HTTP transport wiring over outline-mcp-core"
 keywords = ["mcp", "outline", "checklist", "tree"]
 categories = ["command-line-utilities"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
-outline-mcp-core = { path = "../outline-mcp-core", version = "0.14.0" }
+outline-mcp-core = { path = "../outline-mcp-core", version = "0.15.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
