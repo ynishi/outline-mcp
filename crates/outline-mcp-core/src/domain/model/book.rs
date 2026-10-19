@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::id::{BookId, NodeId};
-use super::node::{normalize_rel, Link, NodeType, TemplateNode};
+use super::node::{
+    content_fingerprint, normalize_rel, BodyChange, Link, NodeType, Revision, TemplateNode,
+};
 use super::timestamp::Timestamp;
 use crate::domain::error::DomainError;
 
@@ -261,6 +263,104 @@ impl TemplateBook {
             }
         }
         false
+    }
+
+    /// Attach `revision` to node `id` as its pending revision, without
+    /// changing the node's content. `revision.base` is set to the node's
+    /// current [`content_fingerprint`].
+    ///
+    /// Refused when the node is archived (or under an archived section), when
+    /// the revision changes no field or would leave the node as it is, when it
+    /// both replaces and patches properties, and when a revision is already
+    /// pending unless `replace`.
+    pub fn propose_revision(
+        &mut self,
+        id: NodeId,
+        mut revision: Revision,
+        replace: bool,
+    ) -> Result<(), DomainError> {
+        let node = self.nodes.get(&id).ok_or(DomainError::NodeNotFound(id))?;
+        if self.is_archived_or_under_archived(id) {
+            return Err(DomainError::RevisionOnArchived(id));
+        }
+        if revision.fields().is_empty() {
+            return Err(DomainError::EmptyRevision);
+        }
+        if revision.properties.is_some() && revision.properties_patch.is_some() {
+            return Err(DomainError::ConflictingPropertyUpdate(id));
+        }
+        if node.proposal().is_some() && !replace {
+            return Err(DomainError::ProposalExists(id));
+        }
+        let mut applied = node.clone();
+        apply_revision_content(&mut applied, &revision);
+        if content_fingerprint(&applied) == content_fingerprint(node) {
+            return Err(DomainError::RevisionChangesNothing(id));
+        }
+        revision.base = content_fingerprint(node);
+        self.nodes
+            .get_mut(&id)
+            .ok_or(DomainError::NodeNotFound(id))?
+            .set_proposal(Some(revision));
+        Ok(())
+    }
+
+    /// Apply node `id`'s pending revision to its content (through the same
+    /// path as [`Self::update_node`]) and clear it. Returns the applied
+    /// revision.
+    ///
+    /// Refused when there is none, when the node is archived (or under an
+    /// archived section), and — unless `force` — when the node changed after
+    /// the revision was proposed.
+    pub fn approve_revision(&mut self, id: NodeId, force: bool) -> Result<Revision, DomainError> {
+        let node = self.nodes.get(&id).ok_or(DomainError::NodeNotFound(id))?;
+        let revision = node
+            .proposal()
+            .cloned()
+            .ok_or(DomainError::NoProposal(id))?;
+        if self.is_archived_or_under_archived(id) {
+            return Err(DomainError::RevisionOnArchived(id));
+        }
+        if revision.is_stale(node) && !force {
+            return Err(DomainError::StaleProposal(id));
+        }
+        self.update_node(
+            id,
+            UpdateNodeRequest {
+                title: revision.title.clone(),
+                body: revision.body.clone().map(|b| match b {
+                    BodyChange::Set(text) => Some(text),
+                    BodyChange::Clear => None,
+                }),
+                node_type: None,
+                placeholder: None,
+                properties: revision.properties.clone(),
+                properties_patch: revision.properties_patch.clone(),
+                status: None,
+            },
+        )?;
+        self.nodes
+            .get_mut(&id)
+            .ok_or(DomainError::NodeNotFound(id))?
+            .set_proposal(None);
+        Ok(revision)
+    }
+
+    /// Discard node `id`'s pending revision; returns it.
+    pub fn reject_revision(&mut self, id: NodeId) -> Result<Revision, DomainError> {
+        self.nodes
+            .get_mut(&id)
+            .ok_or(DomainError::NodeNotFound(id))?
+            .set_proposal(None)
+            .ok_or(DomainError::NoProposal(id))
+    }
+
+    /// Nodes with a pending revision, in book (depth-first) order.
+    pub fn nodes_with_proposals(&self) -> Vec<&TemplateNode> {
+        self.all_nodes_dfs()
+            .into_iter()
+            .filter(|n| n.proposal().is_some())
+            .collect()
     }
 
     /// Mark a node as verified at `at` by `by` (content unchanged).
@@ -595,6 +695,25 @@ impl TemplateBook {
                 self.collect_subtree_dfs(child_id, out);
             }
         }
+    }
+}
+
+/// Apply a revision's content fields to `node` (title, body, properties),
+/// the way approving it would. Used to tell whether it changes anything.
+fn apply_revision_content(node: &mut TemplateNode, revision: &Revision) {
+    if let Some(title) = &revision.title {
+        node.set_title(title.clone());
+    }
+    match &revision.body {
+        Some(BodyChange::Set(text)) => node.set_body(Some(text.clone())),
+        Some(BodyChange::Clear) => node.set_body(None),
+        None => {}
+    }
+    if let Some(properties) = &revision.properties {
+        node.set_properties(properties.clone());
+    }
+    if let Some(patch) = &revision.properties_patch {
+        node.patch_properties(patch.clone());
     }
 }
 
@@ -1224,5 +1343,41 @@ mod tests {
             assert_eq!(indexed, scan, "backlinks of {id}");
         }
         assert!(!index.contains_key(&c), "C has no incoming links");
+    }
+
+    #[test]
+    fn absent_and_empty_body_are_the_same_content() {
+        let mut book = make_book();
+        let id = book
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "Bare".into(),
+                node_type: NodeType::Content,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+                properties: HashMap::new(),
+            })
+            .unwrap();
+        let before = content_fingerprint(book.get_node(id).unwrap());
+        let mut with_empty = book.get_node(id).unwrap().clone();
+        with_empty.set_body(Some(String::new()));
+        assert_eq!(content_fingerprint(&with_empty), before);
+
+        let empty_body = Revision {
+            title: None,
+            body: Some(BodyChange::Set(String::new())),
+            properties: None,
+            properties_patch: None,
+            base: String::new(),
+            by: None,
+            note: None,
+            at: Timestamp::now(),
+        };
+        assert!(matches!(
+            book.propose_revision(id, empty_body, false),
+            Err(DomainError::RevisionChangesNothing(_))
+        ));
+        assert!(book.get_node(id).unwrap().proposal().is_none());
     }
 }

@@ -33,6 +33,7 @@ mod health;
 mod helpers;
 mod request;
 mod resources;
+mod revision;
 mod server;
 mod tools;
 

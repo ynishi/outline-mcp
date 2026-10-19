@@ -37,17 +37,21 @@ pub enum LintCheck {
     /// Links whose target node is not in the book (left by data restored or
     /// imported from elsewhere).
     DanglingLinks,
+    /// Pending revisions older than `stale_days`, or whose node changed after
+    /// they were proposed.
+    StaleProposals,
 }
 
 impl LintCheck {
     /// Every check, in report order.
-    pub const ALL: [LintCheck; 6] = [
+    pub const ALL: [LintCheck; 7] = [
         LintCheck::RootContent,
         LintCheck::SimilarTitles,
         LintCheck::PropertyKeyVariants,
         LintCheck::EmptySections,
         LintCheck::StaleDrafts,
         LintCheck::DanglingLinks,
+        LintCheck::StaleProposals,
     ];
 
     /// The snake_case name used on the wire.
@@ -59,6 +63,7 @@ impl LintCheck {
             LintCheck::EmptySections => "empty_sections",
             LintCheck::StaleDrafts => "stale_drafts",
             LintCheck::DanglingLinks => "dangling_links",
+            LintCheck::StaleProposals => "stale_proposals",
         }
     }
 
@@ -166,6 +171,7 @@ pub fn lint(book: &TemplateBook, opts: &LintOptions) -> LintReport {
             LintCheck::EmptySections => empty_sections(&order),
             LintCheck::StaleDrafts => stale_drafts(&order, opts.stale_days, opts.now),
             LintCheck::DanglingLinks => dangling_links(book, &order),
+            LintCheck::StaleProposals => stale_proposals(book, opts.stale_days, opts.now),
         };
         let left_out = found.len().saturating_sub(opts.limit);
         omitted.insert(check, left_out);
@@ -245,6 +251,45 @@ fn stale_drafts(order: &[&TemplateNode], stale_days: u32, now: Timestamp) -> Vec
             nodes: vec![n.id()],
             detail: format!("draft \"{}\": {age}", n.title()),
             score: None,
+        })
+        .collect()
+}
+
+/// Unlike the other checks this one also looks at archived nodes (and nodes
+/// under an archived section): a revision pending there can no longer be
+/// approved, only rejected, so it is reported for that reason. That keeps the
+/// count of pending revisions it can see equal to `book_stats`'
+/// `pending_proposals` and to `revisions_pending`.
+fn stale_proposals(book: &TemplateBook, stale_days: u32, now: Timestamp) -> Vec<LintFinding> {
+    let limit_ms = i64::from(stale_days) * DAY_MS;
+    book.all_nodes_dfs()
+        .into_iter()
+        .filter_map(|n| {
+            let p = n.proposal()?;
+            let age = now.as_millis() - p.at.as_millis();
+            let mut why = Vec::new();
+            if book.is_archived_or_under_archived(n.id()) {
+                why.push("on an archived node — reject it".to_string());
+            }
+            if p.is_stale(n) {
+                why.push("the node changed after it was proposed".to_string());
+            }
+            if age > limit_ms {
+                why.push(format!("proposed {} days ago", age / DAY_MS));
+            }
+            (!why.is_empty()).then(|| LintFinding {
+                kind: LintCheck::StaleProposals,
+                nodes: vec![n.id()],
+                detail: format!(
+                    "pending revision of \"{}\"{}: {}",
+                    n.title(),
+                    p.by.as_deref()
+                        .map(|b| format!(" by {b}"))
+                        .unwrap_or_default(),
+                    why.join("; ")
+                ),
+                score: None,
+            })
         })
         .collect()
 }
@@ -555,6 +600,8 @@ pub struct BookStats {
     pub property_keys: usize,
     /// Typed links across the book (outgoing links of every node).
     pub links: usize,
+    /// Nodes with a pending revision.
+    pub pending_proposals: usize,
 }
 
 fn bucket(n: usize) -> &'static str {
@@ -663,6 +710,7 @@ pub fn stats(book: &TemplateBook, now: Timestamp) -> BookStats {
         updated,
         property_keys: keys.len(),
         links: book.link_count(),
+        pending_proposals: nodes.iter().filter(|n| n.proposal().is_some()).count(),
     }
 }
 
@@ -1282,5 +1330,110 @@ mod tests {
         b.add_link(a, c, "x").unwrap();
         b.add_link(c, a, "y").unwrap();
         assert_eq!(stats(&b, Timestamp::now()).links, 2);
+    }
+
+    fn revision(at: Timestamp) -> crate::domain::model::node::Revision {
+        crate::domain::model::node::Revision {
+            title: Some("New title".to_string()),
+            body: None,
+            properties: None,
+            properties_patch: None,
+            base: String::new(),
+            by: Some("alice".to_string()),
+            note: None,
+            at,
+        }
+    }
+
+    #[test]
+    fn stale_proposals_reports_old_and_outdated_revisions_only() {
+        let now = Timestamp::now();
+        let mut b = TemplateBook::new("B", 4);
+        let s = add(&mut b, None, "S", NodeType::Section);
+        let fresh = add(&mut b, Some(s), "Fresh", NodeType::Content);
+        let old = add(&mut b, Some(s), "Old", NodeType::Content);
+        let changed = add(&mut b, Some(s), "Changed", NodeType::Content);
+        b.propose_revision(fresh, revision(now), false).unwrap();
+        b.propose_revision(
+            old,
+            revision(Timestamp::from_millis(now.as_millis() - 100 * DAY_MS)),
+            false,
+        )
+        .unwrap();
+        b.propose_revision(changed, revision(now), false).unwrap();
+        b.update_node(
+            changed,
+            crate::domain::model::book::UpdateNodeRequest {
+                title: None,
+                body: Some(Some("edited meanwhile".to_string())),
+                node_type: None,
+                placeholder: None,
+                properties: None,
+                properties_patch: None,
+                status: None,
+            },
+        )
+        .unwrap();
+
+        let r = lint(
+            &b,
+            &LintOptions {
+                checks: vec![LintCheck::StaleProposals],
+                now,
+                ..Default::default()
+            },
+        );
+        let f = kinds(&r, LintCheck::StaleProposals);
+        let ids: Vec<NodeId> = f.iter().map(|f| f.nodes[0]).collect();
+        assert_eq!(ids, vec![old, changed], "{f:?}");
+        assert!(f[0].detail.contains("100 days ago"), "{}", f[0].detail);
+        assert!(f[1].detail.contains("changed after"), "{}", f[1].detail);
+        assert!(LintCheck::ALL.contains(&LintCheck::StaleProposals));
+        assert_eq!(
+            LintCheck::parse("stale_proposals"),
+            Some(LintCheck::StaleProposals)
+        );
+        assert_eq!(stats(&b, now).pending_proposals, 3);
+    }
+
+    #[test]
+    fn stale_proposals_reports_a_revision_left_on_an_archived_node() {
+        let now = Timestamp::now();
+        let mut b = TemplateBook::new("B", 4);
+        let s = add(&mut b, None, "S", NodeType::Section);
+        let n = add(&mut b, Some(s), "N", NodeType::Content);
+        b.propose_revision(n, revision(now), false).unwrap();
+        b.update_node(
+            s,
+            crate::domain::model::book::UpdateNodeRequest {
+                title: None,
+                body: None,
+                node_type: None,
+                placeholder: None,
+                properties: None,
+                properties_patch: None,
+                status: Some(NodeStatus::Archived),
+            },
+        )
+        .unwrap();
+
+        let r = lint(
+            &b,
+            &LintOptions {
+                checks: vec![LintCheck::StaleProposals],
+                now,
+                ..Default::default()
+            },
+        );
+        let f = kinds(&r, LintCheck::StaleProposals);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].nodes, vec![n]);
+        assert!(
+            f[0].detail.contains("on an archived node"),
+            "{}",
+            f[0].detail
+        );
+        // The same revision is counted by book_stats.
+        assert_eq!(stats(&b, now).pending_proposals, 1);
     }
 }

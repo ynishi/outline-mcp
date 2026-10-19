@@ -63,7 +63,7 @@ use uuid::Uuid;
 use crate::domain::model::book::TemplateBook;
 use crate::domain::model::changelog::ChangeEntry;
 use crate::domain::model::id::{BookId, NodeId};
-use crate::domain::model::node::{Link, NodeParts, TemplateNode};
+use crate::domain::model::node::{Link, NodeParts, Revision, TemplateNode};
 use crate::domain::model::timestamp::Timestamp;
 use crate::domain::store::{
     BookStore, BookSummary, Committed, SnapshotDelete, SnapshotInfo, SnapshotStore, StoreError,
@@ -168,6 +168,7 @@ struct NodeRow {
     verified_at: Option<i64>,
     verified_by: Option<String>,
     links: Value,
+    proposal: Option<Value>,
 }
 
 impl NodeRow {
@@ -178,6 +179,7 @@ impl NodeRow {
             + self.placeholder.as_ref().map_or(0, String::len)
             + self.properties.to_string().len()
             + self.links.to_string().len()
+            + self.proposal.as_ref().map_or(0, |p| p.to_string().len())
     }
 }
 
@@ -250,7 +252,7 @@ impl PgBookStore {
     ) -> Result<HashMap<Uuid, NodeRow>, StoreError> {
         let rows = sqlx::query(
             "SELECT id, parent, position, title, body, node_type, placeholder, properties, status, updated_at, \
-                    verified_at, verified_by, links \
+                    verified_at, verified_by, links, proposal \
              FROM nodes WHERE book = $1",
         )
         .bind(slug)
@@ -386,16 +388,16 @@ impl BookStore for PgBookStore {
             let changed = &changed_all[range];
             sqlx::query(
                 "INSERT INTO nodes (book, id, parent, position, title, body, node_type, placeholder, properties, status, \
-                                    updated_at, verified_at, verified_by, links) \
+                                    updated_at, verified_at, verified_by, links, proposal) \
                  SELECT $1, * FROM UNNEST($2::uuid[], $3::uuid[], $4::int4[], $5::text[], $6::text[], \
                                           $7::text[], $8::text[], $9::jsonb[], $10::text[], $11::int8[], \
-                                          $12::int8[], $13::text[], $14::jsonb[]) \
+                                          $12::int8[], $13::text[], $14::jsonb[], $15::jsonb[]) \
                  ON CONFLICT (book, id) DO UPDATE SET parent = EXCLUDED.parent, position = EXCLUDED.position, \
                  title = EXCLUDED.title, body = EXCLUDED.body, node_type = EXCLUDED.node_type, \
                  placeholder = EXCLUDED.placeholder, properties = EXCLUDED.properties, \
                  status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, \
                  verified_at = EXCLUDED.verified_at, verified_by = EXCLUDED.verified_by, \
-                 links = EXCLUDED.links",
+                 links = EXCLUDED.links, proposal = EXCLUDED.proposal",
             )
             .bind(slug)
             .bind(changed.iter().map(|r| r.id).collect::<Vec<_>>())
@@ -411,6 +413,7 @@ impl BookStore for PgBookStore {
             .bind(changed.iter().map(|r| r.verified_at).collect::<Vec<_>>())
             .bind(changed.iter().map(|r| r.verified_by.clone()).collect::<Vec<_>>())
             .bind(changed.iter().map(|r| r.links.clone()).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.proposal.clone()).collect::<Vec<_>>())
             .execute(&mut *tx)
             .await
             .map_err(StoreError::backend)?;
@@ -745,6 +748,11 @@ fn rows_of(book: &TemplateBook) -> Result<HashMap<Uuid, NodeRow>, StoreError> {
         };
         let properties = serde_json::to_value(node.properties()).map_err(StoreError::backend)?;
         let links = serde_json::to_value(node.links()).map_err(StoreError::backend)?;
+        let proposal = node
+            .proposal()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(StoreError::backend)?;
         let row = NodeRow {
             id: id.as_uuid(),
             parent: node.parent().map(|p| p.as_uuid()),
@@ -759,6 +767,7 @@ fn rows_of(book: &TemplateBook) -> Result<HashMap<Uuid, NodeRow>, StoreError> {
             verified_at: node.verified_at().map(|t| t.as_millis()),
             verified_by: node.verified_by().map(str::to_string),
             links,
+            proposal,
         };
         rows.insert(row.id, row);
     }
@@ -796,6 +805,12 @@ fn assemble(
             serde_json::from_value(row.properties.clone()).map_err(StoreError::backend)?;
         let links: Vec<Link> =
             serde_json::from_value(row.links.clone()).map_err(StoreError::backend)?;
+        let proposal: Option<Revision> = row
+            .proposal
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(StoreError::backend)?;
         let node = TemplateNode::from_parts(NodeParts {
             id: NodeId::from_uuid(row.id),
             parent: row.parent.map(NodeId::from_uuid),
@@ -810,6 +825,7 @@ fn assemble(
             verified_at: row.verified_at.map(Timestamp::from_millis),
             verified_by: row.verified_by.clone(),
             links,
+            proposal,
         });
         nodes.insert(node.id(), node);
     }
@@ -837,6 +853,7 @@ fn node_row(r: &PgRow) -> Result<NodeRow, StoreError> {
         verified_at: r.try_get("verified_at").map_err(StoreError::backend)?,
         verified_by: r.try_get("verified_by").map_err(StoreError::backend)?,
         links: r.try_get("links").map_err(StoreError::backend)?,
+        proposal: r.try_get("proposal").map_err(StoreError::backend)?,
     })
 }
 

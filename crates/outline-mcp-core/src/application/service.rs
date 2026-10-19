@@ -2,6 +2,7 @@ use crate::domain::error::DomainError;
 use crate::domain::model::book::{AddNodeRequest, TemplateBook, UpdateNodeRequest};
 use crate::domain::model::changelog::{ChangeAction, ChangeEntry};
 use crate::domain::model::id::NodeId;
+use crate::domain::model::node::Revision;
 use crate::domain::model::timestamp::Timestamp;
 use crate::domain::store::{BookStore, StoreError, Versioned};
 
@@ -232,6 +233,64 @@ impl<S: BookStore> BookService<S> {
         let warnings = self.commit(Some(version), &book, &entries).await?;
 
         Ok(((), join_warnings(warnings)))
+    }
+
+    /// Attach `revision` to node `id` as its pending revision (see
+    /// [`TemplateBook::propose_revision`]): one commit with an `Update` entry
+    /// whose before / after differ only in the proposal. The node's content and
+    /// `updated_at` are unchanged. Returns the stored revision (with `base`).
+    pub async fn propose_revision(
+        &self,
+        id: NodeId,
+        revision: Revision,
+        replace: bool,
+    ) -> Result<Revision, AppError> {
+        self.revision_write(id, |book| {
+            book.propose_revision(id, revision, replace)?;
+            book.get_node(id)
+                .and_then(|n| n.proposal().cloned())
+                .ok_or(DomainError::NodeNotFound(id))
+        })
+        .await
+    }
+
+    /// Apply node `id`'s pending revision and clear it (see
+    /// [`TemplateBook::approve_revision`]): one commit with one `Update` entry
+    /// carrying the content change. `updated_at` moves as for any edit.
+    /// Returns the applied revision.
+    pub async fn approve_revision(&self, id: NodeId, force: bool) -> Result<Revision, AppError> {
+        self.revision_write(id, |book| book.approve_revision(id, force))
+            .await
+    }
+
+    /// Discard node `id`'s pending revision: one commit with an `Update`
+    /// entry. Returns the discarded revision.
+    pub async fn reject_revision(&self, id: NodeId) -> Result<Revision, AppError> {
+        self.revision_write(id, |book| book.reject_revision(id))
+            .await
+    }
+
+    /// Load, apply `change` to node `id`, commit with one `Update` entry for
+    /// that node.
+    async fn revision_write<F>(&self, id: NodeId, change: F) -> Result<Revision, AppError>
+    where
+        F: FnOnce(&mut TemplateBook) -> Result<Revision, DomainError>,
+    {
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
+        let before = node_json(&book, id);
+        let revision = change(&mut book)?;
+        let entry = ChangeEntry::new(
+            id,
+            ChangeAction::Update,
+            before,
+            node_json(&book, id),
+            Timestamp::now(),
+        );
+        self.commit(Some(version), &book, &[entry]).await?;
+        Ok(revision)
     }
 
     /// Add a typed link from `from` to `to` (see [`TemplateBook::add_link`]):
@@ -1608,5 +1667,199 @@ mod tests {
         let t = svc.read_tree().await.unwrap();
         assert!(t.get_node(c).unwrap().links().is_empty());
         assert_eq!(stamp(&t, c), c0, "link dropped with its target");
+    }
+
+    fn body_revision(text: &str) -> Revision {
+        Revision {
+            title: None,
+            body: Some(crate::domain::model::node::BodyChange::Set(
+                text.to_string(),
+            )),
+            properties: None,
+            properties_patch: None,
+            base: String::new(),
+            by: Some("alice".to_string()),
+            note: None,
+            at: Timestamp::now(),
+        }
+    }
+
+    async fn node_with_body(svc: &BookService<MemoryBookStore>, body: &str) -> NodeId {
+        let mut req = add_req("N");
+        req.body = Some(body.to_string());
+        svc.add_node(req).await.unwrap().0
+    }
+
+    #[tokio::test]
+    async fn test_propose_keeps_content_and_records_one_update() {
+        let svc = memory_service().await;
+        let id = node_with_body(&svc, "v1").await;
+        let before = svc.read_tree().await.unwrap();
+        let stamp_before = before.get_node(id).unwrap().updated_at();
+        let history_before = svc.history().await.unwrap().len();
+
+        let stored = svc
+            .propose_revision(id, body_revision("v2"), false)
+            .await
+            .unwrap();
+        assert!(!stored.base.is_empty(), "base fingerprint recorded");
+
+        let t = svc.read_tree().await.unwrap();
+        let n = t.get_node(id).unwrap();
+        assert_eq!(n.body(), Some("v1"), "content unchanged until approval");
+        assert_eq!(n.updated_at(), stamp_before, "proposing is not an edit");
+        assert!(n.proposal().is_some());
+        let h = svc.history().await.unwrap();
+        assert_eq!(h.len(), history_before + 1);
+        assert_eq!(h.last().unwrap().action, ChangeAction::Update);
+    }
+
+    #[tokio::test]
+    async fn test_approve_applies_in_one_commit_with_one_entry_and_clears() {
+        let svc = memory_service().await;
+        let id = node_with_body(&svc, "v1").await;
+        svc.propose_revision(id, body_revision("v2"), false)
+            .await
+            .unwrap();
+        let history_before = svc.history_by_node(id).await.unwrap().len();
+
+        svc.approve_revision(id, false).await.unwrap();
+
+        let t = svc.read_tree().await.unwrap();
+        let n = t.get_node(id).unwrap();
+        assert_eq!(n.body(), Some("v2"));
+        assert!(n.proposal().is_none(), "approved revision is cleared");
+        let h = svc.history_by_node(id).await.unwrap();
+        assert_eq!(h.len(), history_before + 1, "approve is one entry");
+        let last = h.last().unwrap();
+        assert!(last.before.as_deref().unwrap().contains("\"v1\""));
+        assert!(last.after.as_deref().unwrap().contains("\"v2\""));
+        assert!(
+            !last.after.as_deref().unwrap().contains("proposal"),
+            "the entry's after has no proposal any more"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reject_clears_without_changing_content() {
+        let svc = memory_service().await;
+        let id = node_with_body(&svc, "v1").await;
+        svc.propose_revision(id, body_revision("v2"), false)
+            .await
+            .unwrap();
+        let rejected = svc.reject_revision(id).await.unwrap();
+        assert_eq!(rejected.by.as_deref(), Some("alice"));
+        let t = svc.read_tree().await.unwrap();
+        let n = t.get_node(id).unwrap();
+        assert_eq!(n.body(), Some("v1"));
+        assert!(n.proposal().is_none());
+        assert!(matches!(
+            svc.reject_revision(id).await,
+            Err(AppError::Domain(DomainError::NoProposal(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_propose_refusals_and_replace() {
+        let svc = memory_service().await;
+        let id = node_with_body(&svc, "v1").await;
+        // Changes nothing.
+        assert!(matches!(
+            svc.propose_revision(id, body_revision("v1"), false).await,
+            Err(AppError::Domain(DomainError::RevisionChangesNothing(_)))
+        ));
+        // No field.
+        let mut empty = body_revision("x");
+        empty.body = None;
+        assert!(matches!(
+            svc.propose_revision(id, empty, false).await,
+            Err(AppError::Domain(DomainError::EmptyRevision))
+        ));
+        // Replace and patch together.
+        let mut both = body_revision("x");
+        both.properties = Some(Default::default());
+        both.properties_patch = Some(Default::default());
+        assert!(matches!(
+            svc.propose_revision(id, both, false).await,
+            Err(AppError::Domain(DomainError::ConflictingPropertyUpdate(_)))
+        ));
+        // One pending at a time; replace swaps it.
+        svc.propose_revision(id, body_revision("v2"), false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            svc.propose_revision(id, body_revision("v3"), false).await,
+            Err(AppError::Domain(DomainError::ProposalExists(_)))
+        ));
+        svc.propose_revision(id, body_revision("v3"), true)
+            .await
+            .unwrap();
+        svc.approve_revision(id, false).await.unwrap();
+        let t = svc.read_tree().await.unwrap();
+        assert_eq!(t.get_node(id).unwrap().body(), Some("v3"));
+    }
+
+    #[tokio::test]
+    async fn test_stale_proposal_needs_force() {
+        let svc = memory_service().await;
+        let id = node_with_body(&svc, "v1").await;
+        svc.propose_revision(id, body_revision("v2"), false)
+            .await
+            .unwrap();
+        svc.update_node(id, title_req("Renamed")).await.unwrap();
+
+        let t = svc.read_tree().await.unwrap();
+        let n = t.get_node(id).unwrap();
+        assert!(n.proposal().unwrap().is_stale(n), "node changed since");
+        assert!(matches!(
+            svc.approve_revision(id, false).await,
+            Err(AppError::Domain(DomainError::StaleProposal(_)))
+        ));
+        svc.approve_revision(id, true).await.unwrap();
+        let t = svc.read_tree().await.unwrap();
+        let n = t.get_node(id).unwrap();
+        assert_eq!(n.body(), Some("v2"));
+        assert_eq!(n.title(), "Renamed", "the newer title survives");
+    }
+
+    #[tokio::test]
+    async fn test_archived_node_takes_no_revision() {
+        let svc = memory_service().await;
+        let id = node_with_body(&svc, "v1").await;
+        let mut archive = title_req("N");
+        archive.title = None;
+        archive.status = Some(NodeStatus::Archived);
+        svc.update_node(id, archive).await.unwrap();
+        assert!(matches!(
+            svc.propose_revision(id, body_revision("v2"), false).await,
+            Err(AppError::Domain(DomainError::RevisionOnArchived(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_properties_patch_revision_merges_on_approve() {
+        let svc = memory_service().await;
+        let mut req = add_req("P");
+        req.properties.insert("keep".into(), "1".into());
+        req.properties.insert("scope".into(), "old".into());
+        let id = svc.add_node(req).await.unwrap().0;
+        let mut rev = body_revision("x");
+        rev.body = None;
+        rev.properties_patch = Some([("scope".to_string(), "new".to_string())].into());
+        svc.propose_revision(id, rev, false).await.unwrap();
+        svc.approve_revision(id, false).await.unwrap();
+        let t = svc.read_tree().await.unwrap();
+        let n = t.get_node(id).unwrap();
+        assert_eq!(n.get_property("scope"), Some("new"));
+        assert_eq!(n.get_property("keep"), Some("1"));
+    }
+
+    #[test]
+    fn test_old_node_json_without_proposal_reads_as_none() {
+        let old = r#"{"id":"7e77e8b8-492b-465d-b726-bdd281d17c75","parent":null,"children":[],
+            "title":"Old","body":"b","node_type":"Content","placeholder":null}"#;
+        let node: crate::domain::model::node::TemplateNode = serde_json::from_str(old).unwrap();
+        assert!(node.proposal().is_none());
+        assert!(!serde_json::to_string(&node).unwrap().contains("proposal"));
     }
 }

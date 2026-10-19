@@ -58,6 +58,82 @@ pub fn normalize_rel(rel: &str) -> Option<String> {
     ok.then_some(rel)
 }
 
+/// What a pending revision does to the body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BodyChange {
+    /// Replace the body with this text.
+    Set(String),
+    /// Remove the body.
+    Clear,
+}
+
+/// A proposed change to a node's content, waiting for approval. The node
+/// itself is unchanged until the revision is approved; injection, `toc`,
+/// `dump` and every other read use the current content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Revision {
+    /// New title, if the revision changes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Body change, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<BodyChange>,
+    /// Replacement property map (mutually exclusive with `properties_patch`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<HashMap<String, String>>,
+    /// Properties to merge in (mutually exclusive with `properties`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties_patch: Option<HashMap<String, String>>,
+    /// [`content_fingerprint`] of the node when the revision was proposed;
+    /// a different current fingerprint means the node changed since.
+    pub base: String,
+    /// Who proposed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// Why, in the proposer's words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// When it was proposed.
+    pub at: Timestamp,
+}
+
+impl Revision {
+    /// Names of the content fields the revision changes, in a fixed order.
+    pub fn fields(&self) -> Vec<&'static str> {
+        let mut f = Vec::new();
+        if self.title.is_some() {
+            f.push("title");
+        }
+        if self.body.is_some() {
+            f.push("body");
+        }
+        if self.properties.is_some() || self.properties_patch.is_some() {
+            f.push("properties");
+        }
+        f
+    }
+
+    /// `true` when `node`'s content changed since the revision was proposed.
+    pub fn is_stale(&self, node: &TemplateNode) -> bool {
+        self.base != content_fingerprint(node)
+    }
+}
+
+/// Fingerprint of a node's reviewable content — title, body and properties
+/// (order-insensitive) — as a hex SHA-256. Used to tell whether a node
+/// changed after a revision of it was proposed.
+///
+/// An absent body and an empty body fingerprint the same (both as `""`), the
+/// same normalization `revision_diff` and the "changes nothing" check use.
+pub fn content_fingerprint(node: &TemplateNode) -> String {
+    use sha2::{Digest, Sha256};
+    let properties: std::collections::BTreeMap<&String, &String> = node.properties.iter().collect();
+    let record = serde_json::json!([node.title, node.body.as_deref().unwrap_or(""), properties]);
+    let digest = Sha256::digest(record.to_string().as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Template上のノード。Bookが所有し、Bookを通じて操作する。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateNode {
@@ -89,6 +165,10 @@ pub struct TemplateNode {
     /// written before links existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     links: Vec<Link>,
+    /// A proposed content change waiting for approval, if any. Absent in data
+    /// written before revisions existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proposal: Option<Revision>,
 }
 
 /// Every stored field of a [`TemplateNode`], for adapters that keep nodes as
@@ -107,6 +187,7 @@ pub(crate) struct NodeParts {
     pub(crate) verified_at: Option<Timestamp>,
     pub(crate) verified_by: Option<String>,
     pub(crate) links: Vec<Link>,
+    pub(crate) proposal: Option<Revision>,
 }
 
 impl TemplateNode {
@@ -130,6 +211,7 @@ impl TemplateNode {
             verified_at: None,
             verified_by: None,
             links: Vec::new(),
+            proposal: None,
         }
     }
 
@@ -150,6 +232,7 @@ impl TemplateNode {
             verified_at: parts.verified_at,
             verified_by: parts.verified_by,
             links: parts.links,
+            proposal: parts.proposal,
         }
     }
 
@@ -226,6 +309,12 @@ impl TemplateNode {
     /// Outgoing typed links, in the order they were added.
     pub fn links(&self) -> &[Link] {
         &self.links
+    }
+
+    /// The pending revision, if one was proposed and not yet approved or
+    /// rejected.
+    pub fn proposal(&self) -> Option<&Revision> {
+        self.proposal.as_ref()
     }
 
     /// `true` when the node has never been verified or was last verified
@@ -324,6 +413,12 @@ impl TemplateNode {
         self.links
             .retain(|l| !(l.target == target && rel.is_none_or(|r| l.rel == r)));
         before - self.links.len()
+    }
+
+    /// Attach or replace the pending revision, or clear it (`None`).
+    /// `updated_at` is left alone: a proposal is not an edit of the content.
+    pub(crate) fn set_proposal(&mut self, proposal: Option<Revision>) -> Option<Revision> {
+        std::mem::replace(&mut self.proposal, proposal)
     }
 
     /// Remove every link whose target is in `targets`; returns how many.
