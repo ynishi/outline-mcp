@@ -9,8 +9,9 @@ use rmcp::{
 use outline_mcp_core::application::eject::{EjectConfig, EjectFormat, EjectService, EjectTree};
 
 use crate::helpers::{
-    build_hierarchical_ids, describe_book_update, describe_descendants, describe_subtree_change,
-    describe_subtrees_change, find_hierarchical_id, format_toc, format_toc_limited, id_suffix,
+    archived_hidden_count, archived_hidden_line, build_hierarchical_ids, describe_book_update,
+    describe_descendants, describe_subtree_change, describe_subtrees_change, find_hierarchical_id,
+    format_toc, format_toc_limited, id_suffix,
 };
 use crate::request::{
     normalize_text, parse_node_id, parse_node_status, parse_node_type, sanitize_for_filename,
@@ -19,9 +20,10 @@ use crate::request::{
     McpBookStatsRequest, McpBookUpdateRequest, McpDumpRequest, McpEjectRequest,
     McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpNodeCreateRequest,
     McpNodeHistoryRequest, McpNodeMoveRequest, McpNodeQueryRequest, McpNodeUpdateRequest,
-    McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest, McpSnapshotDeleteRequest,
-    McpSnapshotDiffRequest, McpSnapshotDumpAllRequest, McpSnapshotDumpRequest,
-    McpSnapshotListRequest, McpSnapshotRestoreRequest, McpSnapshotTagRequest, McpTocRequest,
+    McpNodeVerifyRequest, McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest,
+    McpSnapshotDeleteRequest, McpSnapshotDiffRequest, McpSnapshotDumpAllRequest,
+    McpSnapshotDumpRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest,
+    McpSnapshotTagRequest, McpTocRequest,
 };
 use crate::server::OutlineMcpServer;
 
@@ -132,6 +134,62 @@ impl OutlineMcpServer {
         );
         if let Some(w) = warning {
             msg.push_str(&format!("\n[WARNING] {w}"));
+        }
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            msg,
+        )]))
+    }
+
+    #[tool(
+        name = "node_verify",
+        description = "Record that someone confirmed these nodes still match reality: sets their verification time to now (and `by`, if given). Content and last-edited time are unchanged; each node gets one entry in history, all in one commit. Find nodes nobody has confirmed lately with `node_query` `verified_before`.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn node_verify(
+        &self,
+        Parameters(req): Parameters<McpNodeVerifyRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        if req.node_ids.is_empty() {
+            return Err(McpError::invalid_params(
+                "node_ids must name at least one node",
+                None,
+            ));
+        }
+        let svc = self.service().await?;
+        let mut ids = Vec::with_capacity(req.node_ids.len());
+        for s in &req.node_ids {
+            let id = self.resolve_id(s).await?;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let by = req
+            .by
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
+        let at = svc
+            .verify_nodes(&ids, by.clone())
+            .await
+            .map_err(Self::to_mcp_error)?;
+
+        let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
+        let mut msg = format!(
+            "Verified {} node(s) at {}{}:",
+            ids.len(),
+            at.to_iso8601(),
+            by.as_deref()
+                .map(|b| format!(" by {b}"))
+                .unwrap_or_default()
+        );
+        for id in &ids {
+            let hier = find_hierarchical_id(&book, *id).unwrap_or_else(|| id.short().to_string());
+            let title = book.get_node(*id).map(|n| n.title()).unwrap_or("?");
+            msg.push_str(&format!("\n  {hier}. {title}{}", id_suffix(*id)));
         }
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             msg,
@@ -310,13 +368,36 @@ impl OutlineMcpServer {
             }
         }
 
+        // Archived nodes (and everything under an archived section) are
+        // hidden unless asked for, and the count of hidden ones covers only
+        // what this view (max_depth / limit) would have shown. A subtree_root
+        // that is itself archived (or under an archived section) was asked
+        // for by name, so its subtree is shown, marked [archived].
+        let root_is_archived = subtree_id.is_some_and(|id| book.is_archived_or_under_archived(id));
+        let show_archived = req.include_archived || root_is_archived;
+        let archived_hidden = if show_archived {
+            0
+        } else {
+            archived_hidden_count(&book, &nodes, req.max_depth, req.limit)
+        };
+        if !show_archived {
+            nodes.retain(|node| !book.is_archived_or_under_archived(node.id()));
+        }
+        let archived_line = archived_hidden_line(archived_hidden);
+
         if nodes.is_empty() {
+            let msg = if archived_hidden > 0 {
+                format!("No matching nodes.\n{archived_line}")
+            } else {
+                "No matching nodes. Use `node_create` to add nodes.".to_string()
+            };
             return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                "No matching nodes. Use `node_create` to add nodes.",
+                msg,
             )]));
         }
 
-        let output = format_toc_limited(&book, &nodes, req.max_depth, req.limit);
+        let mut output = format_toc_limited(&book, &nodes, req.max_depth, req.limit);
+        output.push_str(&archived_line);
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             output,
         )]))
@@ -324,7 +405,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "checklist",
-        description = "Export a section as a Markdown checklist with checkboxes. First run `toc` to find the section ID, then pass it as subtree_root (e.g. '2'). Omit subtree_root for full book export. Book is NOT modified.",
+        description = "Export a section as a Markdown checklist with checkboxes. First run `toc` to find the section ID, then pass it as subtree_root (e.g. '2'). Omit subtree_root for full book export. Archived nodes and their subtrees are left out unless `include_archived` is true or subtree_root is itself archived. Book is NOT modified.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -353,6 +434,16 @@ impl OutlineMcpServer {
         let subtree_root = match req.subtree_root.as_deref() {
             Some(s) => Some(self.resolve_id(s).await?),
             None => None,
+        };
+        // Retired nodes are not tasks: leave archived subtrees out of the
+        // export (an in-memory copy; the stored book is not touched), unless
+        // asked for or the requested subtree_root is itself archived.
+        let root_is_archived =
+            subtree_root.is_some_and(|id| book.is_archived_or_under_archived(id));
+        let book = if req.include_archived || root_is_archived {
+            book
+        } else {
+            without_archived(book)
         };
 
         let output_dir = req
@@ -527,7 +618,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "book_lint",
-        description = "Check a book for structural smells, read-only: content nodes at the root (root_content), pairs of nodes with similar titles (similar_titles; Jaccard over title words, character pairs for CJK; two single-token titles are paired only when identical), property keys that differ only by case / `_` / `-` / spaces (property_key_variants), sections without children (empty_sections), and drafts not updated for `stale_days` (stale_drafts). Reports node toc IDs and UUIDs; changes nothing. `slug` defaults to the selected book. Use `format: \"json\"` when a program reads the result.",
+        description = "Check a book for structural smells, read-only: content nodes at the root (root_content), pairs of nodes with similar titles (similar_titles; Jaccard over title words, character pairs for CJK; two single-token titles are paired only when identical), property keys that differ only by case / `_` / `-` / spaces (property_key_variants), sections without children (empty_sections), and drafts not updated for `stale_days` (stale_drafts). Archived nodes and everything under an archived section are ignored. Reports node toc IDs and UUIDs; changes nothing. `slug` defaults to the selected book. Use `format: \"json\"` when a program reads the result.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -691,11 +782,22 @@ impl OutlineMcpServer {
         let toc_section = if req.quiet {
             String::new()
         } else {
-            let nodes = book.all_nodes_dfs();
-            if nodes.is_empty() {
+            // Same view as `toc` without arguments: archived subtrees hidden,
+            // with the closing line counting them.
+            let all = book.all_nodes_dfs();
+            let hidden = archived_hidden_count(&book, &all, None, None);
+            let nodes: Vec<_> = all
+                .into_iter()
+                .filter(|n| !book.is_archived_or_under_archived(n.id()))
+                .collect();
+            if nodes.is_empty() && hidden == 0 {
                 String::from("\n(empty)")
             } else {
-                format!("\n\n{}", format_toc(&book, &nodes))
+                format!(
+                    "\n\n{}{}",
+                    format_toc(&book, &nodes),
+                    archived_hidden_line(hidden)
+                )
             }
         };
 
@@ -705,10 +807,15 @@ impl OutlineMcpServer {
             m.insert("inject".to_string(), "true".to_string());
             m
         };
+        // Only active nodes outside archived sections: archiving a section
+        // retires everything under it, including active inject=true children.
         let injected_nodes: Vec<_> = book
             .nodes_matching(&inject_filter)
             .into_iter()
-            .filter(|node| node.status() != NodeStatus::Draft)
+            .filter(|node| {
+                node.status() == NodeStatus::Active
+                    && !book.is_archived_or_under_archived(node.id())
+            })
             .collect();
         let inject_section = if injected_nodes.is_empty() {
             String::new()
@@ -770,6 +877,10 @@ impl OutlineMcpServer {
             let id_map = build_hierarchical_ids(&book);
 
             for node in book.all_nodes_dfs() {
+                // Retired guidance should not route anyone to it.
+                if book.is_archived_or_under_archived(node.id()) {
+                    continue;
+                }
                 let routing = match node.get_property("routing") {
                     Some(v) => v.to_string(),
                     None => continue,
@@ -1914,9 +2025,31 @@ impl OutlineMcpServer {
             nodes.retain(|n| n.node_type() == &nt);
         }
 
-        if let Some(ref s) = req.status {
-            let st = parse_node_status(s)?;
-            nodes.retain(|n| n.status() == st);
+        // Archived nodes (and nodes under an archived section) only come back
+        // when asked for: `status: "archived"` or `include_archived`.
+        match req.status.as_deref() {
+            Some(s) => {
+                let st = parse_node_status(s)?;
+                nodes.retain(|n| n.status() == st);
+                if st != NodeStatus::Archived && !req.include_archived {
+                    nodes.retain(|n| !book.is_archived_or_under_archived(n.id()));
+                }
+            }
+            None if !req.include_archived => {
+                nodes.retain(|n| !book.is_archived_or_under_archived(n.id()));
+            }
+            None => {}
+        }
+
+        let verified_cutoff = match req.verified_before.as_deref() {
+            Some(s) => Some(
+                Timestamp::parse_moment(s)
+                    .map_err(|e| McpError::invalid_params(format!("verified_before: {e}"), None))?,
+            ),
+            None => None,
+        };
+        if let Some(cutoff) = verified_cutoff {
+            nodes.retain(|n| n.verified_before(cutoff));
         }
 
         let text_query = match req.text.as_deref() {
@@ -1952,10 +2085,10 @@ impl OutlineMcpServer {
                             NodeType::Section => "section",
                             NodeType::Content => "content",
                         },
-                        "status": match node.status() {
-                            outline_mcp_core::domain::model::changelog::NodeStatus::Active => "active",
-                            outline_mcp_core::domain::model::changelog::NodeStatus::Draft => "draft",
-                        },
+                        "status": node.status().as_str(),
+                        // null when never verified.
+                        "verified_at": node.verified_at().map(|t| t.to_iso8601()),
+                        "verified_by": node.verified_by(),
                         "placeholder": node.placeholder(),
                         // Always an object, never omitted: a caller has to be
                         // able to tell "this node has no properties" from
@@ -1992,10 +2125,7 @@ impl OutlineMcpServer {
                 NodeType::Section => "section",
                 NodeType::Content => "content",
             };
-            let status_str = match node.status() {
-                outline_mcp_core::domain::model::changelog::NodeStatus::Active => "active",
-                outline_mcp_core::domain::model::changelog::NodeStatus::Draft => "draft",
-            };
+            let status_str = node.status().as_str();
             output.push_str(&format!(
                 "\n{}. [{}] {}\n   UUID: {}\n   Type: {}\n   Status: {}\n",
                 i + 1,
@@ -2005,6 +2135,19 @@ impl OutlineMcpServer {
                 type_str,
                 status_str,
             ));
+            // Shown when the node has been verified, and as "never" when the
+            // caller is asking about verification.
+            match (node.verified_at(), verified_cutoff) {
+                (Some(at), _) => output.push_str(&format!(
+                    "   Verified: {}{}\n",
+                    at.to_iso8601(),
+                    node.verified_by()
+                        .map(|b| format!(" by {b}"))
+                        .unwrap_or_default()
+                )),
+                (None, Some(_)) => output.push_str("   Verified: never\n"),
+                (None, None) => {}
+            }
             let props = node.properties();
             if !props.is_empty() {
                 let props_str = props
@@ -2036,6 +2179,31 @@ impl OutlineMcpServer {
 // ---------------------------------------------------------------------------
 
 /// The word a history listing shows for an action.
+/// `book` without its archived nodes and everything under them (an
+/// in-memory copy for exports; nothing is committed).
+fn without_archived(
+    mut book: outline_mcp_core::domain::model::book::TemplateBook,
+) -> outline_mcp_core::domain::model::book::TemplateBook {
+    // Only the top-most archived nodes need removing: removal takes the
+    // subtree with it.
+    let tops: Vec<outline_mcp_core::domain::model::id::NodeId> = book
+        .all_nodes_dfs()
+        .into_iter()
+        .filter(|n| {
+            n.status() == NodeStatus::Archived
+                && !n
+                    .parent()
+                    .is_some_and(|p| book.is_archived_or_under_archived(p))
+        })
+        .map(|n| n.id())
+        .collect();
+    for id in tops {
+        // Ids come from the book itself, so removal cannot fail.
+        let _ = book.remove_node(id);
+    }
+    book
+}
+
 fn action_name(action: ChangeAction) -> &'static str {
     match action {
         ChangeAction::Create => "create",
@@ -2648,6 +2816,8 @@ mod ergonomics_tool_tests {
             include_body: false,
             kind: None,
             status: None,
+            include_archived: false,
+            verified_before: None,
             subtree_root: None,
             text: Some(text.into()),
             format: None,
@@ -2730,6 +2900,7 @@ mod ergonomics_tool_tests {
             filter: None,
             max_depth,
             limit,
+            include_archived: false,
         };
         let r = text(&s.toc(Parameters(toc(Some(1), None))).await.unwrap());
         assert!(
@@ -2931,6 +3102,7 @@ mod ergonomics_tool_tests {
                 filter: None,
                 max_depth: None,
                 limit: None,
+                include_archived: false,
             }))
             .await
             .unwrap(),
@@ -2954,6 +3126,7 @@ mod ergonomics_tool_tests {
             filter: None,
             max_depth,
             limit,
+            include_archived: false,
         };
         let e = s.toc(Parameters(toc(Some(0), None))).await.unwrap_err();
         assert!(e.message.contains("max_depth"), "{e:?}");
@@ -2973,6 +3146,7 @@ mod ergonomics_tool_tests {
                 filter: None,
                 max_depth: Some(2),
                 limit: None,
+                include_archived: false,
             }))
             .await
             .unwrap(),
@@ -3211,5 +3385,397 @@ mod health_tool_tests {
         let t = text(&server.book_lint(Parameters(req)).await.unwrap());
         assert!(t.contains("## empty_sections (4)"), "{t}");
         assert!(t.contains("… 2 more not shown"), "{t}");
+    }
+}
+
+#[cfg(test)]
+mod archived_verify_tool_tests {
+    use std::sync::Arc;
+
+    use outline_mcp_core::infra::memory_store::{MemoryBookStore, MemorySnapshotStore};
+
+    use super::*;
+    use crate::request::McpSelectBookRequest;
+    use crate::server::Storage;
+
+    async fn server_with_book() -> OutlineMcpServer {
+        let s = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        s.service_for("e")
+            .await
+            .unwrap()
+            .create_book("E", 4)
+            .await
+            .unwrap();
+        *s.selected.write().unwrap() = Some("e".into());
+        s
+    }
+
+    fn text(r: &CallToolResult) -> String {
+        r.content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Creates a node and returns its toc id.
+    async fn create(
+        s: &OutlineMcpServer,
+        parent: Option<&str>,
+        title: &str,
+        props: &[(&str, &str)],
+    ) -> String {
+        let r = s
+            .node_create(Parameters(McpNodeCreateRequest {
+                parent: parent.map(str::to_string),
+                title: title.into(),
+                node_type: "section".into(),
+                body: Some(format!("{title} body")),
+                placeholder: None,
+                position: None,
+                properties: (!props.is_empty()).then(|| {
+                    props
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
+                }),
+            }))
+            .await
+            .expect("create");
+        text(&r)
+            .strip_prefix("Created: ")
+            .and_then(|r| r.split('.').next())
+            .expect("toc id")
+            .to_string()
+    }
+
+    async fn set_status(s: &OutlineMcpServer, id: &str, status: &str) {
+        s.node_update(Parameters(McpNodeUpdateRequest {
+            node_id: id.into(),
+            title: None,
+            body: None,
+            node_type: None,
+            placeholder: None,
+            properties: None,
+            properties_patch: None,
+            status: Some(status.into()),
+        }))
+        .await
+        .expect("set status");
+    }
+
+    fn query() -> McpNodeQueryRequest {
+        McpNodeQueryRequest {
+            filter: None,
+            include_body: false,
+            kind: None,
+            status: None,
+            include_archived: false,
+            verified_before: None,
+            subtree_root: None,
+            text: None,
+            format: None,
+        }
+    }
+
+    fn toc(include_archived: bool) -> McpTocRequest {
+        McpTocRequest {
+            subtree_root: None,
+            filter: None,
+            max_depth: None,
+            limit: None,
+            include_archived,
+        }
+    }
+
+    async fn history_len(s: &OutlineMcpServer) -> usize {
+        s.service_for("e")
+            .await
+            .unwrap()
+            .history()
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn archiving_stops_injection() {
+        let s = server_with_book().await;
+        let rule = create(&s, None, "Rule", &[("inject", "true")]).await;
+        let select = || McpSelectBookRequest {
+            book: "e".into(),
+            quiet: true,
+        };
+        let before = text(&s.select_book(Parameters(select())).await.unwrap());
+        assert!(before.contains("Injected Context (1 rules)"), "{before}");
+
+        set_status(&s, &rule, "archived").await;
+        let after = text(&s.select_book(Parameters(select())).await.unwrap());
+        assert!(!after.contains("Injected Context"), "{after}");
+    }
+
+    #[tokio::test]
+    async fn node_query_hides_archived_unless_asked() {
+        let s = server_with_book().await;
+        create(&s, None, "Live", &[]).await;
+        let old = create(&s, None, "Old", &[]).await;
+        create(&s, Some(&old), "Under old", &[]).await;
+        set_status(&s, &old, "archived").await;
+
+        let t = text(&s.node_query(Parameters(query())).await.unwrap());
+        assert!(t.contains("(1 matches)") && t.contains("Live"), "{t}");
+        assert!(!t.contains("Old") && !t.contains("Under old"), "{t}");
+
+        let mut q = query();
+        q.include_archived = true;
+        let t = text(&s.node_query(Parameters(q)).await.unwrap());
+        assert!(t.contains("(3 matches)"), "{t}");
+
+        let mut q = query();
+        q.status = Some("archived".into());
+        let t = text(&s.node_query(Parameters(q)).await.unwrap());
+        assert!(t.contains("(1 matches)") && t.contains("Old"), "{t}");
+        assert!(t.contains("Status: archived"), "{t}");
+
+        // Active nodes under an archived section stay hidden for status
+        // "active" too, unless include_archived.
+        let mut q = query();
+        q.status = Some("active".into());
+        let t = text(&s.node_query(Parameters(q)).await.unwrap());
+        assert!(t.contains("(1 matches)") && !t.contains("Under old"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn toc_hides_archived_subtrees_and_counts_them() {
+        let s = server_with_book().await;
+        create(&s, None, "Live", &[]).await;
+        let old = create(&s, None, "Old", &[]).await;
+        create(&s, Some(&old), "Under old", &[]).await;
+        set_status(&s, &old, "archived").await;
+
+        let t = text(&s.toc(Parameters(toc(false))).await.unwrap());
+        assert!(t.contains("1. Live") && !t.contains("Old"), "{t}");
+        assert!(
+            t.contains("… 2 archived nodes hidden (include_archived: true to show)"),
+            "{t}"
+        );
+
+        let t = text(&s.toc(Parameters(toc(true))).await.unwrap());
+        assert!(
+            t.contains("2. Old [archived]") && t.contains("2-1. Under old"),
+            "{t}"
+        );
+        assert!(!t.contains("hidden"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn node_verify_records_one_commit_and_feeds_verified_before() {
+        let s = server_with_book().await;
+        let a = create(&s, None, "A", &[]).await;
+        let b = create(&s, None, "B", &[]).await;
+        create(&s, None, "C", &[]).await;
+        let h0 = history_len(&s).await;
+
+        let r = s
+            .node_verify(Parameters(McpNodeVerifyRequest {
+                node_ids: vec![a.clone(), b.clone(), a.clone()],
+                by: Some("alice".into()),
+            }))
+            .await
+            .unwrap();
+        let t = text(&r);
+        assert!(
+            t.starts_with("Verified 2 node(s) at ") && t.contains(" by alice:"),
+            "{t}"
+        );
+        assert_eq!(history_len(&s).await, h0 + 2, "one entry per distinct node");
+
+        // A cutoff in the future: everything verified before it, plus C.
+        let mut q = query();
+        q.verified_before = Some("2999-01-01".into());
+        let t = text(&s.node_query(Parameters(q)).await.unwrap());
+        assert!(t.contains("(3 matches)"), "{t}");
+        assert!(
+            t.contains("by alice") && t.contains("Verified: never"),
+            "{t}"
+        );
+
+        // A cutoff in the past: only the never-verified node.
+        let mut q = query();
+        q.verified_before = Some("1000000000000".into()); // 2001, as millis
+        let t = text(&s.node_query(Parameters(q)).await.unwrap());
+        assert!(t.contains("(1 matches)") && t.contains("] C"), "{t}");
+
+        let mut q = query();
+        q.verified_before = Some("last week".into());
+        let e = s.node_query(Parameters(q)).await.unwrap_err();
+        assert!(e.message.contains("verified_before"), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn node_verify_with_an_unknown_node_records_nothing() {
+        let s = server_with_book().await;
+        let a = create(&s, None, "A", &[]).await;
+        let h0 = history_len(&s).await;
+        let e = s
+            .node_verify(Parameters(McpNodeVerifyRequest {
+                node_ids: vec![a, "9".into()],
+                by: None,
+            }))
+            .await;
+        assert!(e.is_err());
+        assert_eq!(history_len(&s).await, h0);
+
+        let e = s
+            .node_verify(Parameters(McpNodeVerifyRequest {
+                node_ids: vec![],
+                by: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("at least one"), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn node_query_json_carries_status_and_verification() {
+        let s = server_with_book().await;
+        let a = create(&s, None, "A", &[]).await;
+        s.node_verify(Parameters(McpNodeVerifyRequest {
+            node_ids: vec![a.clone()],
+            by: Some("bob".into()),
+        }))
+        .await
+        .unwrap();
+        set_status(&s, &a, "archived").await;
+        let mut q = query();
+        q.status = Some("archived".into());
+        q.format = Some("json".into());
+        let r = s.node_query(Parameters(q)).await.unwrap();
+        let v = r.structured_content.expect("structured");
+        let n = &v["nodes"][0];
+        assert_eq!(n["status"], "archived");
+        assert_eq!(n["verified_by"], "bob");
+        assert!(n["verified_at"].as_str().unwrap().ends_with('Z'));
+    }
+
+    #[tokio::test]
+    async fn archiving_a_section_stops_injecting_its_active_children() {
+        let s = server_with_book().await;
+        let old = create(&s, None, "Old rules", &[]).await;
+        create(&s, Some(&old), "Rule", &[("inject", "true")]).await;
+        let select = |quiet| McpSelectBookRequest {
+            book: "e".into(),
+            quiet,
+        };
+        let before = text(&s.select_book(Parameters(select(true))).await.unwrap());
+        assert!(before.contains("Injected Context (1 rules)"), "{before}");
+
+        set_status(&s, &old, "archived").await;
+        let after = text(&s.select_book(Parameters(select(false))).await.unwrap());
+        assert!(!after.contains("Injected Context"), "{after}");
+        // The TOC select_book prints hides the archived subtree like `toc`.
+        assert!(
+            !after.contains("Old rules") && !after.contains("Rule"),
+            "{after}"
+        );
+        assert!(
+            after.contains("… 2 archived nodes hidden (include_archived: true to show)"),
+            "{after}"
+        );
+
+        let r = s
+            .book_stats(Parameters(crate::request::McpBookStatsRequest {
+                slug: None,
+                format: Some("json".into()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.structured_content.expect("json")["injected"], 0);
+    }
+
+    #[tokio::test]
+    async fn toc_counts_only_hidden_nodes_the_view_would_have_shown() {
+        let s = server_with_book().await;
+        create(&s, None, "Live", &[]).await;
+        let old = create(&s, None, "Old", &[]).await;
+        for i in 0..5 {
+            create(&s, Some(&old), &format!("Under {i}"), &[]).await;
+        }
+        set_status(&s, &old, "archived").await;
+
+        let mut req = toc(false);
+        req.max_depth = Some(1);
+        let t = text(&s.toc(Parameters(req)).await.unwrap());
+        // Only "Old" itself is within depth 1; its five children would not
+        // have been shown at that depth either.
+        assert!(
+            t.contains("… 1 archived nodes hidden (include_archived: true to show)"),
+            "{t}"
+        );
+
+        let mut req = toc(false);
+        req.limit = Some(1);
+        let t = text(&s.toc(Parameters(req)).await.unwrap());
+        // The first node in toc order is "Live", which is shown.
+        assert!(!t.contains("archived nodes hidden"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn toc_of_an_archived_subtree_root_shows_it() {
+        let s = server_with_book().await;
+        let old = create(&s, None, "Old", &[]).await;
+        let under = create(&s, Some(&old), "Under old", &[]).await;
+        set_status(&s, &old, "archived").await;
+
+        for root in [&old, &under] {
+            let mut req = toc(false);
+            req.subtree_root = Some(root.clone());
+            let t = text(&s.toc(Parameters(req)).await.unwrap());
+            assert!(t.contains("Under old"), "{root}: {t}");
+            assert!(!t.contains("No matching nodes"), "{root}: {t}");
+            assert!(!t.contains("archived nodes hidden"), "{root}: {t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn checklist_leaves_archived_subtrees_out() {
+        let s = server_with_book().await;
+        create(&s, None, "Live", &[]).await;
+        let old = create(&s, None, "Old", &[]).await;
+        create(&s, Some(&old), "Under old", &[]).await;
+        set_status(&s, &old, "archived").await;
+
+        let dir = std::env::temp_dir().join(format!("outline-checklist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let export = |name: &str, include_archived| crate::request::McpEjectRequest {
+            output_dir: Some(dir.display().to_string()),
+            filename: Some(name.into()),
+            include_placeholders: None,
+            format: None,
+            subtree_root: None,
+            include_archived,
+        };
+        s.checklist(Parameters(export("default.md", false)))
+            .await
+            .unwrap();
+        s.checklist(Parameters(export("all.md", true)))
+            .await
+            .unwrap();
+        let default = std::fs::read_to_string(dir.join("default.md")).unwrap();
+        let all = std::fs::read_to_string(dir.join("all.md")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(default.contains("Live"), "{default}");
+        assert!(
+            !default.contains("Old") && !default.contains("Under old"),
+            "{default}"
+        );
+        assert!(all.contains("Old") && all.contains("Under old"), "{all}");
+        // The stored book is unchanged.
+        let t = text(&s.toc(Parameters(toc(true))).await.unwrap());
+        assert!(t.contains("Old [archived]"), "{t}");
     }
 }

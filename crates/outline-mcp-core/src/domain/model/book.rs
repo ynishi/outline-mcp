@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::id::{BookId, NodeId};
 use super::node::{NodeType, TemplateNode};
+use super::timestamp::Timestamp;
 use crate::domain::error::DomainError;
 
 /// ノード追加リクエスト
@@ -245,6 +246,34 @@ impl TemplateBook {
             node.set_status(status);
         }
 
+        Ok(())
+    }
+
+    /// `true` when the node or one of its ancestors is archived: retiring a
+    /// section retires what is under it.
+    pub fn is_archived_or_under_archived(&self, id: NodeId) -> bool {
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            match self.nodes.get(&c) {
+                Some(n) if n.status() == super::changelog::NodeStatus::Archived => return true,
+                Some(n) => cur = n.parent(),
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Mark a node as verified at `at` by `by` (content unchanged).
+    pub fn verify_node(
+        &mut self,
+        id: NodeId,
+        at: Timestamp,
+        by: Option<String>,
+    ) -> Result<(), DomainError> {
+        self.nodes
+            .get_mut(&id)
+            .ok_or(DomainError::NodeNotFound(id))?
+            .set_verified(at, by);
         Ok(())
     }
 
@@ -498,6 +527,37 @@ mod tests {
 
         assert_eq!(book.root_nodes().len(), 1);
         assert_eq!(book.get_node(id).unwrap().title(), "Design");
+    }
+
+    #[test]
+    fn archived_ancestor_hides_descendants() {
+        let mut book = make_book();
+        let add = |book: &mut TemplateBook, parent| {
+            book.add_node(AddNodeRequest {
+                parent,
+                title: "n".into(),
+                node_type: NodeType::Section,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+                properties: HashMap::new(),
+            })
+            .unwrap()
+        };
+        let top = add(&mut book, None);
+        let mid = add(&mut book, Some(top));
+        let leaf = add(&mut book, Some(mid));
+        let other = add(&mut book, None);
+        assert!(!book.is_archived_or_under_archived(leaf));
+        book.nodes
+            .get_mut(&mid)
+            .unwrap()
+            .set_status(super::super::changelog::NodeStatus::Archived);
+        assert!(book.is_archived_or_under_archived(mid));
+        assert!(book.is_archived_or_under_archived(leaf));
+        assert!(!book.is_archived_or_under_archived(top));
+        assert!(!book.is_archived_or_under_archived(other));
+        assert!(!book.is_archived_or_under_archived(NodeId::new()));
     }
 
     #[test]

@@ -14,6 +14,23 @@ pub enum NodeStatus {
     Active,
     /// Draft state — excluded from `select_book` context injection.
     Draft,
+    /// Retired: kept readable, but excluded from `select_book` context
+    /// injection and, unless asked for, from `node_query` and `toc`.
+    Archived,
+}
+
+impl NodeStatus {
+    /// Every status, in display order.
+    pub const ALL: [NodeStatus; 3] = [NodeStatus::Active, NodeStatus::Draft, NodeStatus::Archived];
+
+    /// The wire / storage name (`"active"`, `"draft"`, `"archived"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NodeStatus::Active => "active",
+            NodeStatus::Draft => "draft",
+            NodeStatus::Archived => "archived",
+        }
+    }
 }
 
 /// ChangeLog に記録するアクション種別。

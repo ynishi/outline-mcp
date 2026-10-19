@@ -44,6 +44,56 @@ impl Timestamp {
     pub fn parse_iso8601(s: &str) -> Result<Self, String> {
         iso8601_to_millis(s).map(Self)
     }
+
+    /// A moment given by a caller: Unix millis (`1767225600000`), a UTC date
+    /// (`2026-01-01`, meaning its 00:00:00Z), or a UTC datetime with or without
+    /// the trailing `Z` (`2026-01-01T09:00:00`, `2026-01-01T09:00:00.000Z`).
+    /// Offsets other than `Z` are not accepted.
+    ///
+    /// # Errors
+    ///
+    /// Any other shape, with a message naming the accepted forms.
+    pub fn parse_moment(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let accepted = "expected Unix millis, YYYY-MM-DD, or YYYY-MM-DDTHH:MM:SS[.sss][Z] (UTC)";
+        if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+            // Unix seconds (10 digits until the year 2286) read as millis
+            // would land in 1970 without any error; refuse them instead.
+            if s.len() <= 10 {
+                return Err(format!(
+                    "{s}: looks like seconds; pass Unix millis or an ISO date ({accepted})"
+                ));
+            }
+            return s
+                .parse::<i64>()
+                .map(Self)
+                .map_err(|e| format!("{s}: {e}; {accepted}"));
+        }
+        if !s.is_ascii() {
+            return Err(format!("{s}: {accepted}"));
+        }
+        // ASCII from here on, so byte offsets are character offsets.
+        let tail = s.get(19..).unwrap_or("");
+        let iso = if s.len() == 10 {
+            format!("{s}T00:00:00Z")
+        } else if s.len() >= 19 && tail.contains(['+', '-']) {
+            // `parse_iso8601` reads the first 19 characters and the fraction;
+            // an offset after them would be silently treated as UTC.
+            return Err(format!("{s}: only UTC (Z) is accepted; {accepted}"));
+        } else if s.len() >= 19 && !s.ends_with('Z') {
+            format!("{s}Z")
+        } else {
+            s.to_string()
+        };
+        let t = Self::parse_iso8601(&iso).map_err(|e| format!("{s}: {e}; {accepted}"))?;
+        // The day is only range-checked (1..=31) by the parser, so a date
+        // like 2026-02-30 would roll over into March. A real date survives
+        // the round trip unchanged.
+        if t.to_iso8601().get(..10) != iso.get(..10) {
+            return Err(format!("{s}: no such date; {accepted}"));
+        }
+        Ok(t)
+    }
 }
 
 impl fmt::Display for Timestamp {
@@ -311,5 +361,76 @@ mod tests {
     fn test_parse_invalid_returns_err() {
         assert!(Timestamp::parse_iso8601("not-a-date").is_err());
         assert!(Timestamp::parse_iso8601("").is_err());
+    }
+
+    #[test]
+    fn test_parse_moment_accepts_millis_date_and_datetime() {
+        let midnight = Timestamp::parse_iso8601("2026-07-01T00:00:00.000Z").unwrap();
+        assert_eq!(Timestamp::parse_moment("2026-07-01").unwrap(), midnight);
+        assert_eq!(
+            Timestamp::parse_moment(&midnight.as_millis().to_string()).unwrap(),
+            midnight
+        );
+        let nine = Timestamp::parse_iso8601("2026-07-01T09:00:00.000Z").unwrap();
+        assert_eq!(
+            Timestamp::parse_moment("2026-07-01T09:00:00").unwrap(),
+            nine
+        );
+        assert_eq!(
+            Timestamp::parse_moment("2026-07-01T09:00:00Z").unwrap(),
+            nine
+        );
+        assert_eq!(
+            Timestamp::parse_moment(" 2026-07-01T09:00:00.000Z ").unwrap(),
+            nine
+        );
+    }
+
+    #[test]
+    fn test_parse_moment_rejects_offsets_and_garbage() {
+        let offset = Timestamp::parse_moment("2026-07-01T09:00:00+09:00").unwrap_err();
+        assert!(offset.contains("only UTC"), "{offset}");
+        let garbage = Timestamp::parse_moment("next week").unwrap_err();
+        assert!(
+            !garbage.contains("only UTC") && garbage.contains("expected"),
+            "{garbage}"
+        );
+        assert!(Timestamp::parse_moment("２０２６年７月１日の午前九時ちょうど").is_err());
+        assert!(Timestamp::parse_moment("yesterday").is_err());
+        assert!(Timestamp::parse_moment("").is_err());
+        assert!(Timestamp::parse_moment("2026-13-01").is_err());
+    }
+
+    #[test]
+    fn test_parse_moment_checks_the_day_against_the_month() {
+        assert!(Timestamp::parse_moment("2024-02-29").is_ok(), "leap year");
+        for bad in [
+            "2026-02-29",
+            "2026-02-30",
+            "2026-04-31",
+            "1900-02-29",
+            "2026-02-30T10:00:00Z",
+        ] {
+            let e = Timestamp::parse_moment(bad).unwrap_err();
+            assert!(e.contains("no such date"), "{bad}: {e}");
+        }
+        assert!(
+            Timestamp::parse_moment("2000-02-29").is_ok(),
+            "400-year leap"
+        );
+        assert!(Timestamp::parse_moment("2026-12-31T23:59:59.999Z").is_ok());
+    }
+
+    #[test]
+    fn test_parse_moment_refuses_what_looks_like_seconds() {
+        let e = Timestamp::parse_moment("1700000000").unwrap_err();
+        assert!(e.contains("looks like seconds"), "{e}");
+        assert!(Timestamp::parse_moment("0").is_err());
+        assert_eq!(
+            Timestamp::parse_moment("1700000000000")
+                .unwrap()
+                .as_millis(),
+            1_700_000_000_000
+        );
     }
 }

@@ -806,3 +806,52 @@ async fn snapshot_delete_stays_inside_its_book_against_postgres() {
         assert!(BookStore::delete(&store, slug, v).await.unwrap());
     }
 }
+
+#[tokio::test]
+async fn archived_status_and_verification_round_trip_against_postgres() {
+    use outline_mcp_core::domain::model::changelog::NodeStatus;
+
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!(
+            "OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres archived/verify test did NOT run"
+        );
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate (incl. 0003)");
+    let slug = format!("_test-archived-verify-{}", std::process::id());
+
+    let svc = BookService::new(store.clone(), slug.clone());
+    svc.create_book("AV", 4).await.expect("create_book");
+    let (a, _) = svc.add_node(add_req(None, "a")).await.unwrap();
+    let (b, _) = svc.add_node(add_req(None, "b")).await.unwrap();
+
+    let mut archive = title_req("a");
+    archive.title = None;
+    archive.status = Some(NodeStatus::Archived);
+    svc.update_node(a, archive).await.expect("archive");
+    let at = svc
+        .verify_nodes(&[b], Some("pg-tester".into()))
+        .await
+        .expect("verify");
+
+    // Read back through a fresh load: both survive the row mapping.
+    let book = BookStore::load(&store, &slug).await.unwrap().unwrap().value;
+    assert_eq!(book.get_node(a).unwrap().status(), NodeStatus::Archived);
+    assert!(book.get_node(a).unwrap().verified_at().is_none());
+    let nb = book.get_node(b).unwrap();
+    assert_eq!(nb.verified_at(), Some(at));
+    assert_eq!(nb.verified_by(), Some("pg-tester"));
+    assert_eq!(nb.status(), NodeStatus::Active);
+    assert_eq!(
+        svc.history_by_node(b).await.unwrap().last().unwrap().action,
+        ChangeAction::Update
+    );
+
+    let v = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert!(BookStore::delete(&store, &slug, v).await.unwrap());
+}

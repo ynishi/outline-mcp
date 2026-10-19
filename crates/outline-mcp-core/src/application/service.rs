@@ -97,6 +97,36 @@ impl<S: BookStore> BookService<S> {
         Ok(((), join_warnings(warnings)))
     }
 
+    /// Mark `ids` as verified now by `by`: one commit over the version just
+    /// read, with one `Update` entry per node (before / after carry the
+    /// verification fields). The nodes' `updated_at` is not touched. Fails
+    /// as a whole, committing nothing, if any id is unknown.
+    pub async fn verify_nodes(
+        &self,
+        ids: &[NodeId],
+        by: Option<String>,
+    ) -> Result<Timestamp, AppError> {
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
+        let at = Timestamp::now();
+        let mut events = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let before = node_json(&book, id);
+            book.verify_node(id, at, by.clone())?;
+            events.push(ChangeEntry::new(
+                id,
+                ChangeAction::Update,
+                before,
+                node_json(&book, id),
+                at,
+            ));
+        }
+        self.commit(Some(version), &book, &events).await?;
+        Ok(at)
+    }
+
     /// Change the book's own fields: title and / or max depth (`None` keeps
     /// the current value). One commit over the version just read, carrying a
     /// [`ChangeAction::BookUpdate`] entry; when nothing would change, nothing
@@ -689,6 +719,65 @@ mod tests {
             .filter(|e| e.action == ChangeAction::Update)
             .count();
         assert_eq!(updates, 2);
+    }
+
+    #[tokio::test]
+    async fn test_verify_nodes_is_one_commit_and_keeps_updated_at() {
+        let svc = memory_service().await;
+        let (a, _) = svc.add_node(add_req("A")).await.expect("add A");
+        let (b, _) = svc.add_node(add_req("B")).await.expect("add B");
+        let edited = svc
+            .read_tree()
+            .await
+            .unwrap()
+            .get_node(a)
+            .unwrap()
+            .updated_at();
+        let before = svc.store.load("test").await.unwrap().unwrap().version;
+
+        let at = svc
+            .verify_nodes(&[a, b], Some("alice".into()))
+            .await
+            .expect("verify");
+
+        assert_eq!(
+            svc.store.load("test").await.unwrap().unwrap().version,
+            before + 1
+        );
+        let book = svc.read_tree().await.unwrap();
+        let na = book.get_node(a).unwrap();
+        assert_eq!(na.verified_at(), Some(at));
+        assert_eq!(na.verified_by(), Some("alice"));
+        assert_eq!(na.updated_at(), edited, "verifying is not editing");
+        let h = svc.history_by_node(a).await.unwrap();
+        let last = h.last().unwrap();
+        assert_eq!(last.action, ChangeAction::Update);
+        assert!(last
+            .after
+            .as_deref()
+            .unwrap()
+            .contains("\"verified_by\":\"alice\""));
+        assert!(!last.before.as_deref().unwrap().contains("verified_at"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_nodes_with_unknown_id_commits_nothing() {
+        let svc = memory_service().await;
+        let (a, _) = svc.add_node(add_req("A")).await.expect("add A");
+        let before = svc.store.load("test").await.unwrap().unwrap().version;
+        assert!(svc.verify_nodes(&[a, NodeId::new()], None).await.is_err());
+        assert_eq!(
+            svc.store.load("test").await.unwrap().unwrap().version,
+            before
+        );
+        assert!(svc
+            .read_tree()
+            .await
+            .unwrap()
+            .get_node(a)
+            .unwrap()
+            .verified_at()
+            .is_none());
     }
 
     #[tokio::test]

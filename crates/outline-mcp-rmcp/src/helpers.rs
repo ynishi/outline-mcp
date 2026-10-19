@@ -1,4 +1,5 @@
 use outline_mcp_core::domain::model::book::TemplateBook;
+use outline_mcp_core::domain::model::changelog::NodeStatus;
 use outline_mcp_core::domain::model::id::NodeId;
 use outline_mcp_core::domain::model::node::TemplateNode;
 
@@ -33,11 +34,17 @@ pub(crate) fn format_toc(book: &TemplateBook, nodes: &[&TemplateNode]) -> String
             .map(|(num, _)| num.as_str())
             .unwrap_or("?");
         let tags = format_property_tags(node);
+        let archived = if node.status() == NodeStatus::Archived {
+            " [archived]"
+        } else {
+            ""
+        };
         output.push_str(&format!(
-            "{}{}. {}{}\n",
+            "{}{}. {}{}{}\n",
             indent,
             hier_id,
             node.title(),
+            archived,
             tags
         ));
     }
@@ -69,6 +76,33 @@ pub(crate) fn format_toc_limited(
         ));
     }
     out
+}
+
+/// How many archived nodes (archived, or under an archived section) the
+/// toc view would have shown had archived nodes been included: only nodes
+/// within `max_depth` and among the first `limit` of those count, so the
+/// number never includes nodes the view would not show anyway.
+pub(crate) fn archived_hidden_count(
+    book: &TemplateBook,
+    nodes: &[&TemplateNode],
+    max_depth: Option<u8>,
+    limit: Option<usize>,
+) -> usize {
+    nodes
+        .iter()
+        .filter(|n| max_depth.is_none_or(|d| book.depth_of(n.id()) <= d))
+        .take(limit.unwrap_or(usize::MAX))
+        .filter(|n| book.is_archived_or_under_archived(n.id()))
+        .count()
+}
+
+/// The closing line naming hidden archived nodes, or an empty string.
+pub(crate) fn archived_hidden_line(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!("… {count} archived nodes hidden (include_archived: true to show)\n")
+    }
 }
 
 /// ` (id: <uuid>)` — appended to result lines so the id can go straight into
