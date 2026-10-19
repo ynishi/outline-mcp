@@ -308,6 +308,17 @@ pub(crate) struct McpSnapshotTagRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpSnapshotDeleteRequest {
+    #[schemars(description = "Timestamp (millis) from snapshot_list output")]
+    pub timestamp: String,
+    #[schemars(
+        description = "Required to delete a labeled snapshot (a label usually marks a restore point someone meant to keep). Default: false"
+    )]
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct McpSnapshotListRequest {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

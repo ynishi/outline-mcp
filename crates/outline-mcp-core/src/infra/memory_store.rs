@@ -8,7 +8,8 @@ use crate::domain::model::changelog::ChangeEntry;
 use crate::domain::model::id::NodeId;
 use crate::domain::model::timestamp::Timestamp;
 use crate::domain::store::{
-    BookStore, BookSummary, Committed, SnapshotInfo, SnapshotStore, StoreError, Versioned,
+    BookStore, BookSummary, Committed, SnapshotDelete, SnapshotInfo, SnapshotStore, StoreError,
+    Versioned,
 };
 
 struct Stored {
@@ -250,6 +251,27 @@ impl SnapshotStore for MemorySnapshotStore {
         )
     }
 
+    async fn delete(
+        &self,
+        slug: &str,
+        timestamp: Timestamp,
+        allow_labeled: bool,
+    ) -> Result<SnapshotDelete, StoreError> {
+        // Check and remove under one lock, so a concurrent `tag` cannot slip in
+        // between.
+        let mut snapshots = self.snapshots.lock().await;
+        let key = (slug.to_string(), timestamp.as_millis());
+        let label = match snapshots.get(&key) {
+            None => return Ok(SnapshotDelete::NotFound),
+            Some(s) => s.label.clone(),
+        };
+        if let (Some(l), false) = (&label, allow_labeled) {
+            return Ok(SnapshotDelete::Labeled(l.clone()));
+        }
+        snapshots.remove(&key);
+        Ok(SnapshotDelete::Deleted { label })
+    }
+
     async fn delete_all(&self, slug: &str) -> Result<u64, StoreError> {
         let mut snapshots = self.snapshots.lock().await;
         let before = snapshots.len();
@@ -262,6 +284,69 @@ impl SnapshotStore for MemorySnapshotStore {
 mod tests {
     use super::*;
     use crate::domain::model::changelog::ChangeAction;
+
+    #[tokio::test]
+    async fn snapshot_delete_removes_one_and_reports_unknown() {
+        let store = MemorySnapshotStore::new();
+        let book = TemplateBook::new("b", 4);
+        let a = store.create("s", &book, None).await.unwrap();
+        let b = store.create("s", &book, Some("keep")).await.unwrap();
+        let other = store.create("t", &book, None).await.unwrap();
+
+        assert_eq!(
+            store.delete("s", a.timestamp, false).await.unwrap(),
+            SnapshotDelete::Deleted { label: None }
+        );
+        assert_eq!(
+            store.delete("s", a.timestamp, false).await.unwrap(),
+            SnapshotDelete::NotFound,
+            "already gone"
+        );
+        let left: Vec<_> = store
+            .list("s")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.timestamp)
+            .collect();
+        assert_eq!(left, vec![b.timestamp]);
+        assert!(store.get("s", a.timestamp).await.unwrap().is_none());
+        assert_eq!(store.list("t").await.unwrap()[0].timestamp, other.timestamp);
+        assert_eq!(
+            store
+                .delete("s", Timestamp::from_millis(1), true)
+                .await
+                .unwrap(),
+            SnapshotDelete::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_delete_guards_labels_and_stays_inside_its_book() {
+        let store = MemorySnapshotStore::new();
+        let book = TemplateBook::new("b", 4);
+        let ts = Timestamp::from_millis(1_000);
+        // Two books with a snapshot at the very same timestamp.
+        store.insert("s", ts, &book, Some("keep")).await.unwrap();
+        store.insert("t", ts, &book, None).await.unwrap();
+
+        assert_eq!(
+            store.delete("s", ts, false).await.unwrap(),
+            SnapshotDelete::Labeled("keep".into())
+        );
+        assert!(store.get("s", ts).await.unwrap().is_some(), "refused");
+        assert_eq!(
+            store.delete("s", ts, true).await.unwrap(),
+            SnapshotDelete::Deleted {
+                label: Some("keep".into())
+            }
+        );
+        assert!(store.get("s", ts).await.unwrap().is_none());
+        assert!(
+            store.get("t", ts).await.unwrap().is_some(),
+            "the other book's snapshot at the same timestamp stays"
+        );
+    }
 
     #[tokio::test]
     async fn snapshots_list_newest_first_and_create_never_reuses_a_millisecond() {

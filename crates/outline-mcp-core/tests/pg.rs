@@ -9,7 +9,7 @@ use outline_mcp_core::domain::model::book::{AddNodeRequest, TemplateBook, Update
 use outline_mcp_core::domain::model::changelog::{ChangeAction, ChangeEntry};
 use outline_mcp_core::domain::model::node::NodeType;
 use outline_mcp_core::domain::model::timestamp::Timestamp;
-use outline_mcp_core::domain::store::{BookStore, SnapshotStore, StoreError};
+use outline_mcp_core::domain::store::{BookStore, SnapshotDelete, SnapshotStore, StoreError};
 use outline_mcp_core::infra::pg_store::PgBookStore;
 use outline_mcp_core::infra::shelf_import::{import_book, read_shelf_book};
 
@@ -519,4 +519,124 @@ async fn import_book_commits_tree_and_history_together_against_postgres() {
     assert!(BookStore::delete(&store, &slug, version_after)
         .await
         .unwrap());
+}
+
+#[tokio::test]
+async fn snapshot_delete_removes_one_row_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!(
+            "OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres snapshot delete test did NOT run"
+        );
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let slug = format!("_test-snapdel-{}", std::process::id());
+    let svc = BookService::new(store.clone(), slug.clone());
+    svc.create_book("SnapDel", 4).await.expect("create_book");
+    svc.add_node(add_req(None, "a")).await.expect("add a");
+    let book = svc.read_tree().await.expect("read");
+    let gone = SnapshotStore::create(&store, &slug, &book, None)
+        .await
+        .expect("snapshot 1");
+    let kept = SnapshotStore::create(&store, &slug, &book, Some("keep"))
+        .await
+        .expect("snapshot 2");
+    let version = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+
+    assert_eq!(
+        SnapshotStore::delete(&store, &slug, gone.timestamp, false)
+            .await
+            .expect("delete"),
+        SnapshotDelete::Deleted { label: None }
+    );
+    assert_eq!(
+        SnapshotStore::delete(&store, &slug, gone.timestamp, false)
+            .await
+            .expect("delete again"),
+        SnapshotDelete::NotFound
+    );
+    // The labeled one is refused without allow_labeled, in the same statement.
+    assert_eq!(
+        SnapshotStore::delete(&store, &slug, kept.timestamp, false)
+            .await
+            .expect("delete labeled"),
+        SnapshotDelete::Labeled("keep".into())
+    );
+    let left: Vec<_> = SnapshotStore::list(&store, &slug)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.timestamp)
+        .collect();
+    assert_eq!(left, vec![kept.timestamp]);
+    assert!(SnapshotStore::get(&store, &slug, gone.timestamp)
+        .await
+        .unwrap()
+        .is_none());
+    // The book is untouched: same version, same node.
+    let after = BookStore::load(&store, &slug).await.unwrap().unwrap();
+    assert_eq!(after.version, version);
+    assert_eq!(after.value.node_count(), 1);
+
+    assert!(BookStore::delete(&store, &slug, version).await.unwrap());
+}
+
+#[tokio::test]
+async fn snapshot_delete_stays_inside_its_book_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!(
+            "OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres snapshot scoping test did NOT run"
+        );
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let pid = std::process::id();
+    let (s, t) = (
+        format!("_test-snapscope-s-{pid}"),
+        format!("_test-snapscope-t-{pid}"),
+    );
+    for slug in [&s, &t] {
+        BookService::new(store.clone(), slug.clone())
+            .create_book("Scope", 4)
+            .await
+            .expect("create_book");
+    }
+    let book = TemplateBook::new("Scope", 4);
+    let ts = Timestamp::from_millis(1_000);
+    // Two books with a snapshot at the very same timestamp.
+    SnapshotStore::insert(&store, &s, ts, &book, Some("keep"))
+        .await
+        .expect("insert s");
+    SnapshotStore::insert(&store, &t, ts, &book, None)
+        .await
+        .expect("insert t");
+
+    assert_eq!(
+        SnapshotStore::delete(&store, &s, ts, true)
+            .await
+            .expect("delete s"),
+        SnapshotDelete::Deleted {
+            label: Some("keep".into())
+        }
+    );
+    assert!(SnapshotStore::get(&store, &s, ts).await.unwrap().is_none());
+    assert!(
+        SnapshotStore::get(&store, &t, ts).await.unwrap().is_some(),
+        "the other book's snapshot at the same timestamp stays"
+    );
+
+    for slug in [&s, &t] {
+        let v = BookStore::load(&store, slug)
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        assert!(BookStore::delete(&store, slug, v).await.unwrap());
+    }
 }

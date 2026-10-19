@@ -15,9 +15,9 @@ use crate::request::{
     McpBatchUpdateRequest, McpBookDeleteRequest, McpBookHistoryRequest, McpDumpRequest,
     McpEjectRequest, McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpNodeCreateRequest,
     McpNodeHistoryRequest, McpNodeMoveRequest, McpNodeQueryRequest, McpNodeUpdateRequest,
-    McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest, McpSnapshotDiffRequest,
-    McpSnapshotDumpAllRequest, McpSnapshotDumpRequest, McpSnapshotListRequest,
-    McpSnapshotRestoreRequest, McpSnapshotTagRequest, McpTocRequest,
+    McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest, McpSnapshotDeleteRequest,
+    McpSnapshotDiffRequest, McpSnapshotDumpAllRequest, McpSnapshotDumpRequest,
+    McpSnapshotListRequest, McpSnapshotRestoreRequest, McpSnapshotTagRequest, McpTocRequest,
 };
 use crate::server::OutlineMcpServer;
 
@@ -912,6 +912,26 @@ impl OutlineMcpServer {
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             format!("Snapshot {} tagged as '{}'", millis, label),
+        )]))
+    }
+
+    #[tool(
+        name = "snapshot_delete",
+        description = "Delete one snapshot of the selected book (timestamp from `snapshot_list`). Cannot be undone. A labeled snapshot needs `force: true`. The book itself is not changed, so nothing is added to its history.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn snapshot_delete(
+        &self,
+        Parameters(req): Parameters<McpSnapshotDeleteRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let msg = self.delete_snapshot(&req.timestamp, req.force).await?;
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            msg,
         )]))
     }
 

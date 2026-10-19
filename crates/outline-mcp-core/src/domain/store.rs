@@ -166,6 +166,23 @@ pub struct SnapshotInfo {
     pub size_bytes: u64,
 }
 
+/// What [`SnapshotStore::delete`] did. The label check and the removal are
+/// one decision inside the store, so a label attached concurrently is never
+/// deleted without `allow_labeled`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotDelete {
+    /// The snapshot was removed.
+    Deleted {
+        /// The label the removed snapshot carried, if any.
+        label: Option<String>,
+    },
+    /// No snapshot of this book at that timestamp.
+    NotFound,
+    /// The snapshot carries this label and `allow_labeled` was false; nothing
+    /// was removed.
+    Labeled(String),
+}
+
 /// Whole-book snapshots, keyed by `(slug, timestamp)`.
 ///
 /// A snapshot is a copy of the book at one moment. Restoring one is not this
@@ -209,6 +226,16 @@ pub trait SnapshotStore: Send + Sync {
     /// snapshot at `timestamp`.
     async fn tag(&self, slug: &str, timestamp: Timestamp, label: &str) -> Result<bool, StoreError>;
 
+    /// Delete one snapshot of `slug`. A labeled snapshot is removed only when
+    /// `allow_labeled` is true; the check and the removal happen together.
+    /// The book itself is not touched.
+    async fn delete(
+        &self,
+        slug: &str,
+        timestamp: Timestamp,
+        allow_labeled: bool,
+    ) -> Result<SnapshotDelete, StoreError>;
+
     /// Delete every snapshot of a book. Returns how many were removed.
     async fn delete_all(&self, slug: &str) -> Result<u64, StoreError>;
 }
@@ -248,6 +275,15 @@ impl<T: SnapshotStore + ?Sized> SnapshotStore for Arc<T> {
 
     async fn tag(&self, slug: &str, timestamp: Timestamp, label: &str) -> Result<bool, StoreError> {
         (**self).tag(slug, timestamp, label).await
+    }
+
+    async fn delete(
+        &self,
+        slug: &str,
+        timestamp: Timestamp,
+        allow_labeled: bool,
+    ) -> Result<SnapshotDelete, StoreError> {
+        (**self).delete(slug, timestamp, allow_labeled).await
     }
 
     async fn delete_all(&self, slug: &str) -> Result<u64, StoreError> {
