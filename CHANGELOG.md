@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.15.1] - 2026-10-19
+
+The library API change of `outline-mcp-core` listed under Changed (new public fields, a new `AppError` variant) is breaking for code that builds those structs with literals or matches `AppError` exhaustively, although this is a patch release.
+
+### Added
+
 - **`import` `new_ids`** (#22) — `new_ids: true` gives every imported node a fresh id and remaps links between imported nodes, for importing a copy next to the original or a file whose ids are not UUIDs.
 - **`import` reports what it did** (#22): nodes created, updated and deleted (every node of the book that is not in the file is deleted, and the result says so), plus links and pending revisions it had to drop. A pending revision in the file that breaks the `revision_propose` rules (on an archived node, `properties` with `properties_patch`, or changing nothing) is dropped and reported instead of failing the import.
 - **Subtree exports are marked and guarded** (#22). An export of one section (`subtree_root`) records it as `subtree_root: {id, title}`; `import` refuses such a file unless `force: true`, because it holds only that section's children and would replace the whole book with them. Subtree exports written by 0.15.0 or earlier carry no marker; when ids are kept, `import` recognizes them from their ids (a top-level node of the file sits under a section in the book) and refuses them the same way. Everything the import decides from the destination book (this guard, which nodes keep their stamp) comes from the same load the commit goes over, so a concurrent write makes the import fail instead of mixing two versions.
@@ -22,6 +38,8 @@ All notable changes to this project will be documented in this file.
 ### Removed
 
 ### Fixed
+
+- **Dependency `chacha20` 0.10.1 → 0.10.2.** 0.10.1 was yanked from crates.io; it came in through `rand` 0.10 (used by `rmcp` and `sqlx-postgres`). Lockfile only.
 
 ### Security
 
