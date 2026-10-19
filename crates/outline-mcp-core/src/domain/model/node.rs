@@ -387,6 +387,12 @@ impl TemplateNode {
         self.status = status;
     }
 
+    /// Overwrite the last-edited stamp (used by import to settle the stamp of
+    /// a node whose file carried none, once the node is complete).
+    pub(crate) fn set_updated_at(&mut self, at: Option<Timestamp>) {
+        self.updated_at = at;
+    }
+
     /// Record a verification. `updated_at` is left alone: verifying confirms
     /// the content, it does not change it, so "last edited" stays meaningful.
     pub(crate) fn set_verified(&mut self, at: Timestamp, by: Option<String>) {

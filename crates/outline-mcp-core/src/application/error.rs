@@ -35,6 +35,11 @@ pub enum AppError {
     #[error("import: invalid node type: {0}")]
     ImportInvalidType(String),
 
+    /// An imported JSON tree is not valid for another reason (an id that is
+    /// not a UUID or is repeated, a self-link, an invalid link type).
+    #[error("import: {0}")]
+    ImportInvalid(String),
+
     /// A snapshot operation failed (not found / I/O / serde).
     #[error("snapshot error: {0}")]
     Snapshot(String),

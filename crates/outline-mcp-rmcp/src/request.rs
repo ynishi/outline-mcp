@@ -261,6 +261,16 @@ pub(crate) struct McpEjectRequest {
 pub(crate) struct McpImportRequest {
     #[schemars(description = "Path to JSON file exported by eject (format: json)")]
     pub file_path: String,
+    #[schemars(
+        description = "Give every imported node a new id (default false: keep the ids in the file, so re-importing a book's own export updates it in place). Use true to import a copy next to the original or a file whose ids are not UUIDs; links between imported nodes are remapped."
+    )]
+    #[serde(default)]
+    pub new_ids: bool,
+    #[schemars(
+        description = "Import a file exported from one section (`subtree_root`) anyway. Such a file holds only that section's children, and importing it replaces the WHOLE book with them; refused unless true."
+    )]
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

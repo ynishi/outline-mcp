@@ -582,6 +582,94 @@ async fn import_book_commits_tree_and_history_together_against_postgres() {
 }
 
 #[tokio::test]
+async fn export_import_round_trip_keeps_curated_state_against_postgres() {
+    use outline_mcp_core::application::eject::{EjectService, EjectTree, ImportOptions};
+    use outline_mcp_core::domain::model::changelog::NodeStatus;
+
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!(
+            "OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres export/import test did NOT run"
+        );
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let slug = format!("_test-export-import-{}", std::process::id());
+    let copy_slug = format!("{slug}-copy");
+
+    let svc = BookService::new(store.clone(), slug.clone());
+    svc.create_book("Curated", 4).await.expect("create_book");
+    let (live, _) = svc.add_node(add_req(None, "live")).await.unwrap();
+    let (old, _) = svc.add_node(add_req(None, "old")).await.unwrap();
+    let mut archive = title_req("old");
+    archive.title = None;
+    archive.status = Some(NodeStatus::Archived);
+    svc.update_node(old, archive).await.unwrap();
+    svc.verify_nodes(&[live], Some("alice".into()))
+        .await
+        .unwrap();
+    svc.add_link(live, old, "supersedes").await.unwrap();
+    svc.propose_revision(
+        live,
+        Revision {
+            title: Some("live v2".into()),
+            body: None,
+            properties: None,
+            properties_patch: None,
+            base: String::new(),
+            by: Some("bob".into()),
+            note: None,
+            at: Timestamp::now(),
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    let before = svc.read_tree().await.unwrap();
+    let history_before = svc.history().await.unwrap().len();
+
+    // Re-import the book's own export: nothing changes, nothing is recorded.
+    let tree: EjectTree =
+        serde_json::from_str(&EjectService::render_json(&before, None).unwrap()).unwrap();
+    let report = EjectService::import_tree_with(&tree, ImportOptions::default()).unwrap();
+    assert_eq!(svc.import_book(&report.book).await.unwrap(), 0);
+    assert_eq!(svc.history().await.unwrap().len(), history_before);
+    let after = svc.read_tree().await.unwrap();
+    for id in [live, old] {
+        assert_eq!(
+            serde_json::to_value(before.get_node(id).unwrap()).unwrap(),
+            serde_json::to_value(after.get_node(id).unwrap()).unwrap()
+        );
+    }
+
+    // A copy with new ids in another book keeps the link between its nodes.
+    let copy = BookService::new(store.clone(), copy_slug.clone());
+    let report = EjectService::import_tree_with(&tree, ImportOptions { new_ids: true }).unwrap();
+    copy.import_book(&report.book).await.unwrap();
+    let copied = copy.read_tree().await.unwrap();
+    let by_title = |t: &str| {
+        copied
+            .all_nodes_dfs()
+            .into_iter()
+            .find(|n| n.title() == t)
+            .unwrap()
+            .id()
+    };
+    let (cl, co) = (by_title("live"), by_title("old"));
+    assert_ne!(cl, live);
+    let l = copied.get_node(cl).unwrap();
+    assert_eq!(l.links()[0].target(), co);
+    assert_eq!(l.verified_by(), Some("alice"));
+    assert!(l.proposal().is_some());
+    assert_eq!(copied.get_node(co).unwrap().status(), NodeStatus::Archived);
+
+    for s in [&slug, &copy_slug] {
+        let v = BookStore::load(&store, s).await.unwrap().unwrap().version;
+        assert!(BookStore::delete(&store, s, v).await.unwrap());
+    }
+}
+
+#[tokio::test]
 async fn book_update_records_a_book_level_event_against_postgres() {
     let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
         eprintln!(

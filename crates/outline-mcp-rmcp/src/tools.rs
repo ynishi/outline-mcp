@@ -6,7 +6,9 @@ use rmcp::{
     ErrorData as McpError,
 };
 
-use outline_mcp_core::application::eject::{EjectConfig, EjectFormat, EjectService, EjectTree};
+use outline_mcp_core::application::eject::{
+    EjectConfig, EjectFormat, EjectService, EjectTree, ImportOptions,
+};
 
 use crate::helpers::{
     archived_hidden_count, archived_hidden_line, build_hierarchical_ids, describe_book_update,
@@ -33,6 +35,7 @@ use crate::revision::{
 };
 use crate::server::OutlineMcpServer;
 
+use outline_mcp_core::application::error::AppError;
 use outline_mcp_core::domain::model::book::AddNodeRequest;
 use outline_mcp_core::domain::model::book::UpdateNodeRequest;
 use outline_mcp_core::domain::model::changelog::{ChangeAction, NodeStatus};
@@ -893,7 +896,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "import",
-        description = "Import a book from a JSON file (previously exported with `checklist` format: json). Replaces the current book entirely; the replacement is recorded in history (a delete per removed node, a create per imported node; imported nodes get new ids, and removed nodes' history is reachable via `node_history` with their full UUID).",
+        description = "Import a book from a JSON file (exported with `dump` or `checklist`, format: json). Replaces the current book entirely, restoring each node's status, verification, links and pending revision. Node ids in the file are kept by default, so re-importing a book's own export changes only what differs; `new_ids: true` gives every node a new id (for a copy, or for a file whose ids are not UUIDs). Links whose target is not in the file, and pending revisions that break the revision rules, are dropped and reported. The result counts nodes created, updated and deleted — every node of the book that is not in the file is deleted. A file exported from one section (`subtree_root`, or — for older exports without that marker — recognized from its node ids) is refused unless `force: true`, since it would replace the whole book with that section's children. The replacement is recorded in history (delete / create / update per node that changed); removed nodes' history stays reachable via `node_history` with their full UUID. For a complete round trip export with `dump` (or `checklist` with `include_archived: true`; by default `checklist` leaves archived nodes out, and importing that file deletes them).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -912,15 +915,96 @@ impl OutlineMcpServer {
         let tree: EjectTree = serde_json::from_str(&content)
             .map_err(|e| McpError::invalid_params(format!("Invalid JSON: {e}"), None))?;
 
-        let book = EjectService::import_tree(&tree).map_err(Self::to_mcp_error)?;
-        let node_count = book.node_count();
-        let recorded = svc.import_book(&book).await.map_err(Self::to_mcp_error)?;
+        // One load of the book being replaced decides everything below (the
+        // subtree guard, which nodes keep their stamp) and is the version the
+        // commit goes over, so a write in between is a conflict, not a mix.
+        let opts = ImportOptions {
+            new_ids: req.new_ids,
+        };
+        let force = req.force;
+        let (counts, report) = svc
+            .import_with(
+                |current| {
+                    if !force {
+                        // A file's ids identify a book's nodes only when they
+                        // are kept; with new ids the file is a copy anyway.
+                        let current = if opts.new_ids { None } else { current };
+                        if let Some((id, title, from_ids)) =
+                            EjectService::exported_subtree(&tree, current)
+                        {
+                            return Err(AppError::ImportInvalid(subtree_refusal(
+                                &title, &id, from_ids,
+                            )));
+                        }
+                    }
+                    EjectService::import_tree_onto(&tree, opts, current)
+                },
+                |report| &report.book,
+            )
+            .await
+            .map_err(Self::to_mcp_error)?;
+        let node_count = report.book.node_count();
 
+        let mut msg = format!(
+            "Imported '{}': {} nodes — {} created, {} updated, {} deleted{} ({} history entries recorded{})",
+            tree.title,
+            node_count,
+            counts.created,
+            counts.updated,
+            counts.deleted,
+            if counts.book_fields_changed {
+                "; book title / max_depth changed"
+            } else {
+                ""
+            },
+            counts.entries,
+            if req.new_ids { "; new ids" } else { "" }
+        );
+        if counts.deleted > 0 {
+            msg.push_str(&format!(
+                "\n{} existing node(s) of the book were deleted: they are not in the file (their history keeps them).",
+                counts.deleted
+            ));
+        }
+        if !report.dropped_proposals.is_empty() {
+            msg.push_str(&format!(
+                "\n{} proposal(s) dropped: they break the revision rules",
+                report.dropped_proposals.len()
+            ));
+            for d in report.dropped_proposals.iter().take(10) {
+                let title = report
+                    .book
+                    .get_node(d.node)
+                    .map(|n| n.title().to_string())
+                    .unwrap_or_default();
+                msg.push_str(&format!("\n- {} — {} (id: {})", title, d.reason, d.node));
+            }
+            if report.dropped_proposals.len() > 10 {
+                msg.push_str(&format!("\n… {} more", report.dropped_proposals.len() - 10));
+            }
+        }
+        if !report.dropped_links.is_empty() {
+            msg.push_str(&format!(
+                "\n{} link(s) dropped: target not in file",
+                report.dropped_links.len()
+            ));
+            for d in report.dropped_links.iter().take(10) {
+                let title = report
+                    .book
+                    .get_node(d.from)
+                    .map(|n| n.title().to_string())
+                    .unwrap_or_default();
+                msg.push_str(&format!(
+                    "\n- {} --{}--> {} (id: {})",
+                    title, d.rel, d.target, d.from
+                ));
+            }
+            if report.dropped_links.len() > 10 {
+                msg.push_str(&format!("\n… {} more", report.dropped_links.len() - 10));
+            }
+        }
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-            format!(
-                "Imported '{}': {} nodes ({} history entries recorded)",
-                tree.title, node_count, recorded
-            ),
+            msg,
         )]))
     }
 
@@ -2655,6 +2739,23 @@ fn without_archived(
 }
 
 /// A free-text field trimmed, `None` when empty.
+/// Why `import` refuses a file exported from one section: the same message
+/// whether the file carries the `subtree_root` marker or the section was
+/// recognized from the file's ids (exports written before the marker).
+fn subtree_refusal(title: &str, id: &str, from_ids: bool) -> String {
+    format!(
+        "This file was exported from the section \"{title}\" (id: {id}), not the whole book{}. \
+         Importing it replaces the WHOLE selected book with that section's children, \
+         deleting every other node. Pass force: true to do that anyway, or export the \
+         whole book (dump, or checklist without subtree_root).",
+        if from_ids {
+            " (recognized from its node ids: its top-level nodes sit under that section here)"
+        } else {
+            ""
+        }
+    )
+}
+
 fn trimmed(s: Option<String>) -> Option<String> {
     s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
@@ -3031,12 +3132,19 @@ mod import_tool_tests {
         let result = server
             .import(Parameters(McpImportRequest {
                 file_path: path.to_string_lossy().into_owned(),
+                new_ids: false,
+                force: false,
             }))
             .await
             .expect("import");
         let _ = std::fs::remove_file(&path);
         let text = format!("{:?}", result.content);
         assert!(text.contains("3 history entries recorded"), "{text}");
+        assert!(text.contains("2 created, 0 updated, 1 deleted"), "{text}");
+        assert!(
+            text.contains("1 existing node(s) of the book were deleted"),
+            "{text}"
+        );
 
         let history = svc.history().await.unwrap();
         let tail: Vec<_> = history[1..].iter().map(|e| e.action).collect();
@@ -3050,6 +3158,390 @@ mod import_tool_tests {
         );
         let old_history = svc.history_by_node(old).await.unwrap();
         assert_eq!(old_history.last().unwrap().action, ChangeAction::Delete);
+    }
+
+    fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "outline-mcp-{name}-{}-{}.json",
+            std::process::id(),
+            outline_mcp_core::domain::model::id::NodeId::new()
+        ));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        format!("{:?}", result.content)
+    }
+
+    /// A book with an archived node, a verified node, a link and a pending
+    /// revision, built through the service so every write is committed.
+    async fn curated(
+        server: &OutlineMcpServer,
+        slug: &str,
+    ) -> (
+        outline_mcp_core::domain::model::id::NodeId,
+        outline_mcp_core::domain::model::id::NodeId,
+    ) {
+        use outline_mcp_core::domain::model::changelog::NodeStatus;
+        use outline_mcp_core::domain::model::node::Revision;
+        let svc = server.service_for(slug).await.unwrap();
+        svc.create_book("Curated", 4).await.unwrap();
+        let mut inject = add_req("Live");
+        inject.properties = HashMap::from([("inject".to_string(), "true".to_string())]);
+        inject.body = Some("live body".into());
+        let (live, _) = svc.add_node(inject).await.unwrap();
+        let (old, _) = svc.add_node(add_req("Old")).await.unwrap();
+        svc.update_node(
+            old,
+            outline_mcp_core::domain::model::book::UpdateNodeRequest {
+                title: None,
+                body: None,
+                node_type: None,
+                placeholder: None,
+                properties: None,
+                properties_patch: None,
+                status: Some(NodeStatus::Archived),
+            },
+        )
+        .await
+        .unwrap();
+        svc.verify_nodes(&[live], Some("alice".into()))
+            .await
+            .unwrap();
+        svc.add_link(live, old, "supersedes").await.unwrap();
+        svc.propose_revision(
+            live,
+            Revision {
+                title: Some("Live v2".into()),
+                body: None,
+                properties: None,
+                properties_patch: None,
+                base: String::new(),
+                by: Some("bob".into()),
+                note: None,
+                at: outline_mcp_core::domain::model::timestamp::Timestamp::now(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        (live, old)
+    }
+
+    #[tokio::test]
+    async fn reimporting_a_books_own_export_changes_nothing() {
+        let server = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        let (live, old) = curated(&server, "cur").await;
+        *server.selected.write().unwrap() = Some("cur".into());
+        let svc = server.service_for("cur").await.unwrap();
+        let before_book = svc.read_tree().await.unwrap();
+        let before_history = svc.history().await.unwrap().len();
+
+        let path = write_temp(
+            "roundtrip",
+            &EjectService::render_json(&before_book, None).unwrap(),
+        );
+        let result = server
+            .import(Parameters(McpImportRequest {
+                file_path: path.to_string_lossy().into_owned(),
+                new_ids: false,
+                force: false,
+            }))
+            .await
+            .expect("import");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text_of(&result).contains("0 history entries recorded"),
+            "{}",
+            text_of(&result)
+        );
+        assert_eq!(svc.history().await.unwrap().len(), before_history);
+
+        let after = svc.read_tree().await.unwrap();
+        for id in [live, old] {
+            assert_eq!(
+                serde_json::to_value(before_book.get_node(id).unwrap()).unwrap(),
+                serde_json::to_value(after.get_node(id).unwrap()).unwrap()
+            );
+        }
+        let l = after.get_node(live).unwrap();
+        assert_eq!(l.verified_by(), Some("alice"));
+        assert_eq!(l.links()[0].target(), old);
+        assert!(l.proposal().is_some());
+    }
+
+    #[tokio::test]
+    async fn new_ids_imports_a_copy_with_links_remapped() {
+        let server = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        let (live, old) = curated(&server, "src").await;
+        let src = server
+            .service_for("src")
+            .await
+            .unwrap()
+            .read_tree()
+            .await
+            .unwrap();
+        let copy = server.service_for("copy").await.unwrap();
+        copy.create_book("Copy", 4).await.unwrap();
+        *server.selected.write().unwrap() = Some("copy".into());
+
+        let path = write_temp("copy", &EjectService::render_json(&src, None).unwrap());
+        server
+            .import(Parameters(McpImportRequest {
+                file_path: path.to_string_lossy().into_owned(),
+                new_ids: true,
+                force: false,
+            }))
+            .await
+            .expect("import");
+        let _ = std::fs::remove_file(&path);
+
+        let book = copy.read_tree().await.unwrap();
+        assert!(book.get_node(live).is_none() && book.get_node(old).is_none());
+        let by_title = |t: &str| {
+            book.all_nodes_dfs()
+                .into_iter()
+                .find(|n| n.title() == t)
+                .unwrap()
+                .id()
+        };
+        let (nl, no) = (by_title("Live"), by_title("Old"));
+        let l = book.get_node(nl).unwrap();
+        assert_eq!(l.links()[0].target(), no);
+        assert_eq!(l.verified_by(), Some("alice"));
+        assert!(l.proposal().is_some());
+        assert_eq!(
+            book.get_node(no).unwrap().status(),
+            outline_mcp_core::domain::model::changelog::NodeStatus::Archived
+        );
+    }
+
+    #[tokio::test]
+    async fn import_reports_dropped_links_and_rejects_bad_ids() {
+        let server = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        let (_, old) = curated(&server, "cur").await;
+        *server.selected.write().unwrap() = Some("cur".into());
+        let book = server
+            .service_for("cur")
+            .await
+            .unwrap()
+            .read_tree()
+            .await
+            .unwrap();
+        let mut tree = EjectService::build_tree(&book, None);
+        tree.nodes.retain(|n| n.id != old.to_string());
+        let path = write_temp("dropped", &serde_json::to_string(&tree).unwrap());
+        let result = server
+            .import(Parameters(McpImportRequest {
+                file_path: path.to_string_lossy().into_owned(),
+                new_ids: false,
+                force: false,
+            }))
+            .await
+            .expect("import");
+        let _ = std::fs::remove_file(&path);
+        let text = text_of(&result);
+        assert!(
+            text.contains("1 link(s) dropped: target not in file"),
+            "{text}"
+        );
+        assert!(text.contains("supersedes"), "{text}");
+
+        let bad = r#"{"title":"T","max_depth":4,"nodes":[{"id":"not-a-uuid","title":"N","node_type":"content"}]}"#;
+        let path = write_temp("badid", bad);
+        let err = server
+            .import(Parameters(McpImportRequest {
+                file_path: path.to_string_lossy().into_owned(),
+                new_ids: false,
+                force: false,
+            }))
+            .await
+            .unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("new_ids"), "{}", err.message);
+    }
+
+    async fn import_file(
+        server: &OutlineMcpServer,
+        path: &std::path::Path,
+        force: bool,
+    ) -> Result<CallToolResult, McpError> {
+        server
+            .import(Parameters(McpImportRequest {
+                file_path: path.to_string_lossy().into_owned(),
+                new_ids: false,
+                force,
+            }))
+            .await
+    }
+
+    #[tokio::test]
+    async fn importing_a_default_checklist_export_reports_the_deleted_archived_nodes() {
+        let server = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        let (_, old) = curated(&server, "chk").await;
+        *server.selected.write().unwrap() = Some("chk".into());
+        let svc = server.service_for("chk").await.unwrap();
+        // What `checklist` writes by default: archived nodes left out.
+        let book = without_archived(svc.read_tree().await.unwrap());
+        let path = write_temp("chk", &EjectService::render_json(&book, None).unwrap());
+        let text = text_of(&import_file(&server, &path, false).await.expect("import"));
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("1 deleted"), "{text}");
+        assert!(
+            text.contains("1 existing node(s) of the book were deleted"),
+            "{text}"
+        );
+        assert!(svc.read_tree().await.unwrap().get_node(old).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_subtree_export_is_refused_unless_forced() {
+        let server = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        let svc = server.service_for("sub").await.unwrap();
+        svc.create_book("Sub", 4).await.unwrap();
+        let mut sec = add_req("Section");
+        sec.node_type = NodeType::Section;
+        let (sec, _) = svc.add_node(sec).await.unwrap();
+        let mut child = add_req("Child");
+        child.parent = Some(sec);
+        svc.add_node(child).await.unwrap();
+        svc.add_node(add_req("Elsewhere")).await.unwrap();
+        *server.selected.write().unwrap() = Some("sub".into());
+
+        let book = svc.read_tree().await.unwrap();
+        let version_before = svc.history().await.unwrap().len();
+        let path = write_temp("sub", &EjectService::render_json(&book, Some(sec)).unwrap());
+
+        let err = import_file(&server, &path, false).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("force: true"), "{}", err.message);
+        assert!(err.message.contains("WHOLE"), "{}", err.message);
+        assert_eq!(svc.history().await.unwrap().len(), version_before);
+        assert_eq!(svc.read_tree().await.unwrap().node_count(), 3);
+
+        let text = text_of(&import_file(&server, &path, true).await.expect("forced"));
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("deleted"), "{text}");
+        assert_eq!(svc.read_tree().await.unwrap().node_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_marker_less_subtree_export_is_recognized_from_ids_and_refused() {
+        let server = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        let svc = server.service_for("legacy").await.unwrap();
+        svc.create_book("Legacy", 4).await.unwrap();
+        let mut sec = add_req("Section");
+        sec.node_type = NodeType::Section;
+        let (sec, _) = svc.add_node(sec).await.unwrap();
+        let mut child = add_req("Child");
+        child.parent = Some(sec);
+        svc.add_node(child).await.unwrap();
+        svc.add_node(add_req("Elsewhere")).await.unwrap();
+        *server.selected.write().unwrap() = Some("legacy".into());
+
+        // What 0.15.0 wrote for a subtree export: the section's children,
+        // the section's title, no `subtree_root` marker.
+        let book = svc.read_tree().await.unwrap();
+        let mut tree = EjectService::build_tree(&book, Some(sec));
+        tree.subtree_root = None;
+        let path = write_temp("legacy-sub", &serde_json::to_string(&tree).unwrap());
+        let entries_before = svc.history().await.unwrap().len();
+
+        let err = import_file(&server, &path, false).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("WHOLE"), "{}", err.message);
+        assert!(
+            err.message.contains("recognized from its node ids"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("\"Section\""), "{}", err.message);
+        assert_eq!(svc.history().await.unwrap().len(), entries_before);
+        assert_eq!(svc.read_tree().await.unwrap().node_count(), 3);
+
+        let text = text_of(&import_file(&server, &path, true).await.expect("forced"));
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("deleted"), "{text}");
+        assert_eq!(svc.read_tree().await.unwrap().node_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reimporting_a_014_shaped_export_of_the_same_book_changes_nothing() {
+        let server = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        let svc = server.service_for("old").await.unwrap();
+        svc.create_book("Old", 4).await.unwrap();
+        let mut a = add_req("A");
+        a.body = Some("a body".into());
+        a.properties = HashMap::from([("inject".to_string(), "true".to_string())]);
+        svc.add_node(a).await.unwrap();
+        svc.add_node(add_req("B")).await.unwrap();
+        *server.selected.write().unwrap() = Some("old".into());
+        let before = svc.history().await.unwrap().len();
+
+        // 0.14 exports had no updated_at (and none of the 0.15 fields).
+        let mut tree = EjectService::build_tree(&svc.read_tree().await.unwrap(), None);
+        tree.nodes.iter_mut().for_each(|n| n.updated_at = None);
+        let path = write_temp("v014", &serde_json::to_string(&tree).unwrap());
+        let text = text_of(&import_file(&server, &path, false).await.expect("import"));
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("0 created, 0 updated, 0 deleted"), "{text}");
+        assert!(text.contains("0 history entries recorded"), "{text}");
+        assert_eq!(svc.history().await.unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_proposal_in_the_file_is_dropped_and_reported() {
+        let server = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        let (live, old) = curated(&server, "prop").await;
+        *server.selected.write().unwrap() = Some("prop".into());
+        let svc = server.service_for("prop").await.unwrap();
+        let mut tree = EjectService::build_tree(&svc.read_tree().await.unwrap(), None);
+        // Move the live node's proposal onto the archived node.
+        let i_live = tree
+            .nodes
+            .iter()
+            .position(|n| n.id == live.to_string())
+            .unwrap();
+        let i_old = tree
+            .nodes
+            .iter()
+            .position(|n| n.id == old.to_string())
+            .unwrap();
+        let proposal = tree.nodes[i_live].proposal.take();
+        tree.nodes[i_old].proposal = proposal;
+        let path = write_temp("prop", &serde_json::to_string(&tree).unwrap());
+        let text = text_of(&import_file(&server, &path, false).await.expect("import"));
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains("1 proposal(s) dropped"), "{text}");
+        let book = svc.read_tree().await.unwrap();
+        assert!(book.get_node(old).unwrap().proposal().is_none());
+        assert!(book.get_node(live).unwrap().proposal().is_none());
     }
 }
 

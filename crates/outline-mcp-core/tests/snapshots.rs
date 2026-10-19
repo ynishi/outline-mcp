@@ -62,6 +62,9 @@ fn snapshot_json_subtree() {
 /// テスト毎にUUIDが変わるため、連番に置換してスナップショット比較を安定させる。
 fn stabilize_tree(mut tree: EjectTree) -> EjectTree {
     let mut counter = 0;
+    if let Some(root) = &mut tree.subtree_root {
+        root.id = "stable-subtree-root".to_string();
+    }
     for node in &mut tree.nodes {
         stabilize_node(node, &mut counter);
     }
@@ -74,6 +77,8 @@ fn stabilize_node(
 ) {
     *counter += 1;
     node.id = format!("stable-id-{counter}");
+    // Creation time differs per run; it is not what these snapshots check.
+    node.updated_at = None;
     for child in &mut node.children {
         stabilize_node(child, counter);
     }

@@ -590,6 +590,10 @@ impl OutlineMcpServer {
             // A rejected request (cycle, depth, unknown node, …) is the
             // caller's input, whether it came from a dry run or a real run.
             e @ AppError::Domain(_) => McpError::invalid_params(format!("{e}"), None),
+            // So is a file `import` cannot read as a tree.
+            e @ (AppError::ImportInvalidType(_) | AppError::ImportInvalid(_)) => {
+                McpError::invalid_params(format!("{e}"), None)
+            }
             e => McpError::internal_error(format!("{e}"), None),
         }
     }
