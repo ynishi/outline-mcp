@@ -272,12 +272,13 @@ impl PgBookStore {
 impl BookStore for PgBookStore {
     async fn load(&self, slug: &str) -> Result<Option<Versioned<TemplateBook>>, StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
-        let Some(book_row) =
-            sqlx::query("SELECT book_id, title, max_depth, version FROM books WHERE slug = $1")
-                .bind(slug)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(StoreError::backend)?
+        let Some(book_row) = sqlx::query(
+            "SELECT book_id, title, max_depth, archived, version FROM books WHERE slug = $1",
+        )
+        .bind(slug)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::backend)?
         else {
             return Ok(None);
         };
@@ -289,8 +290,10 @@ impl BookStore for PgBookStore {
         let max_depth: i16 = book_row.try_get("max_depth").map_err(StoreError::backend)?;
         let version: i64 = book_row.try_get("version").map_err(StoreError::backend)?;
         let max_depth = u8::try_from(max_depth).map_err(StoreError::backend)?;
+        let archived: bool = book_row.try_get("archived").map_err(StoreError::backend)?;
 
-        let book = assemble(BookId::from_uuid(book_id), title, max_depth, rows)?;
+        let mut book = assemble(BookId::from_uuid(book_id), title, max_depth, rows)?;
+        book.set_archived(archived);
         Ok(Some(Versioned {
             value: book,
             version,
@@ -311,13 +314,14 @@ impl BookStore for PgBookStore {
         let (version, old_rows) = match expected_version {
             None => {
                 let inserted = sqlx::query(
-                    "INSERT INTO books (slug, book_id, title, max_depth, version) \
-                     VALUES ($1, $2, $3, $4, 1) ON CONFLICT (slug) DO NOTHING",
+                    "INSERT INTO books (slug, book_id, title, max_depth, archived, version) \
+                     VALUES ($1, $2, $3, $4, $5, 1) ON CONFLICT (slug) DO NOTHING",
                 )
                 .bind(slug)
                 .bind(book.id().as_uuid())
                 .bind(book.title())
                 .bind(max_depth)
+                .bind(book.is_archived())
                 .execute(&mut *tx)
                 .await
                 .map_err(StoreError::backend)?
@@ -353,13 +357,14 @@ impl BookStore for PgBookStore {
                 let version = expected + 1;
                 sqlx::query(
                     "UPDATE books SET book_id = $2, title = $3, max_depth = $4, version = $5, \
-                     updated_at = now() WHERE slug = $1",
+                     archived = $6, updated_at = now() WHERE slug = $1",
                 )
                 .bind(slug)
                 .bind(book.id().as_uuid())
                 .bind(book.title())
                 .bind(max_depth)
                 .bind(version)
+                .bind(book.is_archived())
                 .execute(&mut *tx)
                 .await
                 .map_err(StoreError::backend)?;
@@ -495,7 +500,7 @@ impl BookStore for PgBookStore {
     }
 
     async fn list_books(&self) -> Result<Vec<BookSummary>, StoreError> {
-        let rows = sqlx::query("SELECT slug, title FROM books ORDER BY slug")
+        let rows = sqlx::query("SELECT slug, title, archived FROM books ORDER BY slug")
             .fetch_all(&self.pool)
             .await
             .map_err(StoreError::backend)?;
@@ -504,6 +509,7 @@ impl BookStore for PgBookStore {
                 Ok(BookSummary {
                     slug: r.try_get("slug").map_err(StoreError::backend)?,
                     title: r.try_get("title").map_err(StoreError::backend)?,
+                    archived: r.try_get("archived").map_err(StoreError::backend)?,
                 })
             })
             .collect()

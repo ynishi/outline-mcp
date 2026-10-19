@@ -506,19 +506,20 @@ impl OutlineMcpServer {
         Ok(msg)
     }
 
-    /// The `book_update` tool: change `slug`'s title and / or max depth.
-    /// At least one field is required; the book must exist. Validation
-    /// failures (empty title, max depth 0 or below an existing node) are
-    /// invalid params naming the problem; nothing is committed then.
+    /// The `book_update` tool: change `slug`'s title, max depth and / or
+    /// archived flag. At least one field is required; the book must exist.
+    /// Validation failures (empty title, max depth 0 or below an existing
+    /// node) are invalid params naming the problem; nothing is committed then.
     pub(crate) async fn update_book(
         &self,
         slug: &str,
         title: Option<String>,
         max_depth: Option<u8>,
+        archived: Option<bool>,
     ) -> Result<String, McpError> {
-        if title.is_none() && max_depth.is_none() {
+        if title.is_none() && max_depth.is_none() && archived.is_none() {
             return Err(McpError::invalid_params(
-                "Nothing to change: pass `title` and / or `max_depth`.",
+                "Nothing to change: pass `title`, `max_depth` and / or `archived`.",
                 None,
             ));
         }
@@ -530,21 +531,25 @@ impl OutlineMcpServer {
         }
         let svc = self.service_for(slug).await?;
         let up = svc
-            .update_book(title, max_depth)
+            .update_book(title, max_depth, archived)
             .await
             .map_err(|e| book_update_error(slug, e))?;
-        let ((t0, d0), (t1, d1)) = (&up.before, &up.after);
+        let (b, a) = (&up.before, &up.after);
         if !up.changed {
             return Ok(format!(
-                "No change: '{slug}' already has title \"{t1}\" and max_depth {d1}."
+                "No change: '{slug}' already has title \"{}\", max_depth {} and archived {}.",
+                a.title, a.max_depth, a.archived
             ));
         }
         let mut parts = Vec::new();
-        if t0 != t1 {
-            parts.push(format!("title \"{t0}\" → \"{t1}\""));
+        if b.title != a.title {
+            parts.push(format!("title \"{}\" → \"{}\"", b.title, a.title));
         }
-        if d0 != d1 {
-            parts.push(format!("max_depth {d0} → {d1}"));
+        if b.max_depth != a.max_depth {
+            parts.push(format!("max_depth {} → {}", b.max_depth, a.max_depth));
+        }
+        if b.archived != a.archived {
+            parts.push(if a.archived { "archived" } else { "unarchived" }.to_string());
         }
         Ok(format!("Updated book '{slug}': {}.", parts.join(", ")))
     }
@@ -789,7 +794,7 @@ impl ServerHandler for OutlineMcpServer {
                  `revisions_pending` lists them.\n\
                  \n\
                  Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`. \
-                 `checklist` for task export. `init` for new book, `book_update` to retitle or change max_depth, `book_delete` to remove one.\n\
+                 `checklist` for task export. `init` for new book, `book_update` to retitle, change max_depth or archive a book (hidden from `shelf`, nothing injected), `book_delete` to remove one.\n\
                  History: `snapshot_create`/`snapshot_list`/`snapshot_restore`/`snapshot_delete` for versioning. \
                  `node_history` for change tracking. `dump` for full export.\n\
                  Health: `book_lint` (structural smells) and `book_stats` (shape and freshness), both read-only.\n\
@@ -1372,7 +1377,10 @@ mod tests {
             .create_book("Z", 3)
             .await
             .unwrap();
-        let err = server.update_book("z", None, Some(0)).await.unwrap_err();
+        let err = server
+            .update_book("z", None, Some(0), None)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         let book = server
             .service_for("z")

@@ -58,6 +58,10 @@ pub struct TemplateBook {
     max_depth: u8,
     nodes: HashMap<NodeId, TemplateNode>,
     root_nodes: Vec<NodeId>,
+    /// Retired: kept readable, but hidden from `shelf` and the browser view's
+    /// shelf unless asked for, and its nodes are not injected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    archived: bool,
 }
 
 impl TemplateBook {
@@ -69,6 +73,7 @@ impl TemplateBook {
             max_depth,
             nodes: HashMap::new(),
             root_nodes: Vec::new(),
+            archived: false,
         }
     }
 
@@ -88,6 +93,7 @@ impl TemplateBook {
             max_depth,
             nodes,
             root_nodes,
+            archived: false,
         }
     }
 
@@ -104,6 +110,18 @@ impl TemplateBook {
     /// Return the book's configured maximum tree depth.
     pub fn max_depth(&self) -> u8 {
         self.max_depth
+    }
+
+    /// Whether the book is archived (retired, see [`Self::set_archived`]).
+    pub fn is_archived(&self) -> bool {
+        self.archived
+    }
+
+    /// Archive or unarchive the book. Its nodes are untouched: an archived
+    /// book stays readable and writable, it is only left out of listings and
+    /// context injection.
+    pub fn set_archived(&mut self, archived: bool) {
+        self.archived = archived;
     }
 
     /// Rename the book. The title is trimmed and must not be empty.

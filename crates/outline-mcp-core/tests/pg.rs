@@ -687,7 +687,7 @@ async fn book_update_records_a_book_level_event_against_postgres() {
     let (n, _) = svc.add_node(add_req(None, "n")).await.expect("add n");
 
     let up = svc
-        .update_book(Some("After".into()), Some(5))
+        .update_book(Some("After".into()), Some(5), None)
         .await
         .expect("update_book");
     assert!(up.changed);
@@ -719,8 +719,22 @@ async fn book_update_records_a_book_level_event_against_postgres() {
         .find(|b| b.slug == slug)
         .expect("listed");
     assert_eq!(listed.title, "After");
+    assert!(!listed.archived);
     let book = svc.read_tree().await.unwrap();
     assert_eq!(book.max_depth(), 5);
+
+    // Archiving goes to the book row and back.
+    svc.update_book(None, None, Some(true))
+        .await
+        .expect("archive");
+    assert!(svc.read_tree().await.unwrap().is_archived());
+    let listed = BookStore::list_books(&store)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|b| b.slug == slug)
+        .expect("listed");
+    assert!(listed.archived);
 
     let version = BookStore::load(&store, &slug)
         .await
@@ -746,7 +760,7 @@ async fn restore_records_the_revert_of_book_fields_against_postgres() {
     svc.create_book("Kept", 3).await.expect("create_book");
     svc.add_node(add_req(None, "n")).await.expect("add n");
     let old = svc.read_tree().await.unwrap();
-    svc.update_book(None, Some(5)).await.expect("raise");
+    svc.update_book(None, Some(5), None).await.expect("raise");
 
     svc.restore_book(&old).await.expect("restore");
     let book_level: Vec<ChangeEntry> = svc
