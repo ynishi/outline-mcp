@@ -118,8 +118,9 @@ pub(crate) fn parse_node_status(s: &str) -> Result<NodeStatus, McpError> {
     match s {
         "active" => Ok(NodeStatus::Active),
         "draft" => Ok(NodeStatus::Draft),
+        "archived" => Ok(NodeStatus::Archived),
         other => Err(McpError::invalid_params(
-            format!("Unknown status: '{other}'. Use: active, draft"),
+            format!("Unknown status: '{other}'. Use: active, draft, archived"),
             None,
         )),
     }
@@ -188,7 +189,7 @@ pub(crate) struct McpNodeUpdateRequest {
     )]
     pub properties_patch: Option<HashMap<String, String>>,
     #[schemars(
-        description = "Node status: 'active' or 'draft'. Draft nodes are excluded from select_book inject."
+        description = "Node status: 'active', 'draft' or 'archived'. Draft and archived nodes are excluded from select_book inject; archived nodes (and their subtrees) are also hidden from toc and node_query unless asked for."
     )]
     pub status: Option<String>,
 }
@@ -228,6 +229,11 @@ pub(crate) struct McpTocRequest {
         description = "Show at most this many nodes (in toc order). A last line says how many were left out."
     )]
     pub limit: Option<usize>,
+    #[schemars(
+        description = "Show archived nodes (marked `[archived]`). Default false: archived nodes and their subtrees are hidden, with a last line saying how many."
+    )]
+    #[serde(default)]
+    pub include_archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -244,6 +250,11 @@ pub(crate) struct McpEjectRequest {
         description = "Section ID from `toc` output (e.g. '2'). Omit to export entire book."
     )]
     pub subtree_root: Option<String>,
+    #[schemars(
+        description = "Export archived nodes too. Default false: archived nodes and their subtrees are left out (unless `subtree_root` itself is archived)."
+    )]
+    #[serde(default)]
+    pub include_archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -481,7 +492,7 @@ pub(crate) struct McpBatchUpdateItem {
         description = "Merge these properties into the existing ones: listed keys are set, unlisted keys are kept. Cannot be combined with `properties`."
     )]
     pub properties_patch: Option<HashMap<String, String>>,
-    #[schemars(description = "Node status: 'active' or 'draft'")]
+    #[schemars(description = "Node status: 'active', 'draft' or 'archived'")]
     pub status: Option<String>,
 }
 
@@ -514,8 +525,19 @@ pub(crate) struct McpNodeQueryRequest {
     pub include_body: bool,
     #[schemars(description = "Filter by node type: 'section' or 'content'")]
     pub kind: Option<String>,
-    #[schemars(description = "Filter by status: 'active' or 'draft'")]
+    #[schemars(
+        description = "Filter by status: 'active', 'draft' or 'archived'. Archived nodes are returned only when this is 'archived' or `include_archived` is true."
+    )]
     pub status: Option<String>,
+    #[schemars(
+        description = "Include archived nodes (default false). Not needed with status 'archived'."
+    )]
+    #[serde(default)]
+    pub include_archived: bool,
+    #[schemars(
+        description = "Only nodes never verified or last verified strictly before this moment: ISO-8601 date ('2026-07-01') or datetime ('2026-07-01T09:00:00Z'), or Unix millis. See `node_verify`."
+    )]
+    pub verified_before: Option<String>,
     #[schemars(description = "Subtree root ID (toc ID or UUID). Only search within this subtree.")]
     pub subtree_root: Option<String>,
     #[schemars(
@@ -531,6 +553,16 @@ pub(crate) struct McpNodeQueryRequest {
                        default rendering is a plain listing."
     )]
     pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpNodeVerifyRequest {
+    #[schemars(
+        description = "Nodes to mark as verified now: toc IDs (e.g. '2-3') or UUIDs. All or none are recorded."
+    )]
+    pub node_ids: Vec<String>,
+    #[schemars(description = "Who verified them (free text, e.g. a name). Optional.")]
+    pub by: Option<String>,
 }
 
 // =============================================================================

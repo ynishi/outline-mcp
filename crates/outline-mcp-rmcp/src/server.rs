@@ -735,6 +735,10 @@ impl ServerHandler for OutlineMcpServer {
                  automatically included in `select_book` output — use this to inject \
                  persistent rules/context into every session.\n\
                  \n\
+                 Lifecycle: status `active`, `draft` (not written yet) or `archived` (retired: \
+                 not injected, hidden from `toc`/`node_query` unless asked for). `node_verify` \
+                 records that a node was confirmed; `node_query` `verified_before` lists stale ones.\n\
+                 \n\
                  Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`. \
                  `checklist` for task export. `init` for new book, `book_update` to retitle or change max_depth, `book_delete` to remove one.\n\
                  History: `snapshot_create`/`snapshot_list`/`snapshot_restore`/`snapshot_delete` for versioning. \

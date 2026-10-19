@@ -142,13 +142,20 @@ pub fn lint(book: &TemplateBook, opts: &LintOptions) -> LintReport {
             .filter(|c| opts.checks.contains(c))
             .collect()
     };
-    let order: Vec<&TemplateNode> = book.all_nodes_dfs();
+    // Archived nodes (and everything under an archived section) are retired:
+    // no check looks at them, so an archived original never pairs with its
+    // active replacement and an archived empty section is not reported.
+    let order: Vec<&TemplateNode> = book
+        .all_nodes_dfs()
+        .into_iter()
+        .filter(|n| !book.is_archived_or_under_archived(n.id()))
+        .collect();
 
     let mut findings = Vec::new();
     let mut omitted = BTreeMap::new();
     for &check in &checks {
         let mut found = match check {
-            LintCheck::RootContent => root_content(book),
+            LintCheck::RootContent => root_content(book, &order),
             LintCheck::SimilarTitles => similar_titles(&order, effective_threshold(opts.threshold)),
             LintCheck::PropertyKeyVariants => property_key_variants(&order),
             LintCheck::EmptySections => empty_sections(&order),
@@ -166,10 +173,10 @@ pub fn lint(book: &TemplateBook, opts: &LintOptions) -> LintReport {
     }
 }
 
-fn root_content(book: &TemplateBook) -> Vec<LintFinding> {
+fn root_content(book: &TemplateBook, order: &[&TemplateNode]) -> Vec<LintFinding> {
     book.root_nodes()
         .iter()
-        .filter_map(|&id| book.get_node(id))
+        .filter_map(|&id| order.iter().find(|n| n.id() == id).copied())
         .filter(|n| *n.node_type() != NodeType::Section)
         .map(|n| LintFinding {
             kind: LintCheck::RootContent,
@@ -508,10 +515,11 @@ pub struct BookStats {
     pub mean_depth: f64,
     /// Children per section.
     pub children: ChildrenStats,
-    /// Node count per status; always has every status ("active", "draft"),
-    /// 0 when no node has it.
+    /// Node count per status; always has every status ("active", "draft",
+    /// "archived"), 0 when no node has it.
     pub by_status: BTreeMap<String, usize>,
-    /// Nodes with property `inject=true`.
+    /// Nodes `select_book` injects: property `inject=true`, active, and not
+    /// under an archived section.
     pub injected: usize,
     /// Update recency.
     pub updated: UpdatedStats,
@@ -539,9 +547,9 @@ pub fn stats(book: &TemplateBook, now: Timestamp) -> BookStats {
     let nodes = book.all_nodes_dfs();
     let mut sections = 0;
     let mut child_counts = Vec::new();
-    let mut by_status: BTreeMap<String, usize> = ["active", "draft"]
+    let mut by_status: BTreeMap<String, usize> = NodeStatus::ALL
         .into_iter()
-        .map(|s| (s.to_string(), 0))
+        .map(|s| (s.as_str().to_string(), 0))
         .collect();
     let mut injected = 0;
     let mut updated = UpdatedStats::default();
@@ -557,12 +565,15 @@ pub fn stats(book: &TemplateBook, now: Timestamp) -> BookStats {
             sections += 1;
             child_counts.push(n.children().len());
         }
-        let status = match n.status() {
-            NodeStatus::Active => "active",
-            NodeStatus::Draft => "draft",
-        };
-        *by_status.entry(status.to_string()).or_default() += 1;
-        if n.get_property("inject") == Some("true") {
+        *by_status
+            .entry(n.status().as_str().to_string())
+            .or_default() += 1;
+        // What `select_book` actually injects: the property on an active node
+        // that is not under an archived section.
+        if n.get_property("inject") == Some("true")
+            && n.status() == NodeStatus::Active
+            && !book.is_archived_or_under_archived(n.id())
+        {
             injected += 1;
         }
         match n.updated_at() {
@@ -1080,8 +1091,88 @@ mod tests {
         // Every status key is present, at 0.
         assert_eq!(
             st.by_status.into_iter().collect::<Vec<_>>(),
-            [("active".to_string(), 0), ("draft".to_string(), 0)]
+            [
+                ("active".to_string(), 0),
+                ("archived".to_string(), 0),
+                ("draft".to_string(), 0)
+            ]
         );
+    }
+
+    #[test]
+    fn lint_ignores_archived_nodes_and_their_subtrees() {
+        let mut b = TemplateBook::new("B", 4);
+        let live = add(&mut b, None, "Live", NodeType::Section);
+        let old = add(
+            &mut b,
+            Some(live),
+            "Branch strategy guide",
+            NodeType::Content,
+        );
+        add(
+            &mut b,
+            Some(live),
+            "Branch strategy guide",
+            NodeType::Content,
+        );
+        set_status(&mut b, old, NodeStatus::Archived);
+        // An archived empty section, and an archived section holding a
+        // content node at its root level and a stale-looking draft.
+        let gone = add(&mut b, None, "Gone", NodeType::Section);
+        set_status(&mut b, gone, NodeStatus::Archived);
+        let attic = add(&mut b, None, "Attic", NodeType::Section);
+        let d = add(&mut b, Some(attic), "Old draft", NodeType::Content);
+        with_props(&mut b, d, &[("added_by", "x")]);
+        set_status(&mut b, d, NodeStatus::Draft);
+        set_status(&mut b, attic, NodeStatus::Archived);
+        let root_c = add(&mut b, None, "Loose", NodeType::Content);
+        set_status(&mut b, root_c, NodeStatus::Archived);
+
+        let r = lint(
+            &b,
+            &LintOptions {
+                stale_days: 0,
+                ..LintOptions::default()
+            },
+        );
+        assert!(
+            kinds(&r, LintCheck::SimilarTitles).is_empty(),
+            "an archived original must not pair with its replacement: {r:?}"
+        );
+        assert!(kinds(&r, LintCheck::EmptySections).is_empty(), "{r:?}");
+        assert!(kinds(&r, LintCheck::RootContent).is_empty(), "{r:?}");
+        let stale = without_updated_at(&b, d);
+        let r = lint(&stale, &only(LintCheck::StaleDrafts));
+        assert!(
+            kinds(&r, LintCheck::StaleDrafts).is_empty(),
+            "a draft under an archived section is retired: {r:?}"
+        );
+    }
+
+    #[test]
+    fn stats_does_not_count_inject_under_an_archived_section() {
+        let mut b = TemplateBook::new("B", 4);
+        let s = add(&mut b, None, "Old rules", NodeType::Section);
+        let c = add(&mut b, Some(s), "Rule", NodeType::Content);
+        with_props(&mut b, c, &[("inject", "true")]);
+        set_status(&mut b, s, NodeStatus::Archived);
+        let st = stats(&b, Timestamp::now());
+        assert_eq!(st.injected, 0);
+    }
+
+    #[test]
+    fn stats_counts_archived_and_injects_only_active_nodes() {
+        let mut b = TemplateBook::new("B", 4);
+        let a = add(&mut b, None, "a", NodeType::Content);
+        let r = add(&mut b, None, "r", NodeType::Content);
+        for id in [a, r] {
+            with_props(&mut b, id, &[("inject", "true")]);
+        }
+        set_status(&mut b, r, NodeStatus::Archived);
+        let st = stats(&b, Timestamp::now());
+        assert_eq!(st.by_status["archived"], 1);
+        assert_eq!(st.by_status["active"], 1);
+        assert_eq!(st.injected, 1, "an archived node is not injected");
     }
 
     #[test]

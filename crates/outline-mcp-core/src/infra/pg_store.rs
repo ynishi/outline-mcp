@@ -165,6 +165,8 @@ struct NodeRow {
     properties: Value,
     status: String,
     updated_at: Option<i64>,
+    verified_at: Option<i64>,
+    verified_by: Option<String>,
 }
 
 impl NodeRow {
@@ -245,7 +247,8 @@ impl PgBookStore {
         slug: &str,
     ) -> Result<HashMap<Uuid, NodeRow>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, parent, position, title, body, node_type, placeholder, properties, status, updated_at \
+            "SELECT id, parent, position, title, body, node_type, placeholder, properties, status, updated_at, \
+                    verified_at, verified_by \
              FROM nodes WHERE book = $1",
         )
         .bind(slug)
@@ -380,13 +383,16 @@ impl BookStore for PgBookStore {
         for range in chunk_ranges(&changed_all, |r| r.approx_bytes()) {
             let changed = &changed_all[range];
             sqlx::query(
-                "INSERT INTO nodes (book, id, parent, position, title, body, node_type, placeholder, properties, status, updated_at) \
+                "INSERT INTO nodes (book, id, parent, position, title, body, node_type, placeholder, properties, status, \
+                                    updated_at, verified_at, verified_by) \
                  SELECT $1, * FROM UNNEST($2::uuid[], $3::uuid[], $4::int4[], $5::text[], $6::text[], \
-                                          $7::text[], $8::text[], $9::jsonb[], $10::text[], $11::int8[]) \
+                                          $7::text[], $8::text[], $9::jsonb[], $10::text[], $11::int8[], \
+                                          $12::int8[], $13::text[]) \
                  ON CONFLICT (book, id) DO UPDATE SET parent = EXCLUDED.parent, position = EXCLUDED.position, \
                  title = EXCLUDED.title, body = EXCLUDED.body, node_type = EXCLUDED.node_type, \
                  placeholder = EXCLUDED.placeholder, properties = EXCLUDED.properties, \
-                 status = EXCLUDED.status, updated_at = EXCLUDED.updated_at",
+                 status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, \
+                 verified_at = EXCLUDED.verified_at, verified_by = EXCLUDED.verified_by",
             )
             .bind(slug)
             .bind(changed.iter().map(|r| r.id).collect::<Vec<_>>())
@@ -399,6 +405,8 @@ impl BookStore for PgBookStore {
             .bind(changed.iter().map(|r| r.properties.clone()).collect::<Vec<_>>())
             .bind(changed.iter().map(|r| r.status.clone()).collect::<Vec<_>>())
             .bind(changed.iter().map(|r| r.updated_at).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.verified_at).collect::<Vec<_>>())
+            .bind(changed.iter().map(|r| r.verified_by.clone()).collect::<Vec<_>>())
             .execute(&mut *tx)
             .await
             .map_err(StoreError::backend)?;
@@ -743,6 +751,8 @@ fn rows_of(book: &TemplateBook) -> Result<HashMap<Uuid, NodeRow>, StoreError> {
             properties,
             status: enum_str(&node.status())?,
             updated_at: node.updated_at().map(|t| t.as_millis()),
+            verified_at: node.verified_at().map(|t| t.as_millis()),
+            verified_by: node.verified_by().map(str::to_string),
         };
         rows.insert(row.id, row);
     }
@@ -789,6 +799,8 @@ fn assemble(
             properties,
             status: str_enum(&row.status)?,
             updated_at: row.updated_at.map(Timestamp::from_millis),
+            verified_at: row.verified_at.map(Timestamp::from_millis),
+            verified_by: row.verified_by.clone(),
         });
         nodes.insert(node.id(), node);
     }
@@ -813,6 +825,8 @@ fn node_row(r: &PgRow) -> Result<NodeRow, StoreError> {
         properties: r.try_get("properties").map_err(StoreError::backend)?,
         status: r.try_get("status").map_err(StoreError::backend)?,
         updated_at: r.try_get("updated_at").map_err(StoreError::backend)?,
+        verified_at: r.try_get("verified_at").map_err(StoreError::backend)?,
+        verified_by: r.try_get("verified_by").map_err(StoreError::backend)?,
     })
 }
 

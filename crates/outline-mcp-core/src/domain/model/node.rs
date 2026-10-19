@@ -35,6 +35,13 @@ pub struct TemplateNode {
     /// 最終更新タイムスタンプ。既存JSONファイルには存在しないため `#[serde(default)]` で None に。
     #[serde(default)]
     updated_at: Option<Timestamp>,
+    /// When someone last confirmed the node still matches reality
+    /// (`node_verify`). Absent in data written before verification existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_at: Option<Timestamp>,
+    /// Who confirmed it, as passed to `node_verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_by: Option<String>,
 }
 
 /// Every stored field of a [`TemplateNode`], for adapters that keep nodes as
@@ -50,6 +57,8 @@ pub(crate) struct NodeParts {
     pub(crate) properties: HashMap<String, String>,
     pub(crate) status: NodeStatus,
     pub(crate) updated_at: Option<Timestamp>,
+    pub(crate) verified_at: Option<Timestamp>,
+    pub(crate) verified_by: Option<String>,
 }
 
 impl TemplateNode {
@@ -70,6 +79,8 @@ impl TemplateNode {
             properties: HashMap::new(),
             status: NodeStatus::Active,
             updated_at: Some(Timestamp::now()),
+            verified_at: None,
+            verified_by: None,
         }
     }
 
@@ -87,6 +98,8 @@ impl TemplateNode {
             properties: parts.properties,
             status: parts.status,
             updated_at: parts.updated_at,
+            verified_at: parts.verified_at,
+            verified_by: parts.verified_by,
         }
     }
 
@@ -148,6 +161,22 @@ impl TemplateNode {
     /// Return the node's last-updated timestamp, if known.
     pub fn updated_at(&self) -> Option<Timestamp> {
         self.updated_at
+    }
+
+    /// When the node was last verified (`node_verify`), if ever.
+    pub fn verified_at(&self) -> Option<Timestamp> {
+        self.verified_at
+    }
+
+    /// Who last verified the node, if recorded.
+    pub fn verified_by(&self) -> Option<&str> {
+        self.verified_by.as_deref()
+    }
+
+    /// `true` when the node has never been verified or was last verified
+    /// strictly before `cutoff`.
+    pub fn verified_before(&self, cutoff: Timestamp) -> bool {
+        self.verified_at.is_none_or(|t| t < cutoff)
     }
 
     // --- 内部操作（Book経由でのみ呼ばれる） ---
@@ -212,6 +241,13 @@ impl TemplateNode {
     #[allow(dead_code)]
     pub(crate) fn set_status(&mut self, status: NodeStatus) {
         self.status = status;
+    }
+
+    /// Record a verification. `updated_at` is left alone: verifying confirms
+    /// the content, it does not change it, so "last edited" stays meaningful.
+    pub(crate) fn set_verified(&mut self, at: Timestamp, by: Option<String>) {
+        self.verified_at = Some(at);
+        self.verified_by = by;
     }
 }
 
@@ -287,6 +323,35 @@ mod tests {
         let node: TemplateNode = serde_json::from_str(json).expect("deserialize legacy json");
         assert_eq!(node.status(), NodeStatus::Active);
         assert!(node.updated_at().is_none());
+        assert!(node.verified_at().is_none() && node.verified_by().is_none());
+    }
+
+    #[test]
+    fn test_verification_fields_are_omitted_until_set_and_round_trip() {
+        let mut node = make_node();
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(!json.contains("verified"), "{json}");
+
+        let at = Timestamp::from_millis(1_700_000_000_000);
+        node.set_verified(at, Some("alice".into()));
+        let back: TemplateNode =
+            serde_json::from_str(&serde_json::to_string(&node).unwrap()).unwrap();
+        assert_eq!(back.verified_at(), Some(at));
+        assert_eq!(back.verified_by(), Some("alice"));
+        assert!(back.verified_before(Timestamp::from_millis(at.as_millis() + 1)));
+        assert!(!back.verified_before(at), "strictly before");
+        assert!(make_node().verified_before(at), "never verified counts");
+    }
+
+    #[test]
+    fn test_archived_status_round_trips() {
+        let mut node = make_node();
+        node.set_status(NodeStatus::Archived);
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("\"status\":\"archived\""), "{json}");
+        let back: TemplateNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status(), NodeStatus::Archived);
+        assert_eq!(NodeStatus::Archived.as_str(), "archived");
     }
 
     #[test]

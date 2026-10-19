@@ -72,18 +72,19 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
                                    snapshot_create / snapshot_list / snapshot_restore / snapshot_delete
                                    node_history / dump
                                    book_lint / book_stats (read-only health)
+                                   node_verify (curation: verification dates)
 ```
 
 1. **`init`** — Create a new empty book
 2. **`node_create`** — Add sections and content nodes (with optional `properties`); the result carries the new node's UUID, ready for the batch tools
-3. **`toc`** — View the table of contents with numbered IDs (e.g. `1`, `2-3`). Supports `filter` by properties, `max_depth` (depth from the book root; `1` = root level only) and `limit`; a last line counts the nodes left out
-4. **`select_book`** — Select a book. Nodes with `inject=true` property have their body auto-appended (draft nodes excluded)
-5. **`checklist`** — Export a section (or the whole book) as a Markdown checklist with checkboxes
-6. **`node_update`** — Edit title, body, type, placeholder, properties, or status (`active`/`draft`) of a node
+3. **`toc`** — View the table of contents with numbered IDs (e.g. `1`, `2-3`). Supports `filter` by properties, `max_depth` (depth from the book root; `1` = root level only) and `limit`; a last line counts the nodes left out. Archived nodes and their subtrees are hidden (counted on a last line) unless `include_archived: true`, which shows them marked `[archived]`
+4. **`select_book`** — Select a book. Nodes with `inject=true` property have their body auto-appended (draft and archived nodes, and everything under an archived section, excluded; the TOC it prints hides archived subtrees like `toc`)
+5. **`checklist`** — Export a section (or the whole book) as a Markdown checklist with checkboxes. Archived subtrees are left out unless `include_archived: true` (or `subtree_root` is itself archived)
+6. **`node_update`** — Edit title, body, type, placeholder, properties, or status of a node. Status is `active`, `draft` (not written yet) or `archived` (retired: kept readable, but not injected and hidden from `toc` / `node_query` unless asked for)
 7. **`node_move`** — Relocate or delete nodes; descendants go along and are listed in the result. `dry_run: true` shows every node that would move or be removed (old → new positions) without changing anything. A remove records a delete in history for the node and each descendant
 8. **`node_batch_move`** — Move multiple nodes in a single atomic call (requires UUID or UUID-prefix IDs; to delete a node, use `node_move` with `action: "remove"`); also takes `dry_run`
 9. **`node_batch_update`** — Update title/body/type/properties/status on multiple nodes atomically
-10. **`node_query`** — Search nodes by property values, status (`active`/`draft`), type (`section`/`content`), or `text` (case-insensitive substring of title or body, CJK included, with a snippet of the first body match); optionally include body in results
+10. **`node_query`** — Search nodes by property values, status (`active`/`draft`/`archived`), type (`section`/`content`), `text` (case-insensitive substring of title or body, CJK included, with a snippet of the first body match), or `verified_before` (nodes never verified or last verified before a date / datetime / millis); optionally include body in results. Archived nodes come back only with `status: "archived"` or `include_archived: true`
 11. **`import`** — Import a book from a previously exported JSON file
 12. **`gen_routing`** — Generate a Markdown routing table from nodes with `routing` property across all books
 13. **`snapshot_create`** / **`snapshot_list`** / **`snapshot_restore`** / **`snapshot_delete`** — Full book versioning (create, list, restore, delete one snapshot; a labeled snapshot needs `force: true` to delete)
@@ -91,8 +92,9 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 15. **`dump`** — Export full book as JSON file
 16. **`book_delete`** — Delete a book with its nodes, history and snapshots (cannot be undone). The slug is required; a book with any nodes, history or snapshots needs `force: true`, and `dry_run: true` only reports what would be removed. A write to the book between the check and the delete makes the delete fail without removing anything
 17. **`book_update`** — Change a book's title and / or `max_depth` (slug required). Lowering `max_depth` below an existing node's depth is refused and names that node; the change appears in `book_history` as a `book_update` entry
-18. **`book_lint`** — Read-only structural checks on a book (`slug` defaults to the selected book): content nodes at the root, similar titles (Jaccard over title words; character pairs for CJK; `threshold` default 0.6; pairs where both titles are a single token are skipped unless the titles are identical), property keys differing only by case / `_` / `-` / spaces, sections without children, drafts not updated for `stale_days` (default 90). `checks` runs a subset; `limit` (default 50) caps findings per check and counts the rest; `format: "json"` for programs
+18. **`book_lint`** — Read-only structural checks on a book (`slug` defaults to the selected book): content nodes at the root, similar titles (Jaccard over title words; character pairs for CJK; `threshold` default 0.6; pairs where both titles are a single token are skipped unless the titles are identical), property keys differing only by case / `_` / `-` / spaces, sections without children, drafts not updated for `stale_days` (default 90). Archived nodes and everything under an archived section are ignored by every check. `checks` runs a subset; `limit` (default 50) caps findings per check and counts the rest; `format: "json"` for programs
 19. **`book_stats`** — Read-only numbers for a book: node counts, max / mean depth, children per section (max, mean, histogram), counts by status, injected nodes, update recency, distinct property keys; `format: "json"` for programs
+20. **`node_verify`** — Record that nodes were confirmed to still match reality (`node_ids`, optional `by`): sets their verification time to now without touching content or last-edited time; one history entry per node, one commit. Pair with `node_query` `verified_before` to list what nobody has confirmed lately
 
 ### Node IDs
 
