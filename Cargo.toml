@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/outline-mcp-core", "crates/outline-mcp-rmcp", "crates/outline-mcp"]
 
 [workspace.package]
-version = "0.15.1"
+version = "0.15.2"
 edition = "2021"
 # sqlx 0.9 requires rustc 1.94.
 rust-version = "1.94"
