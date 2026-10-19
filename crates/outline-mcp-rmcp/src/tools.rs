@@ -8,16 +8,19 @@ use rmcp::{
 
 use outline_mcp_core::application::eject::{EjectConfig, EjectFormat, EjectService, EjectTree};
 
-use crate::helpers::{build_hierarchical_ids, find_hierarchical_id, format_toc};
+use crate::helpers::{
+    build_hierarchical_ids, describe_book_update, find_hierarchical_id, format_toc,
+};
 use crate::request::{
     normalize_text, parse_node_id, parse_node_status, parse_node_type, sanitize_for_filename,
     unescape_newlines, validate_filename, validate_import_path, validate_slug, McpBatchMoveRequest,
-    McpBatchUpdateRequest, McpBookDeleteRequest, McpBookHistoryRequest, McpDumpRequest,
-    McpEjectRequest, McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpNodeCreateRequest,
-    McpNodeHistoryRequest, McpNodeMoveRequest, McpNodeQueryRequest, McpNodeUpdateRequest,
-    McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest, McpSnapshotDeleteRequest,
-    McpSnapshotDiffRequest, McpSnapshotDumpAllRequest, McpSnapshotDumpRequest,
-    McpSnapshotListRequest, McpSnapshotRestoreRequest, McpSnapshotTagRequest, McpTocRequest,
+    McpBatchUpdateRequest, McpBookDeleteRequest, McpBookHistoryRequest, McpBookUpdateRequest,
+    McpDumpRequest, McpEjectRequest, McpGenRoutingRequest, McpImportRequest, McpInitRequest,
+    McpNodeCreateRequest, McpNodeHistoryRequest, McpNodeMoveRequest, McpNodeQueryRequest,
+    McpNodeUpdateRequest, McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest,
+    McpSnapshotDeleteRequest, McpSnapshotDiffRequest, McpSnapshotDumpAllRequest,
+    McpSnapshotDumpRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest,
+    McpSnapshotTagRequest, McpTocRequest,
 };
 use crate::server::OutlineMcpServer;
 
@@ -404,6 +407,29 @@ impl OutlineMcpServer {
                 req.slug,
                 book.max_depth()
             ),
+        )]))
+    }
+
+    #[tool(
+        name = "book_update",
+        description = "Change a book's title and / or max_depth. The slug must be given explicitly; pass at least one of `title` / `max_depth`. Lowering max_depth below the depth of an existing node is refused and names that node (move or remove it first). The change is one commit and appears in `book_history` as a `book_update` entry.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn book_update(
+        &self,
+        Parameters(req): Parameters<McpBookUpdateRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_slug(&req.slug)?;
+        let msg = self
+            .update_book(&req.slug, req.title, req.max_depth)
+            .await?;
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            msg,
         )]))
     }
 
@@ -1277,13 +1303,7 @@ impl OutlineMcpServer {
             entries.len()
         );
         for (i, entry) in entries.iter().enumerate() {
-            let action_str = match entry.action {
-                ChangeAction::Create => "create",
-                ChangeAction::Update => "update",
-                ChangeAction::Delete => "delete",
-                ChangeAction::Move => "move",
-                ChangeAction::Restore => "restore",
-            };
+            let action_str = action_name(entry.action);
             output.push_str(&format!(
                 "{}. [{}] {}\n",
                 i + 1,
@@ -1401,23 +1421,28 @@ impl OutlineMcpServer {
         let mut output = format!("# History for \"{}\"{}\n\n", book.title(), showing_note);
 
         for (i, entry) in entries.iter().enumerate() {
-            let action_str = match entry.action {
-                ChangeAction::Create => "create",
-                ChangeAction::Update => "update",
-                ChangeAction::Delete => "delete",
-                ChangeAction::Move => "move",
-                ChangeAction::Restore => "restore",
-            };
+            let label_note = snap_label_by_millis
+                .get(&entry.timestamp.as_millis())
+                .map(|l| format!(" [snapshot: {l}]"))
+                .unwrap_or_default();
+            if entry.node_id.is_book_level() {
+                output.push_str(&format!(
+                    "{}. [{}] {} {}{}\n",
+                    i + 1,
+                    entry.timestamp.to_iso8601(),
+                    action_name(entry.action),
+                    describe_book_update(entry.before.as_deref(), entry.after.as_deref()),
+                    label_note
+                ));
+                continue;
+            }
+            let action_str = action_name(entry.action);
             let hier = find_hierarchical_id(&book, entry.node_id)
                 .unwrap_or_else(|| entry.node_id.short().to_string());
             let title = book
                 .get_node(entry.node_id)
                 .map(|n| n.title().to_string())
                 .unwrap_or_else(|| "(deleted)".to_string());
-            let label_note = snap_label_by_millis
-                .get(&entry.timestamp.as_millis())
-                .map(|l| format!(" [snapshot: {l}]"))
-                .unwrap_or_default();
             output.push_str(&format!(
                 "{}. [{}] {} node={} title=\"{}\"{}\n",
                 i + 1,
@@ -1498,7 +1523,7 @@ impl OutlineMcpServer {
     ) -> Result<outline_mcp_core::domain::model::id::NodeId, McpError> {
         // 1. Full UUID
         if let Ok(id) = parse_node_id(s) {
-            return Ok(id);
+            return crate::server::reject_book_level(id);
         }
         // 2. Short prefix in current book
         let svc = self.service().await?;
@@ -1797,6 +1822,18 @@ impl OutlineMcpServer {
 // ---------------------------------------------------------------------------
 // snapshot label / dump helpers
 // ---------------------------------------------------------------------------
+
+/// The word a history listing shows for an action.
+fn action_name(action: ChangeAction) -> &'static str {
+    match action {
+        ChangeAction::Create => "create",
+        ChangeAction::Update => "update",
+        ChangeAction::Delete => "delete",
+        ChangeAction::Move => "move",
+        ChangeAction::Restore => "restore",
+        ChangeAction::BookUpdate => "book_update",
+    }
+}
 
 /// snapshot label の validation。
 ///
@@ -2178,5 +2215,133 @@ mod import_tool_tests {
         );
         let old_history = svc.history_by_node(old).await.unwrap();
         assert_eq!(old_history.last().unwrap().action, ChangeAction::Delete);
+    }
+}
+
+#[cfg(test)]
+mod book_update_tool_tests {
+    use std::sync::Arc;
+
+    use outline_mcp_core::domain::model::node::NodeType;
+    use outline_mcp_core::infra::memory_store::{MemoryBookStore, MemorySnapshotStore};
+
+    use super::*;
+    use crate::server::Storage;
+
+    fn server() -> OutlineMcpServer {
+        OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ))
+    }
+
+    fn req(slug: &str, title: Option<&str>, max_depth: Option<u8>) -> McpBookUpdateRequest {
+        McpBookUpdateRequest {
+            slug: slug.into(),
+            title: title.map(str::to_string),
+            max_depth,
+        }
+    }
+
+    fn text(r: &CallToolResult) -> String {
+        format!("{:?}", r.content)
+    }
+
+    async fn book_with_depth_two_node(server: &OutlineMcpServer, slug: &str) {
+        let svc = server.service_for(slug).await.unwrap();
+        svc.create_book("Old Title", 3).await.unwrap();
+        let (parent, _) = svc
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: "top".into(),
+                node_type: NodeType::Section,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+                properties: HashMap::new(),
+            })
+            .await
+            .unwrap();
+        svc.add_node(AddNodeRequest {
+            parent: Some(parent),
+            title: "nested".into(),
+            node_type: NodeType::Content,
+            body: None,
+            placeholder: None,
+            position: usize::MAX,
+            properties: HashMap::new(),
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn validation_errors_change_nothing() {
+        let s = server();
+        book_with_depth_two_node(&s, "b").await;
+
+        let none = s.book_update(Parameters(req("b", None, None))).await;
+        assert!(none.unwrap_err().message.contains("Nothing to change"));
+        let missing = s
+            .book_update(Parameters(req("nope", Some("X"), None)))
+            .await;
+        assert!(missing.unwrap_err().message.contains("not found"));
+        let empty = s.book_update(Parameters(req("b", Some("   "), None))).await;
+        assert!(empty.unwrap_err().message.contains("must not be empty"));
+        let shallow = s.book_update(Parameters(req("b", None, Some(1)))).await;
+        let msg = shallow.unwrap_err().message.to_string();
+        assert!(
+            msg.contains("\"nested\"") && msg.contains("depth 2"),
+            "{msg}"
+        );
+
+        let book = s.service_for("b").await.unwrap().read_tree().await.unwrap();
+        assert_eq!((book.title(), book.max_depth()), ("Old Title", 3));
+    }
+
+    #[tokio::test]
+    async fn update_is_reported_and_listed_in_book_history() {
+        let s = server();
+        book_with_depth_two_node(&s, "b").await;
+
+        let r = s
+            .book_update(Parameters(req("b", Some("New Title"), Some(4))))
+            .await
+            .unwrap();
+        let t = text(&r);
+        assert!(
+            t.contains(r#"title \"Old Title\" → \"New Title\""#) && t.contains("max_depth 3 → 4"),
+            "{t}"
+        );
+
+        *s.selected.write().unwrap() = Some("b".into());
+        let h = s
+            .book_history(Parameters(McpBookHistoryRequest {
+                limit: None,
+                since: None,
+                until: None,
+            }))
+            .await
+            .unwrap();
+        let h = text(&h);
+        assert!(h.contains("book_update"), "{h}");
+        assert!(h.contains(r#"max_depth 3 → 4"#), "{h}");
+        assert!(
+            !h.contains("(deleted)"),
+            "book-level entry rendered as a node: {h}"
+        );
+
+        // Same values again: no commit, no new history entry.
+        let again = s
+            .book_update(Parameters(req("b", Some("New Title"), Some(4))))
+            .await
+            .unwrap();
+        assert!(text(&again).contains("No change"));
+        let entries = s.service_for("b").await.unwrap().history().await.unwrap();
+        let book_updates = entries
+            .iter()
+            .filter(|e| e.action == ChangeAction::BookUpdate)
+            .count();
+        assert_eq!(book_updates, 1);
     }
 }

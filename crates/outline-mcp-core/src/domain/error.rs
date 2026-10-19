@@ -27,4 +27,29 @@ pub enum DomainError {
         "node {0}: `properties` (replace) and `properties_patch` (merge) are mutually exclusive"
     )]
     ConflictingPropertyUpdate(NodeId),
+
+    /// A book title must not be empty (or whitespace only).
+    #[error("book title must not be empty")]
+    EmptyBookTitle,
+
+    /// A book's max depth must be at least 1.
+    #[error("max depth must be at least 1")]
+    InvalidMaxDepth,
+
+    /// Lowering the max depth would leave an existing node deeper than the
+    /// new limit.
+    #[error(
+        "max depth {requested} is below node \"{title}\" ({node_id}) at depth {depth}; \
+         move or remove it first"
+    )]
+    MaxDepthBelowExistingNode {
+        /// The requested max depth.
+        requested: u8,
+        /// The deepest existing node.
+        node_id: NodeId,
+        /// That node's title.
+        title: String,
+        /// That node's depth (root = 1).
+        depth: u8,
+    },
 }

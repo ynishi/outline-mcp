@@ -68,7 +68,7 @@ Service templates for running this as a daemon live in `contrib/systemd/` and `c
 ```
 shelf  →  select_book  →  toc  →  node_create / node_update / node_move
                                    node_batch_move / node_batch_update / node_query
-                                   checklist / import / init / book_delete / gen_routing
+                                   checklist / import / init / book_update / book_delete / gen_routing
                                    snapshot_create / snapshot_list / snapshot_restore / snapshot_delete
                                    node_history / dump
 ```
@@ -89,6 +89,7 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 14. **`node_history`** — View per-node change log with before/after diffs
 15. **`dump`** — Export full book as JSON file
 16. **`book_delete`** — Delete a book with its nodes, history and snapshots (cannot be undone). The slug is required; a book with any nodes, history or snapshots needs `force: true`, and `dry_run: true` only reports what would be removed. A write to the book between the check and the delete makes the delete fail without removing anything
+17. **`book_update`** — Change a book's title and / or `max_depth` (slug required). Lowering `max_depth` below an existing node's depth is refused and names that node; the change appears in `book_history` as a `book_update` entry
 
 ### Node IDs
 

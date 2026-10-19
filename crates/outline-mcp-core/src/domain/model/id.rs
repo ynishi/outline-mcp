@@ -50,6 +50,17 @@ impl NodeId {
         Self::default()
     }
 
+    /// The id history entries about the book itself carry (the nil UUID):
+    /// no node ever has it, since node ids are random v4 UUIDs.
+    pub const fn book_level() -> Self {
+        Self(uuid::Uuid::nil())
+    }
+
+    /// Whether this is [`Self::book_level`].
+    pub fn is_book_level(&self) -> bool {
+        self.0.is_nil()
+    }
+
     /// 短縮ID（UUIDの先頭8文字）
     pub fn short(&self) -> String {
         self.0.to_string()[..8].to_string()

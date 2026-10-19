@@ -30,6 +30,10 @@ pub enum ChangeAction {
     Move,
     /// snapshot restore 時に記録する。
     Restore,
+    /// The book's own fields (title / max depth) changed. The entry's
+    /// `node_id` is [`NodeId::book_level`]; `before` / `after` are
+    /// `{"title":…,"max_depth":…}`.
+    BookUpdate,
 }
 
 /// ChangeLog の1エントリ。
@@ -63,6 +67,18 @@ impl ChangeEntry {
             after,
             timestamp,
         }
+    }
+
+    /// A [`ChangeAction::BookUpdate`] entry: the book's title / max depth
+    /// before and after, under [`NodeId::book_level`].
+    pub fn book_update(before: String, after: String, timestamp: Timestamp) -> Self {
+        Self::new(
+            NodeId::book_level(),
+            ChangeAction::BookUpdate,
+            Some(before),
+            Some(after),
+            timestamp,
+        )
     }
 }
 
@@ -108,6 +124,7 @@ mod tests {
             (ChangeAction::Delete, r#""delete""#),
             (ChangeAction::Move, r#""move""#),
             (ChangeAction::Restore, r#""restore""#),
+            (ChangeAction::BookUpdate, r#""book_update""#),
         ] {
             let json = serde_json::to_string(action).expect("serialize");
             assert_eq!(&json, expected_json, "action: {action:?}");

@@ -252,6 +252,22 @@ pub(crate) struct McpInitRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpBookUpdateRequest {
+    #[schemars(
+        description = "Slug of the book to change (from `shelf`). Required: the selected book is never changed implicitly."
+    )]
+    pub slug: String,
+    #[schemars(description = "New title (omit to keep the current one)")]
+    #[serde(default)]
+    pub title: Option<String>,
+    #[schemars(
+        description = "New maximum tree depth, at least 1 (omit to keep the current one). Lowering it below an existing node's depth is refused."
+    )]
+    #[serde(default)]
+    pub max_depth: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct McpBookDeleteRequest {
     #[schemars(
         description = "Slug of the book to delete (from `shelf`). Required: the selected book is never deleted implicitly."

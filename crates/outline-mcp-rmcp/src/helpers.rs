@@ -84,3 +84,44 @@ pub(crate) fn find_hierarchical_id(book: &TemplateBook, target: NodeId) -> Optio
         .find(|(_, id)| *id == target)
         .map(|(num, _)| num)
 }
+
+/// The changed fields of a `book_update` history entry, from its
+/// `{"title":…,"max_depth":…}` before / after JSON: e.g.
+/// `title "A" → "B", max_depth 3 → 4`. Unchanged fields are left out.
+pub(crate) fn describe_book_update(before: Option<&str>, after: Option<&str>) -> String {
+    let parse = |s: Option<&str>| {
+        s.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let (b, a) = (parse(before), parse(after));
+    let mut parts = Vec::new();
+    if b["title"] != a["title"] {
+        parts.push(format!("title {} → {}", b["title"], a["title"]));
+    }
+    if b["max_depth"] != a["max_depth"] {
+        parts.push(format!("max_depth {} → {}", b["max_depth"], a["max_depth"]));
+    }
+    if parts.is_empty() {
+        "no change".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod book_update_tests {
+    use super::describe_book_update;
+
+    #[test]
+    fn lists_only_changed_fields() {
+        let before = r#"{"title":"A","max_depth":3}"#;
+        assert_eq!(
+            describe_book_update(Some(before), Some(r#"{"title":"B","max_depth":4}"#)),
+            r#"title "A" → "B", max_depth 3 → 4"#
+        );
+        assert_eq!(
+            describe_book_update(Some(before), Some(r#"{"title":"A","max_depth":5}"#)),
+            "max_depth 3 → 5"
+        );
+    }
+}
