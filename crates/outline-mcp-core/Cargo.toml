@@ -7,9 +7,15 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
+rust-version.workspace = true
+readme.workspace = true
 description = "Domain, application, and infrastructure logic for outline-mcp (pure SDK crate, no MCP transport dependency)"
 keywords = ["mcp", "outline", "checklist", "tree"]
 categories = ["command-line-utilities"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 thiserror = { workspace = true }
