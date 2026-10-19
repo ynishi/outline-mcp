@@ -22,6 +22,7 @@ use rmcp::{
 
 use outline_mcp_core::application::error::AppError;
 use outline_mcp_core::application::service::BookService;
+use outline_mcp_core::domain::model::book::TemplateBook;
 use outline_mcp_core::domain::model::id::NodeId;
 use outline_mcp_core::domain::store::{BookStore, SnapshotDelete, SnapshotStore, StoreError};
 
@@ -303,6 +304,44 @@ impl OutlineMcpServer {
             .map_err(|e| {
                 McpError::internal_error(format!("Failed to read book '{slug}': {e}"), None)
             })
+    }
+
+    /// The book a read-only report looks at: `slug` when given, otherwise the
+    /// selected book. Returns the slug with the loaded tree.
+    pub(crate) async fn report_target(
+        &self,
+        slug: Option<&str>,
+    ) -> Result<(String, TemplateBook), McpError> {
+        match slug {
+            Some(slug) => {
+                crate::request::validate_slug(slug)?;
+                let book = self
+                    .storage
+                    .books
+                    .load(slug)
+                    .await
+                    .map_err(|e| {
+                        McpError::internal_error(format!("Failed to read book '{slug}': {e}"), None)
+                    })?
+                    .ok_or_else(|| {
+                        McpError::invalid_params(
+                            format!("Book '{slug}' not found. Use `shelf` to list books."),
+                            None,
+                        )
+                    })?;
+                Ok((slug.to_string(), book.value))
+            }
+            None => {
+                let slug = self.selected_slug()?;
+                let book = self
+                    .service_for(&slug)
+                    .await?
+                    .read_tree()
+                    .await
+                    .map_err(Self::to_mcp_error)?;
+                Ok((slug, book))
+            }
+        }
     }
 
     /// 選択中BookのServiceを返す。未選択ならエラー。
@@ -700,6 +739,7 @@ impl ServerHandler for OutlineMcpServer {
                  `checklist` for task export. `init` for new book, `book_update` to retitle or change max_depth, `book_delete` to remove one.\n\
                  History: `snapshot_create`/`snapshot_list`/`snapshot_restore`/`snapshot_delete` for versioning. \
                  `node_history` for change tracking. `dump` for full export.\n\
+                 Health: `book_lint` (structural smells) and `book_stats` (shape and freshness), both read-only.\n\
                  Batch: `node_batch_move`/`node_batch_update` for bulk operations (UUID required; \
                  `node_create` and `node_move` return it). `node_move`/`node_batch_move` take \
                  `dry_run` to preview what moves along with a node.\n\
