@@ -103,6 +103,49 @@ impl TemplateBook {
         self.max_depth
     }
 
+    /// Rename the book. The title is trimmed and must not be empty.
+    pub fn set_title(&mut self, title: impl Into<String>) -> Result<(), DomainError> {
+        let title = title.into();
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(DomainError::EmptyBookTitle);
+        }
+        self.title = title.to_string();
+        Ok(())
+    }
+
+    /// Change the maximum tree depth. Refused when it is 0, or when an
+    /// existing node is deeper than `max_depth` (depth as in [`Self::depth_of`],
+    /// root = 1 — the same measure `add_node` checks against); the error names
+    /// the deepest node.
+    pub fn set_max_depth(&mut self, max_depth: u8) -> Result<(), DomainError> {
+        if max_depth == 0 {
+            return Err(DomainError::InvalidMaxDepth);
+        }
+        let deepest = self
+            .nodes
+            .keys()
+            .map(|&id| (self.depth_of(id), id))
+            .max_by_key(|&(depth, _)| depth);
+        if let Some((depth, node_id)) = deepest {
+            if depth > max_depth {
+                let title = self
+                    .nodes
+                    .get(&node_id)
+                    .map(|n| n.title().to_string())
+                    .unwrap_or_default();
+                return Err(DomainError::MaxDepthBelowExistingNode {
+                    requested: max_depth,
+                    node_id,
+                    title,
+                    depth,
+                });
+            }
+        }
+        self.max_depth = max_depth;
+        Ok(())
+    }
+
     /// Return the IDs of root-level nodes, in order.
     pub fn root_nodes(&self) -> &[NodeId] {
         &self.root_nodes
@@ -524,6 +567,72 @@ mod tests {
             result,
             Err(DomainError::MaxDepthExceeded { max: 2, .. })
         ));
+    }
+
+    fn child(parent: Option<NodeId>, title: &str) -> AddNodeRequest {
+        AddNodeRequest {
+            parent,
+            title: title.into(),
+            node_type: NodeType::Section,
+            body: None,
+            placeholder: None,
+            position: usize::MAX,
+            properties: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn set_max_depth_refuses_to_go_below_the_deepest_node() {
+        let mut book = TemplateBook::new("B", 3);
+        let l1 = book.add_node(child(None, "L1")).unwrap();
+        let l2 = book.add_node(child(Some(l1), "L2")).unwrap();
+
+        match book.set_max_depth(1) {
+            Err(DomainError::MaxDepthBelowExistingNode {
+                requested: 1,
+                node_id,
+                title,
+                depth: 2,
+            }) => {
+                assert_eq!(node_id, l2);
+                assert_eq!(title, "L2");
+            }
+            other => panic!("expected MaxDepthBelowExistingNode, got {other:?}"),
+        }
+        assert_eq!(
+            book.max_depth(),
+            3,
+            "a refused change leaves the book as it was"
+        );
+        assert!(matches!(
+            book.set_max_depth(0),
+            Err(DomainError::InvalidMaxDepth)
+        ));
+
+        // Equal to the deepest node is fine.
+        book.set_max_depth(2).unwrap();
+        assert!(book.add_node(child(Some(l2), "L3")).is_err());
+    }
+
+    #[test]
+    fn raising_max_depth_allows_deeper_nodes() {
+        let mut book = TemplateBook::new("B", 1);
+        let l1 = book.add_node(child(None, "L1")).unwrap();
+        assert!(book.add_node(child(Some(l1), "L2")).is_err());
+        book.set_max_depth(2).unwrap();
+        assert!(book.add_node(child(Some(l1), "L2")).is_ok());
+    }
+
+    #[test]
+    fn set_title_trims_and_rejects_empty() {
+        let mut book = TemplateBook::new("Old", 2);
+        book.set_title("  New  ").unwrap();
+        assert_eq!(book.title(), "New");
+        assert!(matches!(
+            book.set_title("   "),
+            Err(DomainError::EmptyBookTitle)
+        ));
+        assert_eq!(book.title(), "New");
     }
 
     #[test]

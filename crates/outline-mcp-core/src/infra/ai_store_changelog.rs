@@ -18,6 +18,7 @@ const KIND_UPDATE: &str = "node_updated";
 const KIND_DELETE: &str = "node_deleted";
 const KIND_MOVE: &str = "node_moved";
 const KIND_RESTORE: &str = "reverted";
+const KIND_BOOK_UPDATE: &str = "book_updated";
 
 /// `ChangeAction` → ai-store `Event.kind` 文字列マッピング。
 fn action_to_kind(action: ChangeAction) -> &'static str {
@@ -27,6 +28,7 @@ fn action_to_kind(action: ChangeAction) -> &'static str {
         ChangeAction::Delete => KIND_DELETE,
         ChangeAction::Move => KIND_MOVE,
         ChangeAction::Restore => KIND_RESTORE,
+        ChangeAction::BookUpdate => KIND_BOOK_UPDATE,
     }
 }
 
@@ -40,6 +42,7 @@ fn kind_to_action(kind: &str) -> Option<ChangeAction> {
         KIND_DELETE => Some(ChangeAction::Delete),
         KIND_MOVE => Some(ChangeAction::Move),
         KIND_RESTORE => Some(ChangeAction::Restore),
+        KIND_BOOK_UPDATE => Some(ChangeAction::BookUpdate),
         _ => None,
     }
 }

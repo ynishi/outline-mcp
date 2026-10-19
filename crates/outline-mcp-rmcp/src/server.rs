@@ -429,6 +429,49 @@ impl OutlineMcpServer {
         Ok(msg)
     }
 
+    /// The `book_update` tool: change `slug`'s title and / or max depth.
+    /// At least one field is required; the book must exist. Validation
+    /// failures (empty title, max depth 0 or below an existing node) are
+    /// invalid params naming the problem; nothing is committed then.
+    pub(crate) async fn update_book(
+        &self,
+        slug: &str,
+        title: Option<String>,
+        max_depth: Option<u8>,
+    ) -> Result<String, McpError> {
+        if title.is_none() && max_depth.is_none() {
+            return Err(McpError::invalid_params(
+                "Nothing to change: pass `title` and / or `max_depth`.",
+                None,
+            ));
+        }
+        if !self.book_exists(slug).await? {
+            return Err(McpError::invalid_params(
+                format!("Book '{slug}' not found. Use `shelf` to list books."),
+                None,
+            ));
+        }
+        let svc = self.service_for(slug).await?;
+        let up = svc
+            .update_book(title, max_depth)
+            .await
+            .map_err(|e| book_update_error(slug, e))?;
+        let ((t0, d0), (t1, d1)) = (&up.before, &up.after);
+        if !up.changed {
+            return Ok(format!(
+                "No change: '{slug}' already has title \"{t1}\" and max_depth {d1}."
+            ));
+        }
+        let mut parts = Vec::new();
+        if t0 != t1 {
+            parts.push(format!("title \"{t0}\" → \"{t1}\""));
+        }
+        if d0 != d1 {
+            parts.push(format!("max_depth {d0} → {d1}"));
+        }
+        Ok(format!("Updated book '{slug}': {}.", parts.join(", ")))
+    }
+
     /// The `snapshot_delete` tool: delete one snapshot of the selected book.
     /// `timestamp` is the millis value `snapshot_list` shows. A labeled
     /// snapshot is refused unless `force`. The book itself is not changed, so
@@ -533,7 +576,7 @@ impl OutlineMcpServer {
 
         // 2. Full UUIDとして解析
         if let Ok(id) = parse_node_id(s) {
-            return Ok(id);
+            return reject_book_level(id);
         }
 
         let svc = self.service().await?;
@@ -590,6 +633,37 @@ impl OutlineMcpServer {
     }
 }
 
+/// Map a `book_update` failure for the slug-addressed tool: the messages name
+/// the slug, never "the selected book".
+fn book_update_error(slug: &str, e: AppError) -> McpError {
+    match e {
+        AppError::Domain(d) => McpError::invalid_params(format!("{d}"), None),
+        AppError::Conflict { actual: None, .. } | AppError::BookNotFound => {
+            McpError::invalid_params(
+                format!("Book '{slug}' not found. Use `shelf` to list books."),
+                None,
+            )
+        }
+        AppError::Conflict { .. } => McpError::invalid_params(
+            format!("Book '{slug}' changed while updating; nothing was changed — retry."),
+            None,
+        ),
+        e => OutlineMcpServer::to_mcp_error(e),
+    }
+}
+
+/// A full UUID given as a node reference, unless it is the book-level id
+/// (the nil UUID that marks book-level history entries), which names no node.
+pub(crate) fn reject_book_level(id: NodeId) -> Result<NodeId, McpError> {
+    if id.is_book_level() {
+        return Err(McpError::invalid_params(
+            format!("'{id}' is not a node id (it marks book-level history entries)"),
+            None,
+        ));
+    }
+    Ok(id)
+}
+
 // =============================================================================
 // ServerHandler impl
 // =============================================================================
@@ -620,7 +694,7 @@ impl ServerHandler for OutlineMcpServer {
                  persistent rules/context into every session.\n\
                  \n\
                  Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`. \
-                 `checklist` for task export. `init` for new book, `book_delete` to remove one.\n\
+                 `checklist` for task export. `init` for new book, `book_update` to retitle or change max_depth, `book_delete` to remove one.\n\
                  History: `snapshot_create`/`snapshot_list`/`snapshot_restore`/`snapshot_delete` for versioning. \
                  `node_history` for change tracking. `dump` for full export.\n\
                  Batch: `node_batch_move`/`node_batch_update` for bulk operations (UUID required). \
@@ -1187,5 +1261,82 @@ mod tests {
         let server = memory_server();
         let err = server.delete_snapshot("1", true).await.unwrap_err();
         assert!(err.message.contains("No book selected"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn book_update_max_depth_zero_is_invalid_params() {
+        let server = memory_server();
+        server
+            .service_for("z")
+            .await
+            .unwrap()
+            .create_book("Z", 3)
+            .await
+            .unwrap();
+        let err = server.update_book("z", None, Some(0)).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        let book = server
+            .service_for("z")
+            .await
+            .unwrap()
+            .read_tree()
+            .await
+            .unwrap();
+        assert_eq!(book.max_depth(), 3, "nothing committed");
+    }
+
+    #[test]
+    fn book_update_errors_name_the_slug() {
+        let conflict = book_update_error(
+            "b",
+            AppError::Conflict {
+                expected: Some(1),
+                actual: Some(2),
+            },
+        );
+        assert_eq!(conflict.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            conflict.message.contains("Book 'b' changed while updating"),
+            "{}",
+            conflict.message
+        );
+
+        for gone in [
+            AppError::BookNotFound,
+            AppError::Conflict {
+                expected: Some(1),
+                actual: None,
+            },
+        ] {
+            let e = book_update_error("b", gone);
+            assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(e.message.contains("Book 'b' not found"), "{}", e.message);
+            assert!(!e.message.contains("selected"), "{}", e.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_book_level_id_is_not_a_node_reference() {
+        let server = memory_server();
+        server
+            .service_for("n")
+            .await
+            .unwrap()
+            .create_book("N", 3)
+            .await
+            .unwrap();
+        *server.selected.write().unwrap() = Some("n".into());
+        // node_history / node_update / ... resolve through resolve_id: the nil
+        // UUID (digits and dashes only) never reaches a store lookup.
+        let nil = NodeId::book_level().to_string();
+        let err = server.resolve_id(&nil).await.unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+
+        // The batch tools parse full UUIDs directly; that path rejects it too.
+        let err = reject_book_level(NodeId::book_level()).unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("not a node id"), "{}", err.message);
+        let id = NodeId::new();
+        assert_eq!(reject_book_level(id).unwrap(), id);
     }
 }

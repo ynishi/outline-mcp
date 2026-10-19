@@ -522,6 +522,112 @@ async fn import_book_commits_tree_and_history_together_against_postgres() {
 }
 
 #[tokio::test]
+async fn book_update_records_a_book_level_event_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!(
+            "OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres book_update test did NOT run"
+        );
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let pool = sqlx::PgPool::connect(&url).await.expect("count connect");
+    let slug = format!("_test-book-update-{}", std::process::id());
+
+    let svc = BookService::new(store.clone(), slug.clone());
+    svc.create_book("Before", 3).await.expect("create_book");
+    let (n, _) = svc.add_node(add_req(None, "n")).await.expect("add n");
+
+    let up = svc
+        .update_book(Some("After".into()), Some(5))
+        .await
+        .expect("update_book");
+    assert!(up.changed);
+
+    // Stored with a NULL node id, read back as the book-level id.
+    let nulls: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE book = $1 AND node_id IS NULL AND action = 'book_update'",
+    )
+    .bind(&slug)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(nulls, 1);
+    let last = svc.history().await.unwrap().pop().unwrap();
+    assert_eq!(last.action, ChangeAction::BookUpdate);
+    assert!(last.node_id.is_book_level());
+    // A node's own history does not pick the book-level entry up.
+    assert!(svc
+        .history_by_node(n)
+        .await
+        .unwrap()
+        .iter()
+        .all(|e| e.action != ChangeAction::BookUpdate));
+
+    let listed = BookStore::list_books(&store)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|b| b.slug == slug)
+        .expect("listed");
+    assert_eq!(listed.title, "After");
+    let book = svc.read_tree().await.unwrap();
+    assert_eq!(book.max_depth(), 5);
+
+    let version = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert!(BookStore::delete(&store, &slug, version).await.unwrap());
+}
+
+#[tokio::test]
+async fn restore_records_the_revert_of_book_fields_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!(
+            "OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres restore book-fields test did NOT run"
+        );
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate");
+    let slug = format!("_test-restore-fields-{}", std::process::id());
+
+    let svc = BookService::new(store.clone(), slug.clone());
+    svc.create_book("Kept", 3).await.expect("create_book");
+    svc.add_node(add_req(None, "n")).await.expect("add n");
+    let old = svc.read_tree().await.unwrap();
+    svc.update_book(None, Some(5)).await.expect("raise");
+
+    svc.restore_book(&old).await.expect("restore");
+    let book_level: Vec<ChangeEntry> = svc
+        .history()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.action == ChangeAction::BookUpdate)
+        .collect();
+    assert_eq!(book_level.len(), 2, "the raise and the revert");
+    let revert = book_level.last().unwrap();
+    assert!(revert.node_id.is_book_level());
+    assert!(revert
+        .before
+        .as_deref()
+        .unwrap()
+        .contains("\"max_depth\":5"));
+    assert!(revert.after.as_deref().unwrap().contains("\"max_depth\":3"));
+    assert_eq!(svc.read_tree().await.unwrap().max_depth(), 3);
+
+    let version = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert!(BookStore::delete(&store, &slug, version).await.unwrap());
+}
+
+#[tokio::test]
 async fn snapshot_delete_removes_one_row_against_postgres() {
     let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
         eprintln!(

@@ -417,7 +417,9 @@ impl BookStore for PgBookStore {
             let mut afters = Vec::with_capacity(events.len());
             let mut ats = Vec::with_capacity(events.len());
             for entry in events {
-                node_ids.push(entry.node_id.as_uuid());
+                // A book-level entry (`book_update`) has no node: NULL, which
+                // `change_entry` reads back as `NodeId::book_level()`.
+                node_ids.push((!entry.node_id.is_book_level()).then(|| entry.node_id.as_uuid()));
                 actions.push(enum_str(&entry.action)?);
                 befores.push(json_column(&entry.before)?);
                 afters.push(json_column(&entry.after)?);
@@ -821,9 +823,8 @@ fn change_entry(r: &PgRow) -> Result<ChangeEntry, StoreError> {
     let after: Option<Value> = r.try_get("after").map_err(StoreError::backend)?;
     let at: i64 = r.try_get("at").map_err(StoreError::backend)?;
     Ok(ChangeEntry::new(
-        // Every event this adapter writes names its node; a NULL can only come
-        // from a future book-level import and reads as the nil id.
-        NodeId::from_uuid(node_id.unwrap_or(Uuid::nil())),
+        // NULL is a book-level entry (`book_update`): the nil id.
+        node_id.map_or(NodeId::book_level(), NodeId::from_uuid),
         str_enum(&action)?,
         before.map(|v| v.to_string()),
         after.map(|v| v.to_string()),

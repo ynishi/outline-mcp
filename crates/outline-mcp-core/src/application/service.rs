@@ -6,6 +6,19 @@ use crate::domain::store::{BookStore, StoreError, Versioned};
 
 use super::error::AppError;
 
+/// The result of [`BookService::update_book`]: the book's (title, max depth)
+/// before and after, and whether anything was committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookUpdate {
+    /// (title, max depth) before the call.
+    pub before: (String, u8),
+    /// (title, max depth) after the call.
+    pub after: (String, u8),
+    /// False when the requested values were already in place (nothing
+    /// committed, no history entry).
+    pub changed: bool,
+}
+
 /// Template Bookに対するユースケース。
 /// load → mutate → commit のパターンで操作する。
 ///
@@ -81,6 +94,43 @@ impl<S: BookStore> BookService<S> {
         let warnings = self.commit(Some(version), &book, &[entry]).await?;
 
         Ok(((), join_warnings(warnings)))
+    }
+
+    /// Change the book's own fields: title and / or max depth (`None` keeps
+    /// the current value). One commit over the version just read, carrying a
+    /// [`ChangeAction::BookUpdate`] entry; when nothing would change, nothing
+    /// is committed and the result says so.
+    pub async fn update_book(
+        &self,
+        title: Option<String>,
+        max_depth: Option<u8>,
+    ) -> Result<BookUpdate, AppError> {
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
+        let before = (book.title().to_string(), book.max_depth());
+        if let Some(title) = title {
+            book.set_title(title)?;
+        }
+        if let Some(max_depth) = max_depth {
+            book.set_max_depth(max_depth)?;
+        }
+        let after = (book.title().to_string(), book.max_depth());
+        if before == after {
+            return Ok(BookUpdate {
+                before,
+                after,
+                changed: false,
+            });
+        }
+        let entry = book_fields_entry(&before, &after, Timestamp::now());
+        self.commit(Some(version), &book, &[entry]).await?;
+        Ok(BookUpdate {
+            before,
+            after,
+            changed: true,
+        })
     }
 
     /// ノードを移動する。
@@ -242,8 +292,9 @@ impl<S: BookStore> BookService<S> {
     /// Replace the book with `book` (an imported tree) and record the
     /// replacement in the same commit: a `Delete` entry for every current node
     /// that `book` does not have, a `Create` entry for every node of `book`
-    /// that is new, and an `Update` entry for a node present in both whose
-    /// content differs. Returns the number of entries recorded.
+    /// that is new, an `Update` entry for a node present in both whose
+    /// content differs, and a [`ChangeAction::BookUpdate`] entry when the
+    /// title or max depth changes. Returns the number of entries recorded.
     ///
     /// The commit goes over the version just read, so a concurrent write in
     /// between is a conflict. A book that does not exist yet is created, with a
@@ -254,6 +305,7 @@ impl<S: BookStore> BookService<S> {
         let mut events = Vec::new();
 
         if let Some(cur) = &current {
+            events.extend(book_fields_change(&cur.value, book, at));
             for id in cur.value.all_node_ids() {
                 if book.get_node(id).is_none() {
                     events.push(ChangeEntry::new(
@@ -290,18 +342,24 @@ impl<S: BookStore> BookService<S> {
     }
 
     /// Replace the book with `book` (a snapshot being restored), recording a
-    /// `Restore` event for every node of `book` in the same commit.
+    /// `Restore` event for every node of `book` in the same commit, plus a
+    /// [`ChangeAction::BookUpdate`] entry when the restored title or max depth
+    /// differs from the current one.
     ///
     /// The book must exist: a restore goes over the version just read, so a
     /// concurrent write between the read and this commit is a conflict rather
     /// than being silently overwritten.
     pub async fn restore_book(&self, book: &TemplateBook) -> Result<(), AppError> {
-        let version = self.load_book().await?.version;
+        let current = self.load_book().await?;
         let at = Timestamp::now();
-        let events: Vec<ChangeEntry> = book
-            .all_node_ids()
-            .map(|id| ChangeEntry::new(id, ChangeAction::Restore, None, None, at))
+        let mut events: Vec<ChangeEntry> = book_fields_change(&current.value, book, at)
+            .into_iter()
             .collect();
+        events.extend(
+            book.all_node_ids()
+                .map(|id| ChangeEntry::new(id, ChangeAction::Restore, None, None, at)),
+        );
+        let version = current.version;
         self.commit(Some(version), book, &events).await?;
         Ok(())
     }
@@ -357,6 +415,27 @@ fn node_json(book: &TemplateBook, id: NodeId) -> Option<String> {
         .and_then(|n| serde_json::to_string(n).ok())
 }
 
+/// A [`ChangeAction::BookUpdate`] entry for the book's own fields.
+fn book_fields_entry(before: &(String, u8), after: &(String, u8), at: Timestamp) -> ChangeEntry {
+    let fields = |(title, max_depth): &(String, u8)| {
+        serde_json::json!({ "title": title, "max_depth": max_depth }).to_string()
+    };
+    ChangeEntry::book_update(fields(before), fields(after), at)
+}
+
+/// The book-level entry for replacing `current` with `next`, when their
+/// title or max depth differ (restore / import carry the book's own fields
+/// along with the tree).
+fn book_fields_change(
+    current: &TemplateBook,
+    next: &TemplateBook,
+    at: Timestamp,
+) -> Option<ChangeEntry> {
+    let before = (current.title().to_string(), current.max_depth());
+    let after = (next.title().to_string(), next.max_depth());
+    (before != after).then(|| book_fields_entry(&before, &after, at))
+}
+
 /// The node as a JSON value, for an order-insensitive comparison of its
 /// content (object keys compare as a map, not by position).
 fn node_value(book: &TemplateBook, id: NodeId) -> Option<serde_json::Value> {
@@ -389,6 +468,7 @@ fn spread_warnings(warnings: Vec<String>, len: usize) -> Vec<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::error::DomainError;
     use crate::domain::model::book::{AddNodeRequest, UpdateNodeRequest};
     use crate::domain::model::changelog::{ChangeAction, ChangeEntry, NodeStatus};
     use crate::domain::model::id::NodeId;
@@ -1002,6 +1082,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_import_book_with_a_new_title_records_a_book_update() {
+        let svc = memory_service().await;
+        svc.add_node(add_req("A")).await.expect("add A");
+        let tree = svc.read_tree().await.unwrap();
+        let mut imported: TemplateBook =
+            serde_json::from_str(&serde_json::to_string(&tree).unwrap()).unwrap();
+        imported.set_title("Renamed".to_string()).unwrap();
+
+        assert_eq!(svc.import_book(&imported).await.expect("import"), 1);
+        let last = svc.history().await.unwrap().pop().unwrap();
+        assert_eq!(last.action, ChangeAction::BookUpdate);
+        assert!(last.node_id.is_book_level());
+        assert!(last.before.unwrap().contains("\"Test\""));
+        assert!(last.after.unwrap().contains("\"Renamed\""));
+    }
+
+    #[tokio::test]
+    async fn test_restore_book_records_the_revert_of_book_fields() {
+        let svc = memory_service().await;
+        svc.add_node(add_req("A")).await.expect("add A");
+        let old = svc.read_tree().await.unwrap(); // max_depth 4, title "Test"
+        svc.update_book(None, Some(6)).await.expect("raise");
+
+        svc.restore_book(&old).await.expect("restore");
+        let book_level: Vec<_> = svc
+            .history()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == ChangeAction::BookUpdate)
+            .collect();
+        assert_eq!(book_level.len(), 2, "the raise and the revert");
+        let revert = book_level.last().unwrap();
+        assert!(revert
+            .before
+            .as_deref()
+            .unwrap()
+            .contains("\"max_depth\":6"));
+        assert!(revert.after.as_deref().unwrap().contains("\"max_depth\":4"));
+        assert_eq!(svc.read_tree().await.unwrap().max_depth(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_restore_book_same_fields_records_no_book_update() {
+        let svc = memory_service().await;
+        svc.add_node(add_req("A")).await.expect("add A");
+        let same = svc.read_tree().await.unwrap();
+        svc.restore_book(&same).await.expect("restore");
+        assert!(svc
+            .history()
+            .await
+            .unwrap()
+            .iter()
+            .all(|e| e.action != ChangeAction::BookUpdate));
+    }
+
+    #[tokio::test]
     async fn test_import_book_into_a_missing_book_creates_it_with_create_entries() {
         let svc = BookService::new(MemoryBookStore::new(), "fresh");
         let mut book = TemplateBook::new("Fresh", 4);
@@ -1010,6 +1147,125 @@ mod tests {
         let h = svc.history().await.unwrap();
         assert_eq!(h.len(), 1);
         assert_eq!((h[0].node_id, h[0].action), (x, ChangeAction::Create));
+    }
+
+    #[tokio::test]
+    async fn test_update_book_is_one_commit_with_one_book_level_event() {
+        let svc = memory_service().await;
+        let v0 = svc.current_version().await.unwrap().unwrap();
+
+        let up = svc
+            .update_book(Some("Renamed".into()), Some(6))
+            .await
+            .expect("update_book");
+        assert!(up.changed);
+        assert_eq!(up.before, ("Test".to_string(), 4));
+        assert_eq!(up.after, ("Renamed".to_string(), 6));
+        assert_eq!(svc.current_version().await.unwrap(), Some(v0 + 1));
+
+        let h = svc.history().await.unwrap();
+        let last = h.last().unwrap();
+        assert_eq!(last.action, ChangeAction::BookUpdate);
+        assert!(last.node_id.is_book_level());
+        let before: serde_json::Value =
+            serde_json::from_str(last.before.as_deref().unwrap()).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(last.after.as_deref().unwrap()).unwrap();
+        assert_eq!(before, serde_json::json!({"title": "Test", "max_depth": 4}));
+        assert_eq!(
+            after,
+            serde_json::json!({"title": "Renamed", "max_depth": 6})
+        );
+
+        let book = svc.read_tree().await.unwrap();
+        assert_eq!((book.title(), book.max_depth()), ("Renamed", 6));
+    }
+
+    #[tokio::test]
+    async fn test_update_book_without_a_change_commits_nothing() {
+        let svc = memory_service().await;
+        let v0 = svc.current_version().await.unwrap();
+        let n0 = svc.history().await.unwrap().len();
+        let up = svc.update_book(Some("Test".into()), Some(4)).await.unwrap();
+        assert!(!up.changed);
+        assert_eq!(svc.current_version().await.unwrap(), v0);
+        assert_eq!(svc.history().await.unwrap().len(), n0);
+    }
+
+    #[tokio::test]
+    async fn test_update_book_refused_change_commits_nothing() {
+        let svc = memory_service().await;
+        let v0 = svc.current_version().await.unwrap();
+        let err = svc.update_book(Some("".into()), None).await.unwrap_err();
+        assert!(matches!(err, AppError::Domain(DomainError::EmptyBookTitle)));
+        assert_eq!(svc.current_version().await.unwrap(), v0);
+    }
+
+    /// A store that lets one other writer commit right after `update_book`
+    /// read the book, so its commit goes over a stale version.
+    struct InterleavingStore {
+        inner: MemoryBookStore,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl BookStore for InterleavingStore {
+        async fn load(&self, slug: &str) -> Result<Option<Versioned<TemplateBook>>, StoreError> {
+            let loaded = self.inner.load(slug).await?;
+            if let Some(v) = &loaded {
+                if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    self.inner
+                        .commit(slug, Some(v.version), &v.value, &[])
+                        .await?;
+                }
+            }
+            Ok(loaded)
+        }
+        async fn commit(
+            &self,
+            slug: &str,
+            expected: Option<i64>,
+            book: &TemplateBook,
+            events: &[ChangeEntry],
+        ) -> Result<crate::domain::store::Committed, StoreError> {
+            self.inner.commit(slug, expected, book, events).await
+        }
+        async fn history(&self, slug: &str) -> Result<Vec<ChangeEntry>, StoreError> {
+            self.inner.history(slug).await
+        }
+        async fn history_by_node(
+            &self,
+            slug: &str,
+            id: NodeId,
+        ) -> Result<Vec<ChangeEntry>, StoreError> {
+            self.inner.history_by_node(slug, id).await
+        }
+        async fn list_books(&self) -> Result<Vec<crate::domain::store::BookSummary>, StoreError> {
+            self.inner.list_books().await
+        }
+        async fn delete(&self, slug: &str, expected: i64) -> Result<bool, StoreError> {
+            self.inner.delete(slug, expected).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_book_conflicts_on_a_concurrent_write() {
+        let store = InterleavingStore {
+            inner: MemoryBookStore::new(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let svc = BookService::new(store, "c");
+        svc.create_book("C", 3).await.unwrap();
+        svc.store
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = svc
+            .update_book(Some("Other".into()), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict { .. }), "{err:?}");
+        let book = svc.read_tree().await.unwrap();
+        assert_eq!(book.title(), "C", "the conflicting change was not stored");
     }
 
     #[tokio::test]
