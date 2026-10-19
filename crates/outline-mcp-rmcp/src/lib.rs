@@ -31,10 +31,12 @@
 
 mod health;
 mod helpers;
+mod render;
 mod request;
 mod resources;
 mod revision;
 mod server;
 mod tools;
+mod ui;
 
 pub use server::{run, run_http, OutlineMcpServer, Storage};

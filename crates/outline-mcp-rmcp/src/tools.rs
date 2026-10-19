@@ -2760,7 +2760,7 @@ fn trimmed(s: Option<String>) -> Option<String> {
     s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-fn action_name(action: ChangeAction) -> &'static str {
+pub(crate) fn action_name(action: ChangeAction) -> &'static str {
     match action {
         ChangeAction::Create => "create",
         ChangeAction::Update => "update",

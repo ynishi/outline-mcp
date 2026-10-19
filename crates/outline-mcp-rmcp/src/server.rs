@@ -91,10 +91,6 @@ pub async fn run(storage: Storage) -> anyhow::Result<()> {
 pub async fn run_http(storage: Storage, bind: &str) -> anyhow::Result<()> {
     use std::sync::Arc;
 
-    use rmcp::transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-    };
-
     // Unlike the stdio path, stdout is not a protocol channel here, but the
     // subscriber still targets stderr so daemon logs behave identically in
     // both transports (and under systemd, both land in the journal). ANSI is
@@ -105,8 +101,6 @@ pub async fn run_http(storage: Storage, bind: &str) -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .try_init();
-
-    let server = OutlineMcpServer::new(storage);
 
     let addr: std::net::SocketAddr = bind
         .parse()
@@ -123,6 +117,29 @@ pub async fn run_http(storage: Storage, bind: &str) -> anyhow::Result<()> {
         );
     }
 
+    let router = http_router(storage, token, loopback);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, auth = if loopback { "loopback" } else { "bearer-token" }, "serving MCP over streamable HTTP at /mcp and a read-only view at /ui");
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+/// The HTTP router `run_http` serves: `/mcp` (streamable HTTP, behind the
+/// bearer check when `token` is set) merged with the read-only `/ui`.
+pub(crate) fn http_router(
+    storage: Storage,
+    token: Option<std::sync::Arc<str>>,
+    loopback: bool,
+) -> axum::Router {
+    use std::sync::Arc;
+
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    let ui_storage = storage.clone();
+    let server = OutlineMcpServer::new(storage);
     let mut http_config = StreamableHttpServerConfig::default();
     if !loopback {
         // Bearer auth replaces loopback Host validation for LAN/remote binds.
@@ -138,7 +155,7 @@ pub async fn run_http(storage: Storage, bind: &str) -> anyhow::Result<()> {
     );
 
     let mut router = axum::Router::new().nest_service("/mcp", service);
-    if let Some(token) = token {
+    if let Some(token) = token.clone() {
         router = router.layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let token = Arc::clone(&token);
@@ -155,11 +172,32 @@ pub async fn run_http(storage: Storage, bind: &str) -> anyhow::Result<()> {
             },
         ));
     }
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, auth = if loopback { "loopback" } else { "bearer-token" }, "serving MCP over streamable HTTP at /mcp");
-    axum::serve(listener, router).await?;
-    Ok(())
+    // The read-only browser view is merged after the bearer layer above, so
+    // it is not wrapped by it: browsers send HTTP Basic, which `ui` checks
+    // against the same token (or, without one, a loopback `Host`).
+    let router = router.merge(crate::ui::router(ui_storage, token.clone()));
+    // `Router::layer` above also wrapped the default fallback, so a path that
+    // is neither /mcp nor /ui answered with the bearer 401. Merging replaces
+    // that fallback with the default 404; restore the same answer: 401
+    // without a valid bearer token, 404 with one.
+    match token {
+        Some(token) => router.fallback(move |req: axum::extract::Request| {
+            let token = Arc::clone(&token);
+            async move {
+                use axum::response::IntoResponse;
+                if bearer_token_matches(req.headers(), &token) {
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                } else {
+                    (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        "missing or invalid bearer token",
+                    )
+                        .into_response()
+                }
+            }
+        }),
+        None => router,
+    }
 }
 
 /// Constant-time comparison of the request's `Authorization: Bearer` value

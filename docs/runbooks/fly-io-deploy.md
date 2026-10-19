@@ -128,6 +128,10 @@ pending.
 Then, from a registered client (§7): `shelf` lists every book you imported,
 and `select_book` + `node_history` on one of them shows its history.
 
+The read-only browser view is at `https://<your-app-name>.fly.dev/ui/`; the
+browser asks for a user name and password — any user name, the HTTP token as
+the password.
+
 ## 7. Client registration
 
 Register the endpoint with the token as a bearer credential in the
