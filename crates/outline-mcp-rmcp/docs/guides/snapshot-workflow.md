@@ -9,6 +9,8 @@ outline-mcp's snapshot tools. The core idea is:
 - `snapshot_list` shows every frozen version, labels included.
 - `snapshot_tag` lets you attach or overwrite a label on a snapshot
   after the fact.
+- `snapshot_delete` removes one snapshot (cannot be undone). A labeled
+  snapshot needs `force: true`; the book itself is not changed.
 - `snapshot_diff` produces a unified diff between two snapshots (label
   or timestamp headers).
 - `snapshot_dump` / `snapshot_dump_all` render snapshots into a

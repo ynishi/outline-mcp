@@ -23,7 +23,7 @@ use rmcp::{
 use outline_mcp_core::application::error::AppError;
 use outline_mcp_core::application::service::BookService;
 use outline_mcp_core::domain::model::id::NodeId;
-use outline_mcp_core::domain::store::{BookStore, SnapshotStore, StoreError};
+use outline_mcp_core::domain::store::{BookStore, SnapshotDelete, SnapshotStore, StoreError};
 
 use crate::helpers::{build_hierarchical_ids, find_hierarchical_id, is_hierarchical_id};
 use crate::request::parse_node_id;
@@ -429,6 +429,55 @@ impl OutlineMcpServer {
         Ok(msg)
     }
 
+    /// The `snapshot_delete` tool: delete one snapshot of the selected book.
+    /// `timestamp` is the millis value `snapshot_list` shows. A labeled
+    /// snapshot is refused unless `force`. The book itself is not changed, so
+    /// nothing is added to its history.
+    pub(crate) async fn delete_snapshot(
+        &self,
+        timestamp: &str,
+        force: bool,
+    ) -> Result<String, McpError> {
+        let millis: i64 = timestamp.parse().map_err(|_| {
+            McpError::invalid_params(
+                format!("Invalid timestamp: '{timestamp}'. Must be a millis integer."),
+                None,
+            )
+        })?;
+        let slug = self.selected_slug()?;
+        let ts = outline_mcp_core::domain::model::timestamp::Timestamp::from_millis(millis);
+
+        // The store checks the label and removes in one step, so a label
+        // attached concurrently still blocks a delete without `force`.
+        let outcome = self
+            .storage
+            .snapshots
+            .delete(&slug, ts, force)
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to delete snapshot {millis}: {e}"), None)
+            })?;
+        match outcome {
+            SnapshotDelete::Deleted { label: Some(label) } => Ok(format!(
+                "Deleted snapshot {millis} ('{label}') of '{slug}'."
+            )),
+            SnapshotDelete::Deleted { label: None } => {
+                Ok(format!("Deleted snapshot {millis} of '{slug}'."))
+            }
+            SnapshotDelete::NotFound => Err(McpError::invalid_params(
+                format!("Snapshot {millis} not found in '{slug}'. Use `snapshot_list`."),
+                None,
+            )),
+            SnapshotDelete::Labeled(label) => Err(McpError::invalid_params(
+                format!(
+                    "Snapshot {millis} in '{slug}' is labeled '{label}'. Deleting it cannot be \
+                     undone; pass `force: true` to delete it anyway."
+                ),
+                None,
+            )),
+        }
+    }
+
     /// 番号 or slug → slug に解決する。
     pub(crate) async fn resolve_book_ref(&self, book_ref: &str) -> Result<String, McpError> {
         if let Ok(num) = book_ref.parse::<usize>() {
@@ -571,8 +620,8 @@ impl ServerHandler for OutlineMcpServer {
                  persistent rules/context into every session.\n\
                  \n\
                  Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`. \
-                 `checklist` for task export. `init` for new book.\n\
-                 History: `snapshot_create`/`snapshot_list`/`snapshot_restore` for versioning. \
+                 `checklist` for task export. `init` for new book, `book_delete` to remove one.\n\
+                 History: `snapshot_create`/`snapshot_list`/`snapshot_restore`/`snapshot_delete` for versioning. \
                  `node_history` for change tracking. `dump` for full export.\n\
                  Batch: `node_batch_move`/`node_batch_update` for bulk operations (UUID required). \
                  Query: `node_query` for searching nodes by properties/status/type.\n\
@@ -1039,5 +1088,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(counts(&server, "reuse").await, Some((0, 0, 0)));
+    }
+
+    /// The selected book `slug` with two snapshots: (unlabeled, labeled).
+    async fn book_with_two_snapshots(server: &OutlineMcpServer, slug: &str) -> (i64, i64) {
+        book_with_content(server, slug).await;
+        let book = server
+            .service_for(slug)
+            .await
+            .unwrap()
+            .read_tree()
+            .await
+            .unwrap();
+        let labeled = server
+            .storage
+            .snapshots
+            .create(slug, &book, Some("keep"))
+            .await
+            .unwrap();
+        let all = server.storage.snapshots.list(slug).await.unwrap();
+        let unlabeled = all.iter().find(|s| s.label.is_none()).unwrap().timestamp;
+        *server.selected.write().unwrap() = Some(slug.into());
+        (unlabeled.as_millis(), labeled.timestamp.as_millis())
+    }
+
+    async fn snapshot_millis(server: &OutlineMcpServer, slug: &str) -> Vec<i64> {
+        let mut v: Vec<i64> = server
+            .storage
+            .snapshots
+            .list(slug)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.timestamp.as_millis())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn snapshot_delete_of_an_unknown_timestamp_is_an_error() {
+        let server = memory_server();
+        let (a, b) = book_with_two_snapshots(&server, "s").await;
+        let err = server.delete_snapshot("1", false).await.unwrap_err();
+        assert!(err.message.contains("not found"), "{}", err.message);
+        let err = server
+            .delete_snapshot("not-a-number", false)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("Invalid timestamp"), "{}", err.message);
+        assert_eq!(snapshot_millis(&server, "s").await, {
+            let mut v = vec![a, b];
+            v.sort();
+            v
+        });
+    }
+
+    #[tokio::test]
+    async fn snapshot_delete_refuses_a_labeled_snapshot_without_force() {
+        let server = memory_server();
+        let (_, labeled) = book_with_two_snapshots(&server, "s").await;
+        let err = server
+            .delete_snapshot(&labeled.to_string(), false)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("labeled 'keep'"), "{}", err.message);
+        assert!(snapshot_millis(&server, "s").await.contains(&labeled));
+
+        let msg = server
+            .delete_snapshot(&labeled.to_string(), true)
+            .await
+            .unwrap();
+        assert!(msg.contains("('keep')"), "{msg}");
+        assert!(!snapshot_millis(&server, "s").await.contains(&labeled));
+    }
+
+    #[tokio::test]
+    async fn snapshot_delete_of_an_unlabeled_snapshot_leaves_the_rest() {
+        let server = memory_server();
+        let (unlabeled, labeled) = book_with_two_snapshots(&server, "s").await;
+        let before = counts(&server, "s").await.map(|(n, h, _)| (n, h));
+
+        server
+            .delete_snapshot(&unlabeled.to_string(), false)
+            .await
+            .unwrap();
+        assert_eq!(snapshot_millis(&server, "s").await, vec![labeled]);
+        // The book and its history are untouched.
+        assert_eq!(counts(&server, "s").await.map(|(n, h, _)| (n, h)), before);
+        // Reading the deleted snapshot (restore / dump / diff all go through
+        // load_snapshot) is now "not found".
+        let err = server.load_snapshot("s", unlabeled).await.unwrap_err();
+        assert!(err.message.contains("not found"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn snapshot_delete_needs_a_selected_book() {
+        let server = memory_server();
+        let err = server.delete_snapshot("1", true).await.unwrap_err();
+        assert!(err.message.contains("No book selected"), "{}", err.message);
     }
 }

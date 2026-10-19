@@ -66,7 +66,8 @@ use crate::domain::model::id::{BookId, NodeId};
 use crate::domain::model::node::{NodeParts, TemplateNode};
 use crate::domain::model::timestamp::Timestamp;
 use crate::domain::store::{
-    BookStore, BookSummary, Committed, SnapshotInfo, SnapshotStore, StoreError, Versioned,
+    BookStore, BookSummary, Committed, SnapshotDelete, SnapshotInfo, SnapshotStore, StoreError,
+    Versioned,
 };
 
 /// The bundled schema migrations (`crates/outline-mcp-core/migrations`).
@@ -650,6 +651,44 @@ impl SnapshotStore for PgBookStore {
                 .map_err(StoreError::backend)?
                 .rows_affected();
         Ok(updated > 0)
+    }
+
+    async fn delete(
+        &self,
+        slug: &str,
+        timestamp: Timestamp,
+        allow_labeled: bool,
+    ) -> Result<SnapshotDelete, StoreError> {
+        // The label condition is part of the DELETE, so a label attached
+        // between a caller's check and this statement still blocks it.
+        let deleted: Option<Option<String>> = sqlx::query_scalar(
+            "DELETE FROM snapshots WHERE book = $1 AND taken_at = $2 \
+             AND (label IS NULL OR $3) RETURNING label",
+        )
+        .bind(slug)
+        .bind(timestamp.as_millis())
+        .bind(allow_labeled)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::backend)?;
+        if let Some(label) = deleted {
+            return Ok(SnapshotDelete::Deleted { label });
+        }
+        let existing: Option<Option<String>> =
+            sqlx::query_scalar("SELECT label FROM snapshots WHERE book = $1 AND taken_at = $2")
+                .bind(slug)
+                .bind(timestamp.as_millis())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::backend)?;
+        Ok(match existing {
+            None => SnapshotDelete::NotFound,
+            Some(Some(label)) => SnapshotDelete::Labeled(label),
+            // Unlabeled but not deleted: it appeared after the DELETE ran
+            // (a concurrent insert at the same timestamp). Report it as
+            // not found for this call; nothing was removed.
+            Some(None) => SnapshotDelete::NotFound,
+        })
     }
 
     async fn delete_all(&self, slug: &str) -> Result<u64, StoreError> {
