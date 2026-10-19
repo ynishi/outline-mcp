@@ -855,3 +855,60 @@ async fn archived_status_and_verification_round_trip_against_postgres() {
         .version;
     assert!(BookStore::delete(&store, &slug, v).await.unwrap());
 }
+
+#[tokio::test]
+async fn links_round_trip_and_follow_removal_against_postgres() {
+    let Ok(url) = std::env::var("OUTLINE_MCP_TEST_DATABASE_URL") else {
+        eprintln!("OUTLINE_MCP_TEST_DATABASE_URL not set; the Postgres links test did NOT run");
+        return;
+    };
+    let store = PgBookStore::connect(&url).await.expect("connect");
+    store.migrate().await.expect("migrate (incl. 0004)");
+    let slug = format!("_test-links-{}", std::process::id());
+
+    let svc = BookService::new(store.clone(), slug.clone());
+    svc.create_book("Links", 4).await.expect("create_book");
+    let (a, _) = svc.add_node(add_req(None, "a")).await.unwrap();
+    let (b, _) = svc.add_node(add_req(None, "b")).await.unwrap();
+    let (c, _) = svc.add_node(add_req(None, "c")).await.unwrap();
+
+    // A link-only change must reach the row (NodeRow equality covers links).
+    let v0 = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert!(svc.add_link(a, b, "supersedes").await.unwrap());
+    assert!(svc.add_link(c, b, "see_also").await.unwrap());
+    let loaded = BookStore::load(&store, &slug).await.unwrap().unwrap();
+    assert_eq!(loaded.version, v0 + 2);
+    let book = loaded.value;
+    let la = book.get_node(a).unwrap().links();
+    assert_eq!(la.len(), 1);
+    assert_eq!((la[0].rel(), la[0].target()), ("supersedes", b));
+    assert_eq!(book.backlinks(b).len(), 2);
+
+    // Removing the target drops the incoming links from a and c in the same
+    // commit, with an update entry for each.
+    let base = svc.history().await.unwrap().len();
+    svc.remove_node(b).await.expect("remove b");
+    let h = svc.history().await.unwrap();
+    let new: Vec<_> = h[base..].iter().map(|e| (e.node_id, e.action)).collect();
+    assert_eq!(
+        new,
+        vec![
+            (b, ChangeAction::Delete),
+            (a, ChangeAction::Update),
+            (c, ChangeAction::Update)
+        ]
+    );
+    let book = BookStore::load(&store, &slug).await.unwrap().unwrap().value;
+    assert_eq!(book.link_count(), 0);
+
+    let v = BookStore::load(&store, &slug)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    assert!(BookStore::delete(&store, &slug, v).await.unwrap());
+}

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::id::{BookId, NodeId};
-use super::node::{NodeType, TemplateNode};
+use super::node::{normalize_rel, Link, NodeType, TemplateNode};
 use super::timestamp::Timestamp;
 use crate::domain::error::DomainError;
 
@@ -277,6 +277,93 @@ impl TemplateBook {
         Ok(())
     }
 
+    /// Add a typed link from `from` to `to`. Both must exist in this book and
+    /// differ; `rel` is normalized (see [`Link::new`]). Returns `false` (no
+    /// change) when the same link already exists.
+    pub fn add_link(&mut self, from: NodeId, to: NodeId, rel: &str) -> Result<bool, DomainError> {
+        if !self.nodes.contains_key(&to) {
+            return Err(DomainError::NodeNotFound(to));
+        }
+        if from == to {
+            return Err(DomainError::SelfLink(from));
+        }
+        let link =
+            Link::new(rel, to).ok_or_else(|| DomainError::InvalidLinkRel(rel.to_string()))?;
+        Ok(self
+            .nodes
+            .get_mut(&from)
+            .ok_or(DomainError::NodeNotFound(from))?
+            .add_link(link))
+    }
+
+    /// Remove the links from `from` to `to` — only those of type `rel` when
+    /// given, every type otherwise. Returns how many were removed.
+    pub fn remove_link(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        rel: Option<&str>,
+    ) -> Result<usize, DomainError> {
+        let rel = match rel {
+            Some(r) => {
+                Some(normalize_rel(r).ok_or_else(|| DomainError::InvalidLinkRel(r.to_string()))?)
+            }
+            None => None,
+        };
+        Ok(self
+            .nodes
+            .get_mut(&from)
+            .ok_or(DomainError::NodeNotFound(from))?
+            .remove_links_to(to, rel.as_deref()))
+    }
+
+    /// Incoming links of `target`: `(source node, link)` pairs, in book
+    /// (depth-first) order. Derived on every call; nothing is stored.
+    pub fn backlinks(&self, target: NodeId) -> Vec<(NodeId, &Link)> {
+        self.all_nodes_dfs()
+            .into_iter()
+            .flat_map(|n| {
+                n.links()
+                    .iter()
+                    .filter(move |l| l.target() == target)
+                    .map(move |l| (n.id(), l))
+            })
+            .collect()
+    }
+
+    /// Every node's incoming links at once: target → `(source node, link)`
+    /// pairs in book (depth-first) order, the same pairs [`Self::backlinks`]
+    /// returns per target. One pass over the book, for callers that need the
+    /// backlinks of many nodes (a per-node `backlinks` call would be O(n²)).
+    pub fn backlink_index(&self) -> HashMap<NodeId, Vec<(NodeId, &Link)>> {
+        let mut index: HashMap<NodeId, Vec<(NodeId, &Link)>> = HashMap::new();
+        for n in self.all_nodes_dfs() {
+            for l in n.links() {
+                index.entry(l.target()).or_default().push((n.id(), l));
+            }
+        }
+        index
+    }
+
+    /// Links whose target is not a node of this book (left behind by data
+    /// restored or imported from elsewhere): `(source node, link)` pairs.
+    pub fn dangling_links(&self) -> Vec<(NodeId, &Link)> {
+        self.all_nodes_dfs()
+            .into_iter()
+            .flat_map(|n| {
+                n.links()
+                    .iter()
+                    .filter(|l| !self.nodes.contains_key(&l.target()))
+                    .map(move |l| (n.id(), l))
+            })
+            .collect()
+    }
+
+    /// Total number of links in the book.
+    pub fn link_count(&self) -> usize {
+        self.nodes.values().map(|n| n.links().len()).sum()
+    }
+
     /// ノード移動。循環参照と深さ超過を検証する。
     pub fn move_node(
         &mut self,
@@ -319,9 +406,18 @@ impl TemplateBook {
         }
 
         // 本体 + 子孫を削除
+        let mut removed: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        removed.insert(id);
         self.nodes.remove(&id);
         for desc_id in descendants {
             self.nodes.remove(&desc_id);
+            removed.insert(desc_id);
+        }
+
+        // Links into the removed subtree would dangle: drop them from the
+        // nodes that remain.
+        for node in self.nodes.values_mut() {
+            node.remove_links_into(&removed);
         }
 
         Ok(())
@@ -1013,5 +1109,120 @@ mod tests {
         let all = book.all_nodes_dfs();
         let ids: Vec<NodeId> = all.iter().map(|n| n.id()).collect();
         assert_eq!(ids, vec![a, a1, a2, b]);
+    }
+
+    fn add(book: &mut TemplateBook, parent: Option<NodeId>, title: &str) -> NodeId {
+        book.add_node(AddNodeRequest {
+            parent,
+            title: title.into(),
+            node_type: NodeType::Section,
+            body: None,
+            placeholder: None,
+            position: usize::MAX,
+            properties: HashMap::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn links_add_validate_and_derive_backlinks() {
+        let mut book = make_book();
+        let a = add(&mut book, None, "A");
+        let b = add(&mut book, None, "B");
+        let c = add(&mut book, None, "C");
+        assert!(book.add_link(a, b, "supersedes").unwrap());
+        assert!(book.add_link(c, b, "See_Also").unwrap());
+        assert!(
+            !book.add_link(a, b, "supersedes").unwrap(),
+            "duplicate is a no-op"
+        );
+        assert!(matches!(
+            book.add_link(a, a, "x"),
+            Err(DomainError::SelfLink(_))
+        ));
+        assert!(matches!(
+            book.add_link(a, b, "see also"),
+            Err(DomainError::InvalidLinkRel(_))
+        ));
+        assert!(matches!(
+            book.add_link(a, NodeId::new(), "x"),
+            Err(DomainError::NodeNotFound(_))
+        ));
+
+        let back: Vec<(NodeId, String)> = book
+            .backlinks(b)
+            .into_iter()
+            .map(|(s, l)| (s, l.rel().to_string()))
+            .collect();
+        assert_eq!(back, vec![(a, "supersedes".into()), (c, "see_also".into())]);
+        assert_eq!(book.link_count(), 2);
+        assert_eq!(book.remove_link(c, b, Some("supersedes")).unwrap(), 0);
+        assert_eq!(book.remove_link(c, b, None).unwrap(), 1);
+        assert_eq!(book.backlinks(b).len(), 1);
+    }
+
+    #[test]
+    fn moving_a_target_keeps_its_backlinks() {
+        let mut book = make_book();
+        let a = add(&mut book, None, "A");
+        let s = add(&mut book, None, "S");
+        let b = add(&mut book, None, "B");
+        book.add_link(a, b, "see_also").unwrap();
+        book.move_node(b, Some(s), 0).unwrap();
+        assert_eq!(book.backlinks(b).len(), 1);
+        assert!(book.dangling_links().is_empty());
+    }
+
+    #[test]
+    fn removing_a_subtree_drops_links_into_it_only() {
+        let mut book = make_book();
+        let a = add(&mut book, None, "A");
+        let s = add(&mut book, None, "S");
+        let s1 = add(&mut book, Some(s), "S1");
+        let other = add(&mut book, None, "Other");
+        book.add_link(a, s, "x").unwrap();
+        book.add_link(a, s1, "y").unwrap();
+        book.add_link(a, other, "z").unwrap();
+        book.add_link(s1, other, "w").unwrap();
+        book.remove_node(s).unwrap();
+        let rels: Vec<&str> = book
+            .get_node(a)
+            .unwrap()
+            .links()
+            .iter()
+            .map(|l| l.rel())
+            .collect();
+        assert_eq!(rels, vec!["z"]);
+        assert!(book.dangling_links().is_empty());
+        assert_eq!(book.link_count(), 1);
+    }
+
+    #[test]
+    fn backlink_index_matches_a_per_node_scan() {
+        let mut book = make_book();
+        let a = add(&mut book, None, "A");
+        let b = add(&mut book, None, "B");
+        let b1 = add(&mut book, Some(b), "B1");
+        let c = add(&mut book, None, "C");
+        book.add_link(a, b, "supersedes").unwrap();
+        book.add_link(c, b, "see_also").unwrap();
+        book.add_link(b1, a, "see_also").unwrap();
+        book.add_link(a, b1, "x").unwrap();
+        book.add_link(c, a, "y").unwrap();
+
+        let index = book.backlink_index();
+        for id in book.all_node_ids().collect::<Vec<_>>() {
+            let scan: Vec<(NodeId, String)> = book
+                .backlinks(id)
+                .into_iter()
+                .map(|(s, l)| (s, l.rel().to_string()))
+                .collect();
+            let indexed: Vec<(NodeId, String)> = index
+                .get(&id)
+                .map(|v| v.iter().map(|(s, l)| (*s, l.rel().to_string())).collect())
+                .unwrap_or_default();
+            assert_eq!(indexed, scan, "backlinks of {id}");
+        }
+        assert!(!index.contains_key(&c), "C has no incoming links");
     }
 }

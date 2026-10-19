@@ -738,6 +738,9 @@ impl ServerHandler for OutlineMcpServer {
                  Lifecycle: status `active`, `draft` (not written yet) or `archived` (retired: \
                  not injected, hidden from `toc`/`node_query` unless asked for). `node_verify` \
                  records that a node was confirmed; `node_query` `verified_before` lists stale ones.\n\
+                 Links: `link_add`/`link_remove` keep typed links between nodes (e.g. `supersedes`, \
+                 `see_also`); `links` lists a node's outgoing links and backlinks; `node_query` \
+                 `linked_to` finds the nodes pointing at one.\n\
                  \n\
                  Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`. \
                  `checklist` for task export. `init` for new book, `book_update` to retitle or change max_depth, `book_delete` to remove one.\n\

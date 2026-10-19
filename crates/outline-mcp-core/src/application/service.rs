@@ -207,15 +207,83 @@ impl<S: BookStore> BookService<S> {
         } = self.load_book().await?;
         let removed: Vec<NodeId> = std::iter::once(id).chain(book.descendant_ids(id)).collect();
         let at = Timestamp::now();
-        let entries: Vec<ChangeEntry> = removed
+        let mut entries: Vec<ChangeEntry> = removed
             .iter()
             .map(|&n| ChangeEntry::new(n, ChangeAction::Delete, node_json(&book, n), None, at))
             .collect();
+        // Nodes that keep existing but link into the removed subtree lose
+        // those links (the domain drops them); record each such node.
+        let link_holders: Vec<(NodeId, Option<String>)> =
+            links_into(&book, &removed.iter().copied().collect())
+                .into_iter()
+                .map(|n| (n, node_json(&book, n)))
+                .collect();
         book.remove_node(id)?;
+        for (n, before) in link_holders {
+            entries.push(ChangeEntry::new(
+                n,
+                ChangeAction::Update,
+                before,
+                node_json(&book, n),
+                at,
+            ));
+        }
 
         let warnings = self.commit(Some(version), &book, &entries).await?;
 
         Ok(((), join_warnings(warnings)))
+    }
+
+    /// Add a typed link from `from` to `to` (see [`TemplateBook::add_link`]):
+    /// one commit with an `Update` entry for `from`. Returns `false`, and
+    /// commits nothing, when the same link already exists.
+    pub async fn add_link(&self, from: NodeId, to: NodeId, rel: &str) -> Result<bool, AppError> {
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
+        let before = node_json(&book, from);
+        if !book.add_link(from, to, rel)? {
+            return Ok(false);
+        }
+        let entry = ChangeEntry::new(
+            from,
+            ChangeAction::Update,
+            before,
+            node_json(&book, from),
+            Timestamp::now(),
+        );
+        self.commit(Some(version), &book, &[entry]).await?;
+        Ok(true)
+    }
+
+    /// Remove the links from `from` to `to` (only type `rel` when given):
+    /// one commit with an `Update` entry for `from`. Returns how many were
+    /// removed; nothing is committed when none were.
+    pub async fn remove_link(
+        &self,
+        from: NodeId,
+        to: NodeId,
+        rel: Option<&str>,
+    ) -> Result<usize, AppError> {
+        let Versioned {
+            value: mut book,
+            version,
+        } = self.load_book().await?;
+        let before = node_json(&book, from);
+        let removed = book.remove_link(from, to, rel)?;
+        if removed == 0 {
+            return Ok(0);
+        }
+        let entry = ChangeEntry::new(
+            from,
+            ChangeAction::Update,
+            before,
+            node_json(&book, from),
+            Timestamp::now(),
+        );
+        self.commit(Some(version), &book, &[entry]).await?;
+        Ok(removed)
     }
 
     /// Apply `change` to a copy of the current book without committing, and
@@ -459,6 +527,17 @@ impl<S: BookStore> BookService<S> {
 fn node_json(book: &TemplateBook, id: NodeId) -> Option<String> {
     book.get_node(id)
         .and_then(|n| serde_json::to_string(n).ok())
+}
+
+/// Nodes outside `targets` that hold at least one link into `targets`, in
+/// book order.
+pub fn links_into(book: &TemplateBook, targets: &std::collections::HashSet<NodeId>) -> Vec<NodeId> {
+    book.all_nodes_dfs()
+        .into_iter()
+        .filter(|n| !targets.contains(&n.id()))
+        .filter(|n| n.links().iter().any(|l| targets.contains(&l.target())))
+        .map(|n| n.id())
+        .collect()
 }
 
 /// A [`ChangeAction::BookUpdate`] entry for the book's own fields.
@@ -1442,5 +1521,92 @@ mod tests {
         // Timestamp::now() が panic しないことを確認
         let ts = Timestamp::now();
         assert!(ts.as_millis() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_add_and_remove_link_record_one_update_each() {
+        let svc = memory_service().await;
+        let (a, _) = svc.add_node(add_req("A")).await.unwrap();
+        let (b, _) = svc.add_node(add_req("B")).await.unwrap();
+        let base = svc.history().await.unwrap().len();
+
+        assert!(svc.add_link(a, b, "supersedes").await.unwrap());
+        assert!(
+            !svc.add_link(a, b, "supersedes").await.unwrap(),
+            "duplicate"
+        );
+        let h = svc.history().await.unwrap();
+        assert_eq!(h.len(), base + 1, "the duplicate committed nothing");
+        let last = h.last().unwrap();
+        assert_eq!((last.node_id, last.action), (a, ChangeAction::Update));
+        assert!(last.after.as_deref().unwrap().contains("supersedes"));
+
+        assert_eq!(svc.remove_link(a, b, None).await.unwrap(), 1);
+        assert_eq!(svc.remove_link(a, b, None).await.unwrap(), 0);
+        assert_eq!(svc.history().await.unwrap().len(), base + 2);
+    }
+
+    #[tokio::test]
+    async fn test_removing_a_link_target_updates_the_holders_in_the_same_commit() {
+        let svc = memory_service().await;
+        let (a, _) = svc.add_node(add_req("A")).await.unwrap();
+        let (b, _) = svc.add_node(add_req("B")).await.unwrap();
+        let (c, _) = svc.add_node(add_req("C")).await.unwrap();
+        svc.add_link(a, b, "see_also").await.unwrap();
+        svc.add_link(c, b, "supersedes").await.unwrap();
+        svc.add_link(c, a, "see_also").await.unwrap();
+        let base = svc.history().await.unwrap().len();
+
+        svc.remove_node(b).await.unwrap();
+        let h = svc.history().await.unwrap();
+        let new: Vec<_> = h[base..].iter().map(|e| (e.node_id, e.action)).collect();
+        assert_eq!(
+            new,
+            vec![
+                (b, ChangeAction::Delete),
+                (a, ChangeAction::Update),
+                (c, ChangeAction::Update)
+            ]
+        );
+        let book = svc.read_tree().await.unwrap();
+        assert!(book.get_node(a).unwrap().links().is_empty());
+        let c_links: Vec<_> = book
+            .get_node(c)
+            .unwrap()
+            .links()
+            .iter()
+            .map(|l| l.target())
+            .collect();
+        assert_eq!(c_links, vec![a]);
+    }
+
+    #[tokio::test]
+    async fn test_link_changes_leave_updated_at_alone() {
+        // Links are curation metadata, like a verification: adding or
+        // removing one, or losing one because its target was deleted, does
+        // not count as editing the node.
+        let svc = memory_service().await;
+        let (a, _) = svc.add_node(add_req("A")).await.unwrap();
+        let (b, _) = svc.add_node(add_req("B")).await.unwrap();
+        let (c, _) = svc.add_node(add_req("C")).await.unwrap();
+        let stamp = |book: &TemplateBook, id| book.get_node(id).unwrap().updated_at();
+        let before = svc.read_tree().await.unwrap();
+        let (a0, c0) = (stamp(&before, a), stamp(&before, c));
+        // Let the clock move, so a bump would be visible.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        svc.add_link(a, b, "see_also").await.unwrap();
+        svc.add_link(c, b, "supersedes").await.unwrap();
+        let t = svc.read_tree().await.unwrap();
+        assert_eq!((stamp(&t, a), stamp(&t, c)), (a0, c0), "link_add");
+
+        svc.remove_link(a, b, None).await.unwrap();
+        let t = svc.read_tree().await.unwrap();
+        assert_eq!(stamp(&t, a), a0, "link_remove");
+
+        svc.remove_node(b).await.unwrap();
+        let t = svc.read_tree().await.unwrap();
+        assert!(t.get_node(c).unwrap().links().is_empty());
+        assert_eq!(stamp(&t, c), c0, "link dropped with its target");
     }
 }

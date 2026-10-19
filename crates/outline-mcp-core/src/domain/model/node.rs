@@ -15,6 +15,49 @@ pub enum NodeType {
     Content,
 }
 
+/// A typed, directed reference from one node to another node of the same
+/// book (`supersedes`, `see_also`, …). Stored on the source node by target
+/// id, so moving the target does not break it; backlinks are derived by
+/// scanning the book.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Link {
+    rel: String,
+    target: NodeId,
+}
+
+/// Longest accepted link type.
+pub const MAX_LINK_REL_LEN: usize = 40;
+
+impl Link {
+    /// A link of type `rel` to `target`. `rel` is normalized (trimmed,
+    /// lowercased) and must be 1–40 characters of `a-z`, `0-9`, `_`, `-`;
+    /// otherwise `None`.
+    pub fn new(rel: &str, target: NodeId) -> Option<Self> {
+        normalize_rel(rel).map(|rel| Self { rel, target })
+    }
+
+    /// The link type, normalized.
+    pub fn rel(&self) -> &str {
+        &self.rel
+    }
+
+    /// The node the link points at.
+    pub fn target(&self) -> NodeId {
+        self.target
+    }
+}
+
+/// Normalize a link type: trimmed, lowercased, 1–40 of `[a-z0-9_-]`.
+pub fn normalize_rel(rel: &str) -> Option<String> {
+    let rel = rel.trim().to_lowercase();
+    let ok = !rel.is_empty()
+        && rel.chars().count() <= MAX_LINK_REL_LEN
+        && rel
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    ok.then_some(rel)
+}
+
 /// Template上のノード。Bookが所有し、Bookを通じて操作する。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateNode {
@@ -42,6 +85,10 @@ pub struct TemplateNode {
     /// Who confirmed it, as passed to `node_verify`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     verified_by: Option<String>,
+    /// Outgoing typed links to other nodes of the book. Absent in data
+    /// written before links existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    links: Vec<Link>,
 }
 
 /// Every stored field of a [`TemplateNode`], for adapters that keep nodes as
@@ -59,6 +106,7 @@ pub(crate) struct NodeParts {
     pub(crate) updated_at: Option<Timestamp>,
     pub(crate) verified_at: Option<Timestamp>,
     pub(crate) verified_by: Option<String>,
+    pub(crate) links: Vec<Link>,
 }
 
 impl TemplateNode {
@@ -81,6 +129,7 @@ impl TemplateNode {
             updated_at: Some(Timestamp::now()),
             verified_at: None,
             verified_by: None,
+            links: Vec::new(),
         }
     }
 
@@ -100,6 +149,7 @@ impl TemplateNode {
             updated_at: parts.updated_at,
             verified_at: parts.verified_at,
             verified_by: parts.verified_by,
+            links: parts.links,
         }
     }
 
@@ -171,6 +221,11 @@ impl TemplateNode {
     /// Who last verified the node, if recorded.
     pub fn verified_by(&self) -> Option<&str> {
         self.verified_by.as_deref()
+    }
+
+    /// Outgoing typed links, in the order they were added.
+    pub fn links(&self) -> &[Link] {
+        &self.links
     }
 
     /// `true` when the node has never been verified or was last verified
@@ -249,6 +304,38 @@ impl TemplateNode {
         self.verified_at = Some(at);
         self.verified_by = by;
     }
+
+    /// Add `link`; `false` (and no change) when the same link exists.
+    ///
+    /// Links are curation metadata, like a verification: `updated_at` is left
+    /// alone, so "last edited" keeps meaning the node's own content.
+    pub(crate) fn add_link(&mut self, link: Link) -> bool {
+        if self.links.contains(&link) {
+            return false;
+        }
+        self.links.push(link);
+        true
+    }
+
+    /// Remove the links to `target` (only those of type `rel` when given).
+    /// Returns how many were removed. `updated_at` is left alone.
+    pub(crate) fn remove_links_to(&mut self, target: NodeId, rel: Option<&str>) -> usize {
+        let before = self.links.len();
+        self.links
+            .retain(|l| !(l.target == target && rel.is_none_or(|r| l.rel == r)));
+        before - self.links.len()
+    }
+
+    /// Remove every link whose target is in `targets`; returns how many.
+    /// `updated_at` is left alone (the node itself did not change).
+    pub(crate) fn remove_links_into(
+        &mut self,
+        targets: &std::collections::HashSet<NodeId>,
+    ) -> usize {
+        let before = self.links.len();
+        self.links.retain(|l| !targets.contains(&l.target));
+        before - self.links.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +411,40 @@ mod tests {
         assert_eq!(node.status(), NodeStatus::Active);
         assert!(node.updated_at().is_none());
         assert!(node.verified_at().is_none() && node.verified_by().is_none());
+        assert!(node.links().is_empty());
+    }
+
+    #[test]
+    fn test_links_are_omitted_until_set_and_round_trip() {
+        let mut node = make_node();
+        assert!(!serde_json::to_string(&node).unwrap().contains("links"));
+        let target = NodeId::new();
+        assert!(node.add_link(Link::new("See_Also", target).unwrap()));
+        assert!(
+            !node.add_link(Link::new("see_also", target).unwrap()),
+            "duplicate"
+        );
+        let json = serde_json::to_string(&node).unwrap();
+        assert!(json.contains("\"rel\":\"see_also\""), "{json}");
+        let back: TemplateNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.links(), node.links());
+        assert_eq!(node.remove_links_to(target, Some("supersedes")), 0);
+        assert_eq!(node.remove_links_to(target, None), 1);
+        assert!(node.links().is_empty());
+    }
+
+    #[test]
+    fn test_link_rel_is_normalized_and_validated() {
+        let t = NodeId::new();
+        assert_eq!(Link::new("  Supersedes ", t).unwrap().rel(), "supersedes");
+        assert_eq!(
+            Link::new("merged-from_2", t).unwrap().rel(),
+            "merged-from_2"
+        );
+        for bad in ["", "   ", "see also", "参照", "a/b", &"x".repeat(41)] {
+            assert!(Link::new(bad, t).is_none(), "{bad:?}");
+        }
+        assert!(Link::new(&"x".repeat(40), t).is_some());
     }
 
     #[test]
