@@ -296,7 +296,7 @@ pub(crate) struct McpBookLintRequest {
     #[schemars(description = "Book to check (from `shelf`). Omit to check the selected book.")]
     pub slug: Option<String>,
     #[schemars(
-        description = "Checks to run (default: all): root_content, similar_titles, property_key_variants, empty_sections, stale_drafts"
+        description = "Checks to run (default: all): root_content, similar_titles, property_key_variants, empty_sections, stale_drafts, dangling_links"
     )]
     pub checks: Option<Vec<String>>,
     #[schemars(
@@ -545,6 +545,14 @@ pub(crate) struct McpNodeQueryRequest {
     )]
     pub text: Option<String>,
     #[schemars(
+        description = "Only nodes with an outgoing link to this node (toc ID or UUID). Combine with `link_rel` to require a link type."
+    )]
+    pub linked_to: Option<String>,
+    #[schemars(
+        description = "With `linked_to`: only links of this type (e.g. 'supersedes'). Ignored without `linked_to`."
+    )]
+    pub link_rel: Option<String>,
+    #[schemars(
         description = "Output format: 'text' (default) or 'json'. Use 'json' when a program \
                        reads the result: the text rendering puts each node's properties on one \
                        line and prefixes only the first line of its body, so a property value \
@@ -563,6 +571,44 @@ pub(crate) struct McpNodeVerifyRequest {
     pub node_ids: Vec<String>,
     #[schemars(description = "Who verified them (free text, e.g. a name). Optional.")]
     pub by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpLinkAddRequest {
+    #[schemars(description = "Source node: toc ID (e.g. '2-3') or UUID.")]
+    pub from: String,
+    #[schemars(description = "Target node in the same book: toc ID or UUID.")]
+    pub to: String,
+    #[schemars(
+        description = "Link type: 1-40 of a-z, 0-9, '_', '-' (lowercased), e.g. 'supersedes', 'superseded_by', 'see_also', 'merged_from'."
+    )]
+    pub rel: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpLinkRemoveRequest {
+    #[schemars(description = "Source node: toc ID or UUID.")]
+    pub from: String,
+    #[schemars(
+        description = "Target node: toc ID or UUID. A target that no longer exists can be named by its full UUID."
+    )]
+    pub to: String,
+    #[schemars(
+        description = "Only links of this type; omit to remove every link from `from` to `to`."
+    )]
+    pub rel: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpLinksRequest {
+    #[schemars(description = "Node whose links to list: toc ID or UUID.")]
+    pub node_id: String,
+    #[schemars(
+        description = "'out' (links this node holds), 'in' (backlinks: links pointing at it) or 'both' (default)."
+    )]
+    pub direction: Option<String>,
+    #[schemars(description = "Only links of this type.")]
+    pub rel: Option<String>,
 }
 
 // =============================================================================

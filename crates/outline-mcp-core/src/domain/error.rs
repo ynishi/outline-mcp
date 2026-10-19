@@ -28,6 +28,16 @@ pub enum DomainError {
     )]
     ConflictingPropertyUpdate(NodeId),
 
+    /// A node cannot link to itself.
+    #[error("node {0} cannot link to itself")]
+    SelfLink(NodeId),
+
+    /// A link type must be 1–40 characters of `a-z`, `0-9`, `_`, `-`.
+    #[error(
+        "invalid link type {0:?}: use 1-40 characters of a-z, 0-9, '_' or '-' (e.g. supersedes, see_also)"
+    )]
+    InvalidLinkRel(String),
+
     /// A book title must not be empty (or whitespace only).
     #[error("book title must not be empty")]
     EmptyBookTitle,

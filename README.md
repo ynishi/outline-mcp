@@ -73,6 +73,7 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
                                    node_history / dump
                                    book_lint / book_stats (read-only health)
                                    node_verify (curation: verification dates)
+                                   link_add / link_remove / links (curation: typed links)
 ```
 
 1. **`init`** — Create a new empty book
@@ -92,9 +93,10 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 15. **`dump`** — Export full book as JSON file
 16. **`book_delete`** — Delete a book with its nodes, history and snapshots (cannot be undone). The slug is required; a book with any nodes, history or snapshots needs `force: true`, and `dry_run: true` only reports what would be removed. A write to the book between the check and the delete makes the delete fail without removing anything
 17. **`book_update`** — Change a book's title and / or `max_depth` (slug required). Lowering `max_depth` below an existing node's depth is refused and names that node; the change appears in `book_history` as a `book_update` entry
-18. **`book_lint`** — Read-only structural checks on a book (`slug` defaults to the selected book): content nodes at the root, similar titles (Jaccard over title words; character pairs for CJK; `threshold` default 0.6; pairs where both titles are a single token are skipped unless the titles are identical), property keys differing only by case / `_` / `-` / spaces, sections without children, drafts not updated for `stale_days` (default 90). Archived nodes and everything under an archived section are ignored by every check. `checks` runs a subset; `limit` (default 50) caps findings per check and counts the rest; `format: "json"` for programs
-19. **`book_stats`** — Read-only numbers for a book: node counts, max / mean depth, children per section (max, mean, histogram), counts by status, injected nodes, update recency, distinct property keys; `format: "json"` for programs
+18. **`book_lint`** — Read-only structural checks on a book (`slug` defaults to the selected book): content nodes at the root, similar titles (Jaccard over title words; character pairs for CJK; `threshold` default 0.6; pairs where both titles are a single token are skipped unless the titles are identical), property keys differing only by case / `_` / `-` / spaces, sections without children, drafts not updated for `stale_days` (default 90), and links whose target is not in the book (`dangling_links`). Archived nodes and everything under an archived section are ignored by every check. `checks` runs a subset; `limit` (default 50) caps findings per check and counts the rest; `format: "json"` for programs
+19. **`book_stats`** — Read-only numbers for a book: node counts, max / mean depth, children per section (max, mean, histogram), counts by status, injected nodes, update recency, distinct property keys, links; `format: "json"` for programs
 20. **`node_verify`** — Record that nodes were confirmed to still match reality (`node_ids`, optional `by`): sets their verification time to now without touching content or last-edited time; one history entry per node, one commit. Pair with `node_query` `verified_before` to list what nobody has confirmed lately
+21. **`link_add`** / **`link_remove`** / **`links`** — Typed links between nodes of a book (`rel` such as `supersedes`, `superseded_by`, `see_also`, `merged_from`; any 1–40 of `a-z 0-9 _ -`). Links follow the target's id, so moving it keeps them; removing a node drops the links pointing at it (each holder gets an update in history, in the same commit, and the result says how many were dropped). `links` lists outgoing links and backlinks; `node_query` takes `linked_to` (+ `link_rel`) and its JSON carries `links` / `backlinks` (with each endpoint's status, `archived` included). A link change is recorded in history but, like `node_verify`, leaves the node's `updated_at` alone
 
 ### Node IDs
 

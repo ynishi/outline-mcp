@@ -34,16 +34,20 @@ pub enum LintCheck {
     EmptySections,
     /// Draft nodes not updated for a long time (or never stamped).
     StaleDrafts,
+    /// Links whose target node is not in the book (left by data restored or
+    /// imported from elsewhere).
+    DanglingLinks,
 }
 
 impl LintCheck {
     /// Every check, in report order.
-    pub const ALL: [LintCheck; 5] = [
+    pub const ALL: [LintCheck; 6] = [
         LintCheck::RootContent,
         LintCheck::SimilarTitles,
         LintCheck::PropertyKeyVariants,
         LintCheck::EmptySections,
         LintCheck::StaleDrafts,
+        LintCheck::DanglingLinks,
     ];
 
     /// The snake_case name used on the wire.
@@ -54,6 +58,7 @@ impl LintCheck {
             LintCheck::PropertyKeyVariants => "property_key_variants",
             LintCheck::EmptySections => "empty_sections",
             LintCheck::StaleDrafts => "stale_drafts",
+            LintCheck::DanglingLinks => "dangling_links",
         }
     }
 
@@ -160,6 +165,7 @@ pub fn lint(book: &TemplateBook, opts: &LintOptions) -> LintReport {
             LintCheck::PropertyKeyVariants => property_key_variants(&order),
             LintCheck::EmptySections => empty_sections(&order),
             LintCheck::StaleDrafts => stale_drafts(&order, opts.stale_days, opts.now),
+            LintCheck::DanglingLinks => dangling_links(book, &order),
         };
         let left_out = found.len().saturating_sub(opts.limit);
         omitted.insert(check, left_out);
@@ -183,6 +189,28 @@ fn root_content(book: &TemplateBook, order: &[&TemplateNode]) -> Vec<LintFinding
             nodes: vec![n.id()],
             detail: format!("\"{}\" is a content node at the root", n.title()),
             score: None,
+        })
+        .collect()
+}
+
+fn dangling_links(book: &TemplateBook, order: &[&TemplateNode]) -> Vec<LintFinding> {
+    order
+        .iter()
+        .flat_map(|n| {
+            n.links()
+                .iter()
+                .filter(|l| book.get_node(l.target()).is_none())
+                .map(move |l| LintFinding {
+                    kind: LintCheck::DanglingLinks,
+                    nodes: vec![n.id()],
+                    detail: format!(
+                        "\"{}\" has a {} link to {}, which is not in the book",
+                        n.title(),
+                        l.rel(),
+                        l.target()
+                    ),
+                    score: None,
+                })
         })
         .collect()
 }
@@ -525,6 +553,8 @@ pub struct BookStats {
     pub updated: UpdatedStats,
     /// Distinct property keys across the book.
     pub property_keys: usize,
+    /// Typed links across the book (outgoing links of every node).
+    pub links: usize,
 }
 
 fn bucket(n: usize) -> &'static str {
@@ -632,6 +662,7 @@ pub fn stats(book: &TemplateBook, now: Timestamp) -> BookStats {
         injected,
         updated,
         property_keys: keys.len(),
+        links: book.link_count(),
     }
 }
 
@@ -1200,5 +1231,56 @@ mod tests {
 
         let b = without_updated_at(&b, n);
         assert_eq!(stats(&b, Timestamp::now()).updated.unknown, 1);
+    }
+
+    /// `book` with node `gone` cut out of the serialized tree but every link
+    /// to it left in place — what restoring data from elsewhere can leave.
+    fn without_node_keeping_links(book: &TemplateBook, gone: NodeId) -> TemplateBook {
+        let mut v = serde_json::to_value(book).unwrap();
+        let key = gone.to_string();
+        v["nodes"].as_object_mut().unwrap().remove(&key);
+        v["root_nodes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|x| x.as_str() != Some(key.as_str()));
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn dangling_links_reports_links_to_missing_nodes_only() {
+        let mut b = TemplateBook::new("B", 4);
+        let a = add(&mut b, None, "A", NodeType::Section);
+        let t = add(&mut b, None, "Target", NodeType::Section);
+        let k = add(&mut b, None, "Kept", NodeType::Section);
+        b.add_link(a, t, "supersedes").unwrap();
+        b.add_link(a, k, "see_also").unwrap();
+        assert!(lint(&b, &only(LintCheck::DanglingLinks))
+            .findings
+            .is_empty());
+
+        let b = without_node_keeping_links(&b, t);
+        let f = lint(&b, &only(LintCheck::DanglingLinks)).findings;
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].nodes, vec![a]);
+        assert!(f[0].detail.contains("supersedes") && f[0].detail.contains(&t.to_string()));
+        assert!(
+            LintCheck::ALL.contains(&LintCheck::DanglingLinks),
+            "in the default set"
+        );
+        assert_eq!(
+            LintCheck::parse("dangling_links"),
+            Some(LintCheck::DanglingLinks)
+        );
+    }
+
+    #[test]
+    fn stats_counts_links() {
+        let mut b = TemplateBook::new("B", 4);
+        let a = add(&mut b, None, "A", NodeType::Section);
+        let c = add(&mut b, None, "C", NodeType::Section);
+        assert_eq!(stats(&b, Timestamp::now()).links, 0);
+        b.add_link(a, c, "x").unwrap();
+        b.add_link(c, a, "y").unwrap();
+        assert_eq!(stats(&b, Timestamp::now()).links, 2);
     }
 }

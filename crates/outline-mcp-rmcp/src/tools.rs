@@ -10,26 +10,28 @@ use outline_mcp_core::application::eject::{EjectConfig, EjectFormat, EjectServic
 
 use crate::helpers::{
     archived_hidden_count, archived_hidden_line, build_hierarchical_ids, describe_book_update,
-    describe_descendants, describe_subtree_change, describe_subtrees_change, find_hierarchical_id,
-    format_toc, format_toc_limited, id_suffix,
+    describe_descendants, describe_endpoint, describe_subtree_change, describe_subtrees_change,
+    dropped_links_line, endpoint_status, find_hierarchical_id, format_toc, format_toc_limited,
+    id_suffix, links_line,
 };
 use crate::request::{
     normalize_text, parse_node_id, parse_node_status, parse_node_type, sanitize_for_filename,
     unescape_newlines, validate_filename, validate_import_path, validate_slug, McpBatchMoveRequest,
     McpBatchUpdateRequest, McpBookDeleteRequest, McpBookHistoryRequest, McpBookLintRequest,
     McpBookStatsRequest, McpBookUpdateRequest, McpDumpRequest, McpEjectRequest,
-    McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpNodeCreateRequest,
-    McpNodeHistoryRequest, McpNodeMoveRequest, McpNodeQueryRequest, McpNodeUpdateRequest,
-    McpNodeVerifyRequest, McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest,
-    McpSnapshotDeleteRequest, McpSnapshotDiffRequest, McpSnapshotDumpAllRequest,
-    McpSnapshotDumpRequest, McpSnapshotListRequest, McpSnapshotRestoreRequest,
-    McpSnapshotTagRequest, McpTocRequest,
+    McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpLinkAddRequest,
+    McpLinkRemoveRequest, McpLinksRequest, McpNodeCreateRequest, McpNodeHistoryRequest,
+    McpNodeMoveRequest, McpNodeQueryRequest, McpNodeUpdateRequest, McpNodeVerifyRequest,
+    McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest, McpSnapshotDeleteRequest,
+    McpSnapshotDiffRequest, McpSnapshotDumpAllRequest, McpSnapshotDumpRequest,
+    McpSnapshotListRequest, McpSnapshotRestoreRequest, McpSnapshotTagRequest, McpTocRequest,
 };
 use crate::server::OutlineMcpServer;
 
 use outline_mcp_core::domain::model::book::AddNodeRequest;
 use outline_mcp_core::domain::model::book::UpdateNodeRequest;
 use outline_mcp_core::domain::model::changelog::{ChangeAction, NodeStatus};
+use outline_mcp_core::domain::model::node::normalize_rel;
 use outline_mcp_core::domain::model::timestamp::Timestamp;
 use outline_mcp_core::domain::search::TextQuery;
 
@@ -197,6 +199,165 @@ impl OutlineMcpServer {
     }
 
     #[tool(
+        name = "link_add",
+        description = "Add a typed link from one node to another node of the selected book (e.g. rel 'supersedes', 'superseded_by', 'see_also', 'merged_from'; any 1-40 of a-z 0-9 _ -). Links follow the target's id, so moving the target keeps them; removing a node drops the links pointing at it. Recorded in history as an update of the source node. Adding an existing link changes nothing. List links with `links`.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn link_add(
+        &self,
+        Parameters(req): Parameters<McpLinkAddRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service().await?;
+        let from = self.resolve_id(&req.from).await?;
+        let to = self.resolve_id(&req.to).await?;
+        let added = svc
+            .add_link(from, to, &req.rel)
+            .await
+            .map_err(Self::to_mcp_error)?;
+        let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
+        let rel = normalize_rel(&req.rel).unwrap_or_else(|| req.rel.clone());
+        let msg = if added {
+            format!(
+                "Linked: {}\n  —{rel}→ {}",
+                describe_endpoint(&book, from),
+                describe_endpoint(&book, to)
+            )
+        } else {
+            format!(
+                "Already linked (nothing changed): {}\n  —{rel}→ {}",
+                describe_endpoint(&book, from),
+                describe_endpoint(&book, to)
+            )
+        };
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            msg,
+        )]))
+    }
+
+    #[tool(
+        name = "link_remove",
+        description = "Remove the links from one node to another (only those of type `rel` when given, every type otherwise). Recorded in history as an update of the source node. A target that no longer exists can be named by its full UUID (see `book_lint` dangling_links).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn link_remove(
+        &self,
+        Parameters(req): Parameters<McpLinkRemoveRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let svc = self.service().await?;
+        let from = self.resolve_id(&req.from).await?;
+        let to = self.resolve_id(&req.to).await?;
+        let removed = svc
+            .remove_link(from, to, req.rel.as_deref())
+            .await
+            .map_err(Self::to_mcp_error)?;
+        let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
+        let what = match req.rel.as_deref() {
+            Some(r) => format!(
+                "{} link(s)",
+                normalize_rel(r).unwrap_or_else(|| r.to_string())
+            ),
+            None => "link(s)".to_string(),
+        };
+        let msg = if removed == 0 {
+            format!(
+                "No {what} from {} to {} (nothing changed).",
+                describe_endpoint(&book, from),
+                describe_endpoint(&book, to)
+            )
+        } else {
+            format!(
+                "Removed {removed} {what}: {}\n  → {}",
+                describe_endpoint(&book, from),
+                describe_endpoint(&book, to)
+            )
+        };
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            msg,
+        )]))
+    }
+
+    #[tool(
+        name = "links",
+        description = "List a node's links: outgoing (`direction: \"out\"`), incoming backlinks (`\"in\"`), or both (default). Optional `rel` filters by type. Each line gives the toc ID, title, [archived] mark and UUID of the other end; a target no longer in the book is shown as such.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn links(
+        &self,
+        Parameters(req): Parameters<McpLinksRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let (show_out, show_in) = match req.direction.as_deref().unwrap_or("both") {
+            "out" => (true, false),
+            "in" => (false, true),
+            "both" => (true, true),
+            other => {
+                return Err(McpError::invalid_params(
+                    format!("direction must be 'out', 'in' or 'both', not {other:?}"),
+                    None,
+                ))
+            }
+        };
+        let rel = match req.rel.as_deref() {
+            Some(r) => Some(normalize_rel(r).ok_or_else(|| {
+                McpError::invalid_params(format!("invalid link type {r:?}"), None)
+            })?),
+            None => None,
+        };
+        let svc = self.service().await?;
+        let id = self.resolve_id(&req.node_id).await?;
+        let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
+        let node = book
+            .get_node(id)
+            .ok_or_else(|| McpError::invalid_params(format!("No node {id} in this book."), None))?;
+        let keep = |r: &str| rel.as_deref().is_none_or(|want| want == r);
+
+        let mut msg = format!("# Links of {}\n", describe_endpoint(&book, id));
+        if show_out {
+            let out: Vec<_> = node.links().iter().filter(|l| keep(l.rel())).collect();
+            msg.push_str(&format!("\n## Outgoing ({})\n", out.len()));
+            for l in out {
+                msg.push_str(&format!(
+                    "- {} → {}\n",
+                    l.rel(),
+                    describe_endpoint(&book, l.target())
+                ));
+            }
+        }
+        if show_in {
+            let incoming: Vec<_> = book
+                .backlinks(id)
+                .into_iter()
+                .filter(|(_, l)| keep(l.rel()))
+                .collect();
+            msg.push_str(&format!("\n## Incoming ({})\n", incoming.len()));
+            for (src, l) in incoming {
+                msg.push_str(&format!(
+                    "- {} ← {}\n",
+                    l.rel(),
+                    describe_endpoint(&book, src)
+                ));
+            }
+        }
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            msg,
+        )]))
+    }
+
+    #[tool(
         name = "node_move",
         description = "Move or delete a node together with all of its descendants. Specify node by ID from `toc` output (e.g. '2-3'). Action 'move' relocates, 'remove' deletes. The result names the descendants that went with it. Pass `dry_run: true` to see exactly which nodes would move or be removed (old → new positions) without changing anything. History: a remove records a delete for the node and every descendant; a move records a move for the node only (its descendants keep their parent).",
         annotations(
@@ -281,6 +442,7 @@ impl OutlineMcpServer {
                     .map(|n| n.title().to_string())
                     .unwrap_or_default();
                 let descendants = describe_descendants(&book, id, "and");
+                let dropped = dropped_links_line(&book, id);
 
                 if req.dry_run {
                     let (before, after) = svc
@@ -289,8 +451,9 @@ impl OutlineMcpServer {
                         .map_err(Self::to_mcp_error)?;
                     let n = 1 + before.descendant_ids(id).len();
                     let msg = format!(
-                        "Dry run: would remove {n} node(s):\n{}Nothing changed.",
-                        describe_subtree_change(&before, &after, id)
+                        "Dry run: would remove {n} node(s):\n{}{}Nothing changed.",
+                        describe_subtree_change(&before, &after, id),
+                        dropped.replace("Dropped", "Would drop")
                     );
                     return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
                         msg,
@@ -305,6 +468,10 @@ impl OutlineMcpServer {
                     descendants,
                     id_suffix(id)
                 );
+                if !dropped.is_empty() {
+                    msg.push('\n');
+                    msg.push_str(dropped.trim_end());
+                }
                 if let Some(w) = warning {
                     msg.push_str(&format!("\n[WARNING] {w}"));
                 }
@@ -618,7 +785,7 @@ impl OutlineMcpServer {
 
     #[tool(
         name = "book_lint",
-        description = "Check a book for structural smells, read-only: content nodes at the root (root_content), pairs of nodes with similar titles (similar_titles; Jaccard over title words, character pairs for CJK; two single-token titles are paired only when identical), property keys that differ only by case / `_` / `-` / spaces (property_key_variants), sections without children (empty_sections), and drafts not updated for `stale_days` (stale_drafts). Archived nodes and everything under an archived section are ignored. Reports node toc IDs and UUIDs; changes nothing. `slug` defaults to the selected book. Use `format: \"json\"` when a program reads the result.",
+        description = "Check a book for structural smells, read-only: content nodes at the root (root_content), pairs of nodes with similar titles (similar_titles; Jaccard over title words, character pairs for CJK; two single-token titles are paired only when identical), property keys that differ only by case / `_` / `-` / spaces (property_key_variants), sections without children (empty_sections), drafts not updated for `stale_days` (stale_drafts), and links whose target is not in the book (dangling_links). Archived nodes and everything under an archived section are ignored. Reports node toc IDs and UUIDs; changes nothing. `slug` defaults to the selected book. Use `format: \"json\"` when a program reads the result.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2062,6 +2229,22 @@ impl OutlineMcpServer {
         if let Some(ref q) = text_query {
             nodes.retain(|n| q.matches(n));
         }
+
+        if let Some(ref to) = req.linked_to {
+            let target = self.resolve_id(to).await?;
+            let rel = match req.link_rel.as_deref() {
+                Some(r) => Some(normalize_rel(r).ok_or_else(|| {
+                    McpError::invalid_params(format!("link_rel: invalid link type {r:?}"), None)
+                })?),
+                None => None,
+            };
+            nodes.retain(|n| {
+                n.links()
+                    .iter()
+                    .any(|l| l.target() == target && rel.as_deref().is_none_or(|r| l.rel() == r))
+            });
+        }
+
         let snippet = |node: &outline_mcp_core::domain::model::node::TemplateNode| {
             text_query
                 .as_ref()
@@ -2074,6 +2257,8 @@ impl OutlineMcpServer {
         // caller that asked for JSON must get JSON then too — otherwise the
         // quiet day is the one that breaks it.
         if parse_query_format(req.format.as_deref())? == QueryFormat::Json {
+            // One pass over the book for every node's backlinks.
+            let backlink_index = book.backlink_index();
             let out = serde_json::json!({
                 "matches": nodes.len(),
                 "nodes": nodes.iter().map(|node| {
@@ -2094,6 +2279,23 @@ impl OutlineMcpServer {
                         // able to tell "this node has no properties" from
                         // "properties did not come back".
                         "properties": node.properties(),
+                        // Outgoing links; always an array.
+                        // `target_status` / `source_status`: "active", "draft",
+                        // "archived" (also for a node under an archived
+                        // section) or "missing" (not in the book).
+                        "links": node.links().iter().map(|l| serde_json::json!({
+                            "rel": l.rel(),
+                            "target": l.target().to_string(),
+                            "target_title": book.get_node(l.target()).map(|t| t.title()),
+                            "target_status": endpoint_status(&book, l.target()),
+                        })).collect::<Vec<_>>(),
+                        // Incoming links (derived from the book); always an array.
+                        "backlinks": backlink_index.get(&node.id()).map(|v| v.as_slice()).unwrap_or(&[]).iter().map(|(src, l)| serde_json::json!({
+                            "rel": l.rel(),
+                            "source": src.to_string(),
+                            "source_title": book.get_node(*src).map(|s| s.title()),
+                            "source_status": endpoint_status(&book, *src),
+                        })).collect::<Vec<_>>(),
                     });
                     // Present only when asked for, so "I did not request the
                     // body" and "the body is empty" stay distinguishable.
@@ -2156,6 +2358,10 @@ impl OutlineMcpServer {
                     .collect::<Vec<_>>()
                     .join(", ");
                 output.push_str(&format!("   Properties: {}\n", props_str));
+            }
+            let links = links_line(&book, node);
+            if !links.is_empty() {
+                output.push_str(&format!("   {links}\n"));
             }
             if let Some(s) = snippet(node) {
                 output.push_str(&format!("   Match: {}\n", s));
@@ -2820,6 +3026,8 @@ mod ergonomics_tool_tests {
             verified_before: None,
             subtree_root: None,
             text: Some(text.into()),
+            linked_to: None,
+            link_rel: None,
             format: None,
         }
     }
@@ -3477,6 +3685,8 @@ mod archived_verify_tool_tests {
             verified_before: None,
             subtree_root: None,
             text: None,
+            linked_to: None,
+            link_rel: None,
             format: None,
         }
     }
@@ -3777,5 +3987,378 @@ mod archived_verify_tool_tests {
         // The stored book is unchanged.
         let t = text(&s.toc(Parameters(toc(true))).await.unwrap());
         assert!(t.contains("Old [archived]"), "{t}");
+    }
+}
+
+#[cfg(test)]
+mod link_tool_tests {
+    use std::sync::Arc;
+
+    use outline_mcp_core::infra::memory_store::{MemoryBookStore, MemorySnapshotStore};
+
+    use super::*;
+    use crate::server::Storage;
+
+    async fn server() -> OutlineMcpServer {
+        let s = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        s.service_for("l")
+            .await
+            .unwrap()
+            .create_book("L", 4)
+            .await
+            .unwrap();
+        *s.selected.write().unwrap() = Some("l".into());
+        s
+    }
+
+    fn text(r: &CallToolResult) -> String {
+        r.content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn node(s: &OutlineMcpServer, parent: Option<&str>, title: &str) {
+        s.node_create(Parameters(McpNodeCreateRequest {
+            parent: parent.map(str::to_string),
+            title: title.into(),
+            node_type: "section".into(),
+            body: None,
+            placeholder: None,
+            position: None,
+            properties: None,
+        }))
+        .await
+        .expect("create");
+    }
+
+    async fn link(
+        s: &OutlineMcpServer,
+        from: &str,
+        to: &str,
+        rel: &str,
+    ) -> Result<String, McpError> {
+        s.link_add(Parameters(McpLinkAddRequest {
+            from: from.into(),
+            to: to.into(),
+            rel: rel.into(),
+        }))
+        .await
+        .map(|r| text(&r))
+    }
+
+    async fn list(s: &OutlineMcpServer, id: &str, direction: Option<&str>) -> String {
+        text(
+            &s.links(Parameters(McpLinksRequest {
+                node_id: id.into(),
+                direction: direction.map(str::to_string),
+                rel: None,
+            }))
+            .await
+            .expect("links"),
+        )
+    }
+
+    async fn history_len(s: &OutlineMcpServer) -> usize {
+        s.service().await.unwrap().history().await.unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn add_list_and_remove_links_both_directions() {
+        let s = server().await;
+        node(&s, None, "A").await;
+        node(&s, None, "B").await;
+        node(&s, None, "C").await;
+
+        let t = link(&s, "1", "2", "Supersedes").await.unwrap();
+        assert!(
+            t.starts_with("Linked: 1. A") && t.contains("—supersedes→ 2. B"),
+            "{t}"
+        );
+        link(&s, "3", "2", "see_also").await.unwrap();
+        let h = history_len(&s).await;
+        let t = link(&s, "1", "2", "supersedes").await.unwrap();
+        assert!(t.starts_with("Already linked"), "{t}");
+        assert_eq!(history_len(&s).await, h, "duplicate committed nothing");
+
+        let t = list(&s, "2", Some("in")).await;
+        assert!(t.contains("## Incoming (2)"), "{t}");
+        assert!(
+            t.contains("supersedes ← 1. A") && t.contains("see_also ← 3. C"),
+            "{t}"
+        );
+        assert!(!t.contains("Outgoing"), "{t}");
+        let t = list(&s, "1", None).await;
+        assert!(
+            t.contains("## Outgoing (1)") && t.contains("## Incoming (0)"),
+            "{t}"
+        );
+
+        let r = s
+            .link_remove(Parameters(McpLinkRemoveRequest {
+                from: "3".into(),
+                to: "2".into(),
+                rel: None,
+            }))
+            .await
+            .unwrap();
+        assert!(text(&r).starts_with("Removed 1 link(s)"), "{}", text(&r));
+        assert!(list(&s, "2", Some("in")).await.contains("## Incoming (1)"));
+    }
+
+    #[tokio::test]
+    async fn self_links_bad_types_and_bad_direction_are_refused() {
+        let s = server().await;
+        node(&s, None, "A").await;
+        node(&s, None, "B").await;
+        let h = history_len(&s).await;
+        assert!(link(&s, "1", "1", "x").await.is_err());
+        let e = link(&s, "1", "2", "see also").await.unwrap_err();
+        assert!(e.message.contains("invalid link type"), "{}", e.message);
+        assert_eq!(history_len(&s).await, h, "nothing committed");
+        let e = s
+            .links(Parameters(McpLinksRequest {
+                node_id: "1".into(),
+                direction: Some("sideways".into()),
+                rel: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(e.message.contains("direction"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn moving_the_target_keeps_backlinks() {
+        let s = server().await;
+        node(&s, None, "A").await;
+        node(&s, None, "Holder").await;
+        node(&s, None, "B").await;
+        link(&s, "1", "3", "see_also").await.unwrap();
+        s.node_move(Parameters(McpNodeMoveRequest {
+            node_id: "3".into(),
+            action: "move".into(),
+            new_parent: Some("2".into()),
+            position: None,
+            dry_run: false,
+        }))
+        .await
+        .unwrap();
+        let t = list(&s, "2-1", Some("in")).await;
+        assert!(
+            t.contains("## Incoming (1)") && t.contains("see_also ← 1. A"),
+            "{t}"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_the_target_reports_and_drops_incoming_links() {
+        let s = server().await;
+        node(&s, None, "A").await;
+        node(&s, None, "B").await;
+        node(&s, Some("2"), "B child").await;
+        node(&s, None, "C").await;
+        link(&s, "1", "2", "supersedes").await.unwrap();
+        link(&s, "3", "2-1", "see_also").await.unwrap();
+        link(&s, "1", "3", "see_also").await.unwrap();
+
+        let dry = |dry_run| McpNodeMoveRequest {
+            node_id: "2".into(),
+            action: "remove".into(),
+            new_parent: None,
+            position: None,
+            dry_run,
+        };
+        let t = text(&s.node_move(Parameters(dry(true))).await.unwrap());
+        assert!(t.contains("Would drop 2 link(s)"), "{t}");
+        let t = text(&s.node_move(Parameters(dry(false))).await.unwrap());
+        let mut lines = t.lines();
+        let first = lines.next().unwrap();
+        assert!(
+            first.starts_with("Removed: 2. B") && first.ends_with(')'),
+            "{t}"
+        );
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .starts_with("Dropped 2 link(s) pointing at the removed nodes, from: A, C"),
+            "{t}"
+        );
+        // A keeps its link to C (now 2), C keeps nothing.
+        let t = list(&s, "1", Some("out")).await;
+        assert!(
+            t.contains("## Outgoing (1)") && t.contains("see_also → 2. C"),
+            "{t}"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_query_filters_by_link_and_reports_links_in_json() {
+        let s = server().await;
+        node(&s, None, "Old").await;
+        node(&s, None, "New").await;
+        node(&s, None, "Other").await;
+        link(&s, "2", "1", "supersedes").await.unwrap();
+        link(&s, "3", "1", "see_also").await.unwrap();
+
+        let q = |rel: Option<&str>, format: Option<&str>| McpNodeQueryRequest {
+            filter: None,
+            include_body: false,
+            kind: None,
+            status: None,
+            include_archived: false,
+            verified_before: None,
+            subtree_root: None,
+            text: None,
+            linked_to: Some("1".into()),
+            link_rel: rel.map(str::to_string),
+            format: format.map(str::to_string),
+        };
+        let t = text(&s.node_query(Parameters(q(None, None))).await.unwrap());
+        assert!(t.contains("(2 matches)"), "{t}");
+        assert!(t.contains("Links: supersedes → Old"), "{t}");
+        let t = text(
+            &s.node_query(Parameters(q(Some("supersedes"), None)))
+                .await
+                .unwrap(),
+        );
+        assert!(t.contains("(1 matches)") && t.contains("New"), "{t}");
+
+        let mut all = q(None, Some("json"));
+        all.linked_to = None;
+        let r = s.node_query(Parameters(all)).await.unwrap();
+        let v = r.structured_content.expect("json");
+        let old = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["title"] == "Old")
+            .unwrap();
+        assert_eq!(old["links"].as_array().unwrap().len(), 0);
+        let back = old["backlinks"].as_array().unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0]["rel"], "supersedes");
+        assert_eq!(back[0]["source_title"], "New");
+    }
+
+    fn query_req(linked_to: Option<&str>, link_rel: Option<&str>) -> McpNodeQueryRequest {
+        McpNodeQueryRequest {
+            filter: None,
+            include_body: false,
+            kind: None,
+            status: None,
+            include_archived: true,
+            verified_before: None,
+            subtree_root: None,
+            text: None,
+            linked_to: linked_to.map(str::to_string),
+            link_rel: link_rel.map(str::to_string),
+            format: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn node_query_rejects_an_invalid_link_rel() {
+        let s = server().await;
+        node(&s, None, "A").await;
+        let e = s
+            .node_query(Parameters(query_req(Some("1"), Some("see also"))))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{e:?}");
+        assert!(e.message.contains("link_rel"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn link_endpoints_report_archived_status() {
+        let s = server().await;
+        node(&s, None, "Old").await;
+        node(&s, None, "New").await;
+        node(&s, None, "Retired source").await;
+        link(&s, "2", "1", "supersedes").await.unwrap();
+        link(&s, "3", "2", "see_also").await.unwrap();
+        for id in ["1", "3"] {
+            s.node_update(Parameters(McpNodeUpdateRequest {
+                node_id: id.into(),
+                title: None,
+                body: None,
+                node_type: None,
+                placeholder: None,
+                properties: None,
+                properties_patch: None,
+                status: Some("archived".into()),
+            }))
+            .await
+            .expect("archive");
+        }
+
+        // Text: New's outgoing link points at an archived node.
+        let t = text(
+            &s.node_query(Parameters(query_req(Some("1"), None)))
+                .await
+                .unwrap(),
+        );
+        assert!(t.contains("Links: supersedes → Old [archived]"), "{t}");
+
+        // JSON: target_status on New's link, source_status on New's backlink.
+        let mut q = query_req(None, None);
+        q.format = Some("json".into());
+        let v = s
+            .node_query(Parameters(q))
+            .await
+            .unwrap()
+            .structured_content
+            .expect("json");
+        let new = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["title"] == "New")
+            .unwrap();
+        assert_eq!(new["links"][0]["target_status"], "archived", "{new}");
+        assert_eq!(new["backlinks"][0]["source_status"], "archived", "{new}");
+        let old = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["title"] == "Old")
+            .unwrap();
+        assert_eq!(old["backlinks"][0]["source_status"], "active", "{old}");
+    }
+
+    #[tokio::test]
+    async fn link_remove_clears_a_dangling_target_by_full_uuid() {
+        let s = server().await;
+        node(&s, None, "A").await;
+        let svc = s.service().await.unwrap();
+        let book = svc.read_tree().await.unwrap();
+        let a = book.root_nodes()[0];
+        let gone = outline_mcp_core::domain::model::id::NodeId::new().to_string();
+
+        // A link whose target is not in the book, as restored or imported
+        // older data can carry: built through the stored JSON shape.
+        let mut v = serde_json::to_value(&book).unwrap();
+        let node = &mut v["nodes"][a.to_string()];
+        node["links"] = serde_json::json!([{ "rel": "see_also", "target": gone }]);
+        let dangling: outline_mcp_core::domain::model::book::TemplateBook =
+            serde_json::from_value(v).unwrap();
+        assert_eq!(dangling.dangling_links().len(), 1);
+        svc.import_book(&dangling).await.unwrap();
+
+        let r = s
+            .link_remove(Parameters(McpLinkRemoveRequest {
+                from: "1".into(),
+                to: gone.clone(),
+                rel: None,
+            }))
+            .await
+            .expect("remove dangling");
+        assert!(text(&r).starts_with("Removed 1 link(s)"), "{}", text(&r));
+        let book = svc.read_tree().await.unwrap();
+        assert!(book.dangling_links().is_empty());
     }
 }

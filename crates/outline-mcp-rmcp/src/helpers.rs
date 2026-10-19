@@ -111,6 +111,109 @@ pub(crate) fn id_suffix(id: NodeId) -> String {
     format!(" (id: {id})")
 }
 
+/// `2-1. Title [archived] (id: <uuid>)` for a link endpoint, or
+/// `(not in the book) (id: <uuid>)` when the node no longer exists.
+pub(crate) fn describe_endpoint(book: &TemplateBook, id: NodeId) -> String {
+    match book.get_node(id) {
+        Some(n) => {
+            let hier = find_hierarchical_id(book, id).unwrap_or_else(|| id.short().to_string());
+            let archived = if book.is_archived_or_under_archived(id) {
+                " [archived]"
+            } else {
+                ""
+            };
+            format!("{hier}. {}{archived}{}", n.title(), id_suffix(id))
+        }
+        None => format!("(not in the book){}", id_suffix(id)),
+    }
+}
+
+/// A link endpoint's status as listings show it: `"archived"` for an archived
+/// node or one under an archived section (as [`describe_endpoint`] marks it),
+/// `"missing"` when the node is not in the book, the node's own status
+/// otherwise.
+pub(crate) fn endpoint_status(book: &TemplateBook, id: NodeId) -> &'static str {
+    match book.get_node(id) {
+        None => "missing",
+        Some(_) if book.is_archived_or_under_archived(id) => "archived",
+        Some(n) => n.status().as_str(),
+    }
+}
+
+/// One compact line listing a node's outgoing links, `rel → title`, for
+/// listings; empty when the node has none. Archived targets are marked
+/// `[archived]`, like the `links` tool does.
+pub(crate) fn links_line(book: &TemplateBook, node: &TemplateNode) -> String {
+    if node.links().is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = node
+        .links()
+        .iter()
+        .map(|l| {
+            let title = book
+                .get_node(l.target())
+                .map(|t| t.title().to_string())
+                .unwrap_or_else(|| "(not in the book)".to_string());
+            let archived = if endpoint_status(book, l.target()) == "archived" {
+                " [archived]"
+            } else {
+                ""
+            };
+            format!(
+                "{} → {}{} ({})",
+                l.rel(),
+                title,
+                archived,
+                l.target().short()
+            )
+        })
+        .collect();
+    format!("Links: {}", parts.join("; "))
+}
+
+/// `Dropped N link(s) pointing at the removed nodes, from: a, b\n` — the
+/// links that removing `id` (with its descendants) takes away from the nodes
+/// that remain — or an empty string when there are none.
+pub(crate) fn dropped_links_line(book: &TemplateBook, id: NodeId) -> String {
+    let removed: std::collections::HashSet<NodeId> =
+        std::iter::once(id).chain(book.descendant_ids(id)).collect();
+    let mut count = 0;
+    let mut holders = Vec::new();
+    for n in book.all_nodes_dfs() {
+        if removed.contains(&n.id()) {
+            continue;
+        }
+        let k = n
+            .links()
+            .iter()
+            .filter(|l| removed.contains(&l.target()))
+            .count();
+        if k > 0 {
+            count += k;
+            holders.push(n.title().to_string());
+        }
+    }
+    if count == 0 {
+        return String::new();
+    }
+    let shown: Vec<_> = holders
+        .iter()
+        .take(DESCENDANT_TITLES_SHOWN)
+        .cloned()
+        .collect();
+    let more = holders.len().saturating_sub(shown.len());
+    format!(
+        "Dropped {count} link(s) pointing at the removed nodes, from: {}{}\n",
+        shown.join(", "),
+        if more > 0 {
+            format!(", … {more} more")
+        } else {
+            String::new()
+        }
+    )
+}
+
 /// At most this many descendant titles are listed in a result line.
 const DESCENDANT_TITLES_SHOWN: usize = 10;
 
