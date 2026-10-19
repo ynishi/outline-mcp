@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.15.2] - 2026-10-19
+
+### Added
+
 - **Read-only browser view at `/ui/`** (`--mcp-http` only): shelf, table of contents with inject / status / verification / pending-revision / link markers (archived subtrees hidden unless `?archived=1`), node pages (rendered Markdown body with raw HTML shown as text, properties, links and backlinks, pending revision diff, history), text search and book history. GET only; no script and no external assets (strict CSP, `no-store`, `no-referrer`). With `OUTLINE_MCP_HTTP_TOKEN` set it takes HTTP Basic with the token as the password; without one it serves loopback `Host`s only. `/mcp` and its bearer check are unchanged, and so is the answer for any path outside `/ui` (bearer 401 with a token set, 404 otherwise). Bodies over 1 MiB are shown as plain text rather than rendered; the shelf computes node counts for the first 200 books and a node page lists its newest 100 history entries.
 
 ### Changed
