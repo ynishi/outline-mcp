@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Browser view search by id** — `/ui/` search also matches a UUID prefix (8 or more hex characters), and `#<toc number>` (for example `#2-3`) opens that node.
+
 ### Changed
 
 ### Deprecated

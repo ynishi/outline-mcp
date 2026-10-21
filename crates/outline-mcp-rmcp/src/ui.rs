@@ -11,7 +11,7 @@
 //! | `/ui/search?book=&q=` | `303 See Other` to the book's search page (the shelf form posts here) |
 //! | `/ui/book/{slug}` | the book's table of contents with markers; archived subtrees hidden unless `?archived=1` |
 //! | `/ui/book/{slug}/node/{uuid}` | one node: breadcrumbs, meta, properties, rendered body, links both ways, pending revision with its diff, children, history |
-//! | `/ui/book/{slug}/search?q=` | nodes whose title or body contains `q` (case-insensitive), with snippets |
+//! | `/ui/book/{slug}/search?q=` | nodes whose title or body contains `q` (case-insensitive), with snippets, preceded by nodes whose id starts with `q` when it is a UUID prefix (8+ hex characters); `q=#<toc number>` (`#2-3`) is a `303 See Other` to that node's page, or a "No node" note followed by the text search |
 //! | `/ui/book/{slug}/history?limit=` | the book's history, newest first |
 //!
 //! Access: when `OUTLINE_MCP_HTTP_TOKEN` is set, every `/ui` request needs
@@ -47,7 +47,9 @@ use outline_mcp_core::domain::search::TextQuery;
 use outline_mcp_core::domain::store::{StoreError, Versioned};
 use serde::Deserialize;
 
-use crate::helpers::{build_hierarchical_ids, describe_book_update, endpoint_status};
+use crate::helpers::{
+    build_hierarchical_ids, describe_book_update, endpoint_status, is_hierarchical_id,
+};
 use crate::render::{escape, markdown, query_value};
 use crate::request::parse_node_id;
 use crate::revision::{proposal_line, revision_diff};
@@ -626,6 +628,28 @@ struct SearchQuery {
     archived: Option<String>,
 }
 
+/// The toc number of a `#<n>` query (`#2-3` gives `2-3`); `None` for any
+/// other query, including `#rust`, which is text. A number with no node
+/// behind it falls back to a text search.
+fn toc_number(q: &str) -> Option<&str> {
+    q.strip_prefix('#')
+        .map(str::trim)
+        .filter(|n| is_hierarchical_id(n))
+}
+
+/// Nodes whose id starts with `q`, when `q` looks like a UUID prefix: 8 or
+/// more characters, hex digits and `-` only, at least 8 of them hex digits.
+fn id_prefix_hits<'a>(q: &str, ids: &'a [(String, NodeId)]) -> Vec<&'a (String, NodeId)> {
+    let hex = q.chars().filter(char::is_ascii_hexdigit).count();
+    if hex < 8 || !q.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Vec::new();
+    }
+    let prefix = q.to_ascii_lowercase();
+    ids.iter()
+        .filter(|(_, id)| id.to_string().starts_with(&prefix))
+        .collect()
+}
+
 async fn book_search(
     State(ui): State<Ui>,
     Path(slug): Path<String>,
@@ -635,6 +659,7 @@ async fn book_search(
     let book = &v.value;
     let archived = flag_on(sq.archived.as_deref());
     let text = sq.q.unwrap_or_default();
+    let q = text.trim();
     let mut body = format!(
         r#"<nav><a href="/ui/">outline</a> / <a href="/ui/book/{slug}">{slug}</a></nav><h1>Search</h1>"#,
         slug = escape(&slug)
@@ -644,16 +669,27 @@ async fn book_search(
         return Ok(page("search", &body));
     };
     let ids = build_hierarchical_ids(book);
+    if let Some(num) = toc_number(q) {
+        if let Some((_, id)) = ids.iter().find(|(n, _)| n == num) {
+            return Ok(Redirect::to(&format!("/ui/book/{slug}/node/{id}")).into_response());
+        }
+        // No such node: say so, then search the text (`#12` may be an
+        // issue reference written in a body).
+        body.push_str(&format!("<p>No node at #{}.</p>", escape(num)));
+    }
+    // Id-prefix hits first, then text hits in toc order, none twice.
+    let id_hits = id_prefix_hits(q, &ids);
+    let text_hits = ids.iter().filter(|(_, id)| {
+        !id_hits.iter().any(|(_, i)| i == id)
+            && book.get_node(*id).is_some_and(|n| query.matches(n))
+    });
     let mut hits = 0usize;
     let mut skipped_archived = 0usize;
     body.push_str(r#"<ul class="hits">"#);
-    for (num, id) in &ids {
+    for (num, id) in id_hits.iter().copied().chain(text_hits) {
         let Some(n) = book.get_node(*id) else {
             continue;
         };
-        if !query.matches(n) {
-            continue;
-        }
         if !archived && book.is_archived_or_under_archived(*id) {
             skipped_archived += 1;
             continue;
@@ -902,7 +938,7 @@ fn book_links(slug: &str, archived: bool) -> String {
 
 fn search_form(slug: &str, q: &str) -> String {
     format!(
-        r#"<form action="/ui/book/{}/search" method="get"><input type="search" name="q" value="{}" placeholder="search titles and bodies"> <button type="submit">search</button></form>"#,
+        r#"<form action="/ui/book/{}/search" method="get"><input type="search" name="q" value="{}" placeholder="search titles, bodies, id prefix; #2-3 for a toc number"> <button type="submit">search</button></form>"#,
         escape(slug),
         escape(q),
     )
@@ -923,7 +959,7 @@ fn shelf_search_form(slugs: &[&str], selected: &str, q: &str) -> String {
         })
         .collect();
     format!(
-        r#"<form action="/ui/search" method="get"><select name="book">{options}</select> <input type="search" name="q" value="{}" placeholder="search titles and bodies"> <button type="submit">search</button></form>"#,
+        r#"<form action="/ui/search" method="get"><select name="book">{options}</select> <input type="search" name="q" value="{}" placeholder="search titles, bodies, id prefix; #2-3 for a toc number"> <button type="submit">search</button></form>"#,
         escape(q),
     )
 }
@@ -1276,6 +1312,109 @@ mod tests {
         let (_, body, _) = open(&f, "/ui/book/b/search?q=%3Cscript%3E%22").await;
         assert!(!body.contains("<script"), "{body}");
         assert!(body.contains("&lt;script&gt;&quot;"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_toc_number_redirects_to_the_node() {
+        let f = fixture().await;
+        let (s, _, r) = open(&f, "/ui/book/b/search?q=%231").await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(
+            r.headers()[header::LOCATION].to_str().unwrap(),
+            format!("/ui/book/b/node/{}", f.root)
+        );
+        let (s, _, r) = open(&f, "/ui/book/b/search?q=%20%231-1%20").await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(
+            r.headers()[header::LOCATION].to_str().unwrap(),
+            format!("/ui/book/b/node/{}", f.child)
+        );
+        // archived nodes are reachable too
+        let (s, _, r) = open(&f, "/ui/book/b/search?q=%232-1").await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(
+            r.headers()[header::LOCATION].to_str().unwrap(),
+            format!("/ui/book/b/node/{}", f.old)
+        );
+        let (s, body, _) = open(&f, "/ui/book/b/search?q=%239").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains("<p>No node at #9.</p>"), "{body}");
+        assert!(body.contains(r##"value="#9""##), "{body}");
+        assert!(!body.contains("/ui/book/b/node/"), "{body}");
+        // ...and falls back to the text search
+        assert!(body.contains("No match."), "{body}");
+        // not a toc number: plain text search
+        for q in ["%23abc", "%23", "1"] {
+            let (s, body, _) = open(&f, &format!("/ui/book/b/search?q={q}")).await;
+            assert_eq!(s, StatusCode::OK, "{q}");
+            assert!(!body.contains("No node at"), "{q}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_matches_a_uuid_prefix() {
+        let f = fixture().await;
+        let id = f.child.to_string();
+        let link = format!("/ui/book/b/node/{}", f.child);
+        let (s, body, _) = open(&f, &format!("/ui/book/b/search?q={}", &id[..8])).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains(&link), "{body}");
+        let (_, body, _) = open(&f, &format!("/ui/book/b/search?q={}", id.to_uppercase())).await;
+        assert!(body.contains(&link), "{body}");
+        let (_, body, _) = open(&f, &format!("/ui/book/b/search?q={id}")).await;
+        assert!(body.contains(&link), "{body}");
+        // too short for an id prefix, and no title or body contains it
+        let (_, body, _) = open(&f, &format!("/ui/book/b/search?q={}", &id[..7])).await;
+        assert!(!body.contains(&link), "{body}");
+        assert!(body.contains("No match."), "{body}");
+    }
+
+    #[tokio::test]
+    async fn id_hits_follow_the_archived_rule_and_are_not_repeated() {
+        let f = fixture().await;
+        let old = f.old.to_string();
+        let old_link = format!("/ui/book/b/node/{}", f.old);
+        let uri = format!("/ui/book/b/search?q={}", &old[..8]);
+        let (_, body, _) = open(&f, &uri).await;
+        assert!(!body.contains(&old_link), "{body}");
+        assert!(body.contains("1 archived matches hidden"), "{body}");
+        let (_, body, _) = open(&f, &format!("{uri}&archived=1")).await;
+        assert!(body.contains(&old_link), "{body}");
+        assert!(!body.contains("archived matches hidden"), "{body}");
+
+        // a node matching by id and by text is listed once, id hits first
+        let svc = BookService::new(f.storage.books.clone(), "b");
+        let child = f.child.to_string();
+        svc.update_node(
+            f.old,
+            UpdateNodeRequest {
+                title: None,
+                body: Some(Some(format!("see {}", &child[..8]))),
+                node_type: None,
+                placeholder: None,
+                properties: None,
+                properties_patch: None,
+                status: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (_, body, _) = open(
+            &f,
+            &format!("/ui/book/b/search?q={}&archived=1", &child[..8]),
+        )
+        .await;
+        let child_link = format!("/ui/book/b/node/{}", f.child);
+        assert_eq!(body.matches(&child_link).count(), 1, "{body}");
+        assert!(body.find(&child_link) < body.find(&old_link), "{body}");
+    }
+
+    #[tokio::test]
+    async fn shelf_search_encodes_a_toc_number() {
+        let f = fixture().await;
+        let (s, _, r) = open(&f, "/ui/search?book=b&q=%231").await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(r.headers()[header::LOCATION], "/ui/book/b/search?q=%231");
     }
 
     #[tokio::test]
