@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **Browser view search by id** — `/ui/` search also matches a UUID prefix (8 or more hex characters), and `#<toc number>` (for example `#2-3`) opens that node.
+- **Browser view searches all books** — the shelf's search box now searches every book and groups the hits by book (no book picker; archived books are skipped unless `archived=1`), a book's search page is titled with the book and links to the all-books search, and a node page shows its toc number and short id as separately selectable snippets.
 
 ### Changed
 
