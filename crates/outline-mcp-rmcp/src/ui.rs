@@ -7,11 +7,11 @@
 //!
 //! | route (GET) | shows |
 //! |---|---|
-//! | `/ui/` | the shelf (slug, title, active node count — `active/all` with `?totals=1` —, last update) and a search form; archived books hidden unless `?archived=1` |
-//! | `/ui/search?book=&q=` | `303 See Other` to the book's search page (the shelf form posts here) |
+//! | `/ui/` | the shelf (slug, title, active node count — `active/all` with `?totals=1` —, last update) and a search form that searches all books; archived books hidden unless `?archived=1` |
+//! | `/ui/search?q=` | matches of every book, grouped by book, the same kinds of match as a book's search page (text, UUID prefix, `#<toc number>` listing that node of each book, archived nodes included as on a book's search page); archived books skipped unless `archived=1`, and archived nodes too for text and UUID-prefix matches, at most 200 books searched and 200 rows listed; `?book=<slug>&q=` is still a `303 See Other` to that book's search page |
 //! | `/ui/book/{slug}` | the book's table of contents with markers; archived subtrees hidden unless `?archived=1` |
-//! | `/ui/book/{slug}/node/{uuid}` | one node: breadcrumbs, meta, properties, rendered body, links both ways, pending revision with its diff, children, history |
-//! | `/ui/book/{slug}/search?q=` | nodes whose title or body contains `q` (case-insensitive), with snippets, preceded by nodes whose id starts with `q` when it is a UUID prefix (8+ hex characters); `q=#<toc number>` (`#2-3`) is a `303 See Other` to that node's page, or a "No node" note followed by the text search |
+//! | `/ui/book/{slug}/node/{uuid}` | one node: breadcrumbs, meta (with the toc number and the 8-character id as separately selectable `#n` and short id), properties, rendered body, links both ways, pending revision with its diff, children, history |
+//! | `/ui/book/{slug}/search?q=` | titled with the book, with a link to the same search over all books; nodes whose title or body contains `q` (case-insensitive), with snippets, preceded by nodes whose id starts with `q` when it is a UUID prefix (8+ hex characters); `q=#<toc number>` (`#2-3`) is a `303 See Other` to that node's page, or a "No node" note followed by the text search |
 //! | `/ui/book/{slug}/history?limit=` | the book's history, newest first |
 //!
 //! Access: when `OUTLINE_MCP_HTTP_TOKEN` is set, every `/ui` request needs
@@ -44,7 +44,7 @@ use outline_mcp_core::domain::model::id::NodeId;
 use outline_mcp_core::domain::model::node::{NodeType, TemplateNode};
 use outline_mcp_core::domain::model::timestamp::Timestamp;
 use outline_mcp_core::domain::search::TextQuery;
-use outline_mcp_core::domain::store::{StoreError, Versioned};
+use outline_mcp_core::domain::store::{BookSummary, StoreError, Versioned};
 use serde::Deserialize;
 
 use crate::helpers::{
@@ -332,15 +332,11 @@ async fn index(State(ui): State<Ui>, Query(q): Query<ShelfQuery>) -> UiResult {
     let totals = flag_on(q.totals.as_deref());
     let archived = flag_on(q.archived.as_deref());
     let mut body = String::from("<h1>outline</h1>");
-    body.push_str(&shelf_search_form(
-        &books.iter().map(|b| b.slug.as_str()).collect::<Vec<_>>(),
-        "",
-        "",
-    ));
     if books.is_empty() {
         body.push_str("<p>No books yet.</p>");
         return Ok(page("outline", &body));
     }
+    body.push_str(&shelf_search_form("", archived));
     let hidden = if archived {
         0
     } else {
@@ -419,19 +415,159 @@ async fn index(State(ui): State<Ui>, Query(q): Query<ShelfQuery>) -> UiResult {
 struct ShelfSearch {
     book: Option<String>,
     q: Option<String>,
+    archived: Option<String>,
 }
 
-/// The shelf's search form names a book; send the browser to that book's
-/// search page.
-async fn shelf_search(Query(s): Query<ShelfSearch>) -> UiResult {
-    let slug = s.book.unwrap_or_default();
-    check_slug(&slug)?;
-    let q = s.q.unwrap_or_default();
-    Ok(Redirect::to(&format!(
-        "/ui/book/{slug}/search?q={}",
-        query_value(q.trim())
-    ))
-    .into_response())
+/// The matches of every book, grouped by book. An old link naming a `book`
+/// is sent to that book's search page.
+async fn shelf_search(State(ui): State<Ui>, Query(s): Query<ShelfSearch>) -> UiResult {
+    let text = s.q.unwrap_or_default();
+    if let Some(slug) = s.book {
+        check_slug(&slug)?;
+        return Ok(Redirect::to(&format!(
+            "/ui/book/{slug}/search?q={}",
+            query_value(text.trim())
+        ))
+        .into_response());
+    }
+    let archived = flag_on(s.archived.as_deref());
+    let mut body =
+        String::from(r#"<nav><a href="/ui/">outline</a></nav><h1>Search all books</h1>"#);
+    body.push_str(&shelf_search_form(&text, archived));
+    let Some(query) = TextQuery::new(&text) else {
+        return Ok(page("search", &body));
+    };
+    let q = text.trim();
+
+    let listed = ui.storage.books.list_books().await?;
+    let hidden_books = if archived {
+        0
+    } else {
+        listed.iter().filter(|b| b.archived).count()
+    };
+    let books: Vec<&BookSummary> = listed.iter().filter(|b| archived || !b.archived).collect();
+    let searched = &books[..books.len().min(SHELF_LOAD_MAX)];
+
+    let mut sweep = None;
+    if let Some(num) = toc_number(q) {
+        let found = sweep_books(&ui, searched, q, &query, Some(num), true).await?;
+        if found.found > 0 {
+            sweep = Some(found);
+        } else {
+            // Like a book's search page: say so, then search the text.
+            body.push_str(&format!("<p>No node at #{} in any book.</p>", escape(num)));
+        }
+    }
+    let sweep = match sweep {
+        Some(sweep) => sweep,
+        None => sweep_books(&ui, searched, q, &query, None, archived).await?,
+    };
+    body.push_str(&sweep.html);
+    if sweep.found == 0 {
+        body.push_str("<p>No match.</p>");
+    } else if sweep.found > sweep.shown {
+        body.push_str(&format!(
+            r#"<p class="meta">{} more matches not shown; narrow the query.</p>"#,
+            sweep.found - sweep.shown
+        ));
+    }
+    if sweep.hidden_archived > 0 {
+        body.push_str(&format!(
+            r#"<p class="meta">… {} archived matches hidden (<a href="{}">show</a>)</p>"#,
+            sweep.hidden_archived,
+            all_books_search_url(&text, true),
+        ));
+    }
+    if hidden_books > 0 {
+        body.push_str(&format!(
+            r#"<p class="meta">… {hidden_books} archived books not searched (<a href="{}">show</a>)</p>"#,
+            all_books_search_url(&text, true),
+        ));
+    }
+    if books.len() > SHELF_LOAD_MAX {
+        body.push_str(&format!(
+            r#"<p class="meta">Only the first {SHELF_LOAD_MAX} books were searched.</p>"#
+        ));
+    }
+    Ok(page("search", &body))
+}
+
+/// The all-books search URL for `text`, ready for an HTML attribute.
+fn all_books_search_url(text: &str, archived: bool) -> String {
+    format!(
+        "/ui/search?q={}{}",
+        escape(&query_value(text)),
+        if archived { "&amp;archived=1" } else { "" }
+    )
+}
+
+/// What [`sweep_books`] found.
+struct Sweep {
+    /// One `<h2>` and `<ul class="hits">` per book with a listed hit.
+    html: String,
+    /// Hits that are not hidden as archived, listed or not.
+    found: usize,
+    /// Hits listed.
+    shown: usize,
+    /// Hits hidden because the node is archived.
+    hidden_archived: usize,
+}
+
+/// Search `books` in order, listing at most `RESULT_LIMIT` rows across all
+/// of them. With `toc` it lists the node at that toc number of each book
+/// instead of searching text.
+async fn sweep_books(
+    ui: &Ui,
+    books: &[&BookSummary],
+    q: &str,
+    query: &TextQuery,
+    toc: Option<&str>,
+    archived: bool,
+) -> Result<Sweep, UiError> {
+    let mut sweep = Sweep {
+        html: String::new(),
+        found: 0,
+        shown: 0,
+        hidden_archived: 0,
+    };
+    for b in books {
+        let Some(v) = ui.storage.books.load(&b.slug).await? else {
+            continue;
+        };
+        let book = &v.value;
+        let ids = build_hierarchical_ids(book);
+        let limit = RESULT_LIMIT - sweep.shown;
+        let rows = match toc {
+            Some(num) => hit_rows(
+                book,
+                &b.slug,
+                None,
+                ids.iter().find(|(n, _)| n == num),
+                archived,
+                limit,
+            ),
+            None => hit_rows(
+                book,
+                &b.slug,
+                Some(query),
+                search_hits(book, q, query, &ids),
+                archived,
+                limit,
+            ),
+        };
+        sweep.found += rows.found;
+        sweep.hidden_archived += rows.hidden_archived;
+        if rows.shown > 0 {
+            sweep.shown += rows.shown;
+            sweep.html.push_str(&format!(
+                r#"<h2><a href="/ui/book/{}">{}</a></h2><ul class="hits">{}</ul>"#,
+                escape(&b.slug),
+                escape(&b.title),
+                rows.html,
+            ));
+        }
+    }
+    Ok(sweep)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -515,7 +651,7 @@ async fn node(State(ui): State<Ui>, Path((slug, id)): Path<(String, String)>) ->
 
     let mut body = crumbs(book, &slug, n);
     body.push_str(&format!(
-        r#"<h1>{title}</h1><p class="meta">{num} · {kind} · {status}{updated}{verified}</p><p class="meta"><code class="ref">outline:{slug}/{id}</code></p>"#,
+        r#"<h1>{title}</h1><p class="meta"><code class="ref">#{num}</code> · <code class="ref">{short}</code> · {kind} · {status}{updated}{verified}</p><p class="meta"><code class="ref">outline:{slug}/{id}</code></p>"#,
         title = escape(n.title()),
         num = escape(&num),
         kind = kind_name(n.node_type()),
@@ -534,6 +670,7 @@ async fn node(State(ui): State<Ui>, Path((slug, id)): Path<(String, String)>) ->
             ),
             None => " · never verified".to_string(),
         },
+        short = id.short(),
         slug = escape(&slug),
         id = id,
     ));
@@ -650,6 +787,83 @@ fn id_prefix_hits<'a>(q: &str, ids: &'a [(String, NodeId)]) -> Vec<&'a (String, 
         .collect()
 }
 
+/// Matches of one book: id-prefix hits first, then text hits in toc order,
+/// none twice.
+fn search_hits<'a>(
+    book: &TemplateBook,
+    q: &str,
+    query: &TextQuery,
+    ids: &'a [(String, NodeId)],
+) -> Vec<&'a (String, NodeId)> {
+    let mut hits = id_prefix_hits(q, ids);
+    let text_hits: Vec<_> = ids
+        .iter()
+        .filter(|(_, id)| {
+            !hits.iter().any(|(_, i)| i == id)
+                && book.get_node(*id).is_some_and(|n| query.matches(n))
+        })
+        .collect();
+    hits.extend(text_hits);
+    hits
+}
+
+/// The `<li>` rows of one book's hits.
+struct HitRows {
+    html: String,
+    /// Hits that are not hidden as archived, listed or not.
+    found: usize,
+    /// Rows in `html`.
+    shown: usize,
+    /// Hits hidden because the node is archived.
+    hidden_archived: usize,
+}
+
+/// Render `hits` as rows (title link, toc number, markers, and a snippet
+/// when `query` is given), at most `limit` of them. Archived nodes are
+/// counted, not listed, unless `archived`.
+fn hit_rows<'a>(
+    book: &TemplateBook,
+    slug: &str,
+    query: Option<&TextQuery>,
+    hits: impl IntoIterator<Item = &'a (String, NodeId)>,
+    archived: bool,
+    limit: usize,
+) -> HitRows {
+    let mut rows = HitRows {
+        html: String::new(),
+        found: 0,
+        shown: 0,
+        hidden_archived: 0,
+    };
+    for (num, id) in hits {
+        let Some(n) = book.get_node(*id) else {
+            continue;
+        };
+        if !archived && book.is_archived_or_under_archived(*id) {
+            rows.hidden_archived += 1;
+            continue;
+        }
+        rows.found += 1;
+        if rows.shown >= limit {
+            continue;
+        }
+        rows.shown += 1;
+        rows.html.push_str(&format!(
+            r#"<li><span class="num">{num}.</span> <a href="/ui/book/{slug}/node/{id}">{title}</a>{markers}{snippet}</li>"#,
+            num = escape(num),
+            slug = escape(slug),
+            id = id,
+            title = escape(n.title()),
+            markers = markers(book, n),
+            snippet = query
+                .and_then(|query| query.snippet(n, SNIPPET_CHARS))
+                .map(|s| format!("<pre>{}</pre>", escape(&s)))
+                .unwrap_or_default(),
+        ));
+    }
+    rows
+}
+
 async fn book_search(
     State(ui): State<Ui>,
     Path(slug): Path<String>,
@@ -661,13 +875,18 @@ async fn book_search(
     let text = sq.q.unwrap_or_default();
     let q = text.trim();
     let mut body = format!(
-        r#"<nav><a href="/ui/">outline</a> / <a href="/ui/book/{slug}">{slug}</a></nav><h1>Search</h1>"#,
-        slug = escape(&slug)
+        r#"<nav><a href="/ui/">outline</a> / <a href="/ui/book/{slug}">{slug}</a></nav><h1>Search in {title}</h1>"#,
+        slug = escape(&slug),
+        title = escape(book.title()),
     );
     body.push_str(&search_form(&slug, &text));
     let Some(query) = TextQuery::new(&text) else {
         return Ok(page("search", &body));
     };
+    body.push_str(&format!(
+        r#"<p class="meta"><a href="{}">search all books</a></p>"#,
+        all_books_search_url(&text, archived)
+    ));
     let ids = build_hierarchical_ids(book);
     if let Some(num) = toc_number(q) {
         if let Some((_, id)) = ids.iter().find(|(n, _)| n == num) {
@@ -677,52 +896,27 @@ async fn book_search(
         // issue reference written in a body).
         body.push_str(&format!("<p>No node at #{}.</p>", escape(num)));
     }
-    // Id-prefix hits first, then text hits in toc order, none twice.
-    let id_hits = id_prefix_hits(q, &ids);
-    let text_hits = ids.iter().filter(|(_, id)| {
-        !id_hits.iter().any(|(_, i)| i == id)
-            && book.get_node(*id).is_some_and(|n| query.matches(n))
-    });
-    let mut hits = 0usize;
-    let mut skipped_archived = 0usize;
-    body.push_str(r#"<ul class="hits">"#);
-    for (num, id) in id_hits.iter().copied().chain(text_hits) {
-        let Some(n) = book.get_node(*id) else {
-            continue;
-        };
-        if !archived && book.is_archived_or_under_archived(*id) {
-            skipped_archived += 1;
-            continue;
-        }
-        hits += 1;
-        if hits > RESULT_LIMIT {
-            continue;
-        }
-        body.push_str(&format!(
-            r#"<li><span class="num">{num}.</span> <a href="/ui/book/{slug}/node/{id}">{title}</a>{markers}{snippet}</li>"#,
-            num = escape(num),
-            slug = escape(&slug),
-            id = id,
-            title = escape(n.title()),
-            markers = markers(book, n),
-            snippet = query
-                .snippet(n, SNIPPET_CHARS)
-                .map(|s| format!("<pre>{}</pre>", escape(&s)))
-                .unwrap_or_default(),
-        ));
-    }
-    body.push_str("</ul>");
-    if hits == 0 {
+    let rows = hit_rows(
+        book,
+        &slug,
+        Some(&query),
+        search_hits(book, q, &query, &ids),
+        archived,
+        RESULT_LIMIT,
+    );
+    body.push_str(&format!(r#"<ul class="hits">{}</ul>"#, rows.html));
+    if rows.found == 0 {
         body.push_str("<p>No match.</p>");
-    } else if hits > RESULT_LIMIT {
+    } else if rows.found > rows.shown {
         body.push_str(&format!(
             r#"<p class="meta">{} more matches not shown; narrow the query.</p>"#,
-            hits - RESULT_LIMIT
+            rows.found - rows.shown
         ));
     }
-    if skipped_archived > 0 {
+    if rows.hidden_archived > 0 {
         body.push_str(&format!(
-            r#"<p class="meta">… {skipped_archived} archived matches hidden (<a href="/ui/book/{}/search?q={}&amp;archived=1">show</a>)</p>"#,
+            r#"<p class="meta">… {} archived matches hidden (<a href="/ui/book/{}/search?q={}&amp;archived=1">show</a>)</p>"#,
+            rows.hidden_archived,
             escape(&slug),
             escape(&query_value(&text)),
         ));
@@ -944,23 +1138,17 @@ fn search_form(slug: &str, q: &str) -> String {
     )
 }
 
-fn shelf_search_form(slugs: &[&str], selected: &str, q: &str) -> String {
-    if slugs.is_empty() {
-        return String::new();
-    }
-    let options: String = slugs
-        .iter()
-        .map(|s| {
-            format!(
-                r#"<option value="{0}"{1}>{0}</option>"#,
-                escape(s),
-                if *s == selected { " selected" } else { "" }
-            )
-        })
-        .collect();
+/// The shelf's search box; it searches every book, archived ones too when
+/// `archived`.
+fn shelf_search_form(q: &str, archived: bool) -> String {
     format!(
-        r#"<form action="/ui/search" method="get"><select name="book">{options}</select> <input type="search" name="q" value="{}" placeholder="search titles, bodies, id prefix; #2-3 for a toc number"> <button type="submit">search</button></form>"#,
+        r#"<form action="/ui/search" method="get"><input type="search" name="q" value="{}" placeholder="search titles, bodies, id prefix; #2-3 for a toc number">{} <button type="submit">search</button></form>"#,
         escape(q),
+        if archived {
+            r#"<input type="hidden" name="archived" value="1">"#
+        } else {
+            ""
+        },
     )
 }
 
@@ -1415,6 +1603,229 @@ mod tests {
         let (s, _, r) = open(&f, "/ui/search?book=b&q=%231").await;
         assert_eq!(s, StatusCode::SEE_OTHER);
         assert_eq!(r.headers()[header::LOCATION], "/ui/book/b/search?q=%231");
+    }
+
+    /// Book `c` ("Second"): section "Notes" > content "Other" (body with
+    /// "needle" and "#99"); and the archived book `d` ("Shelved"): section
+    /// "Box" > content "Stored" (body with "needle"). Returns the ids of
+    /// "Notes", "Other" and "Stored".
+    async fn more_books(f: &Fixture) -> (NodeId, NodeId, NodeId) {
+        let svc = BookService::new(f.storage.books.clone(), "c");
+        svc.create_book("Second", 4).await.unwrap();
+        let (notes, _) = svc.add_node(req("Notes", None, None)).await.unwrap();
+        let (other, _) = svc
+            .add_node(req("Other", Some(notes), Some("needle, see #99 here")))
+            .await
+            .unwrap();
+        let svc = BookService::new(f.storage.books.clone(), "d");
+        svc.create_book("Shelved", 4).await.unwrap();
+        let (boxed, _) = svc.add_node(req("Box", None, None)).await.unwrap();
+        let (stored, _) = svc
+            .add_node(req("Stored", Some(boxed), Some("needle in the box")))
+            .await
+            .unwrap();
+        svc.update_book(None, None, Some(true)).await.unwrap();
+        (notes, other, stored)
+    }
+
+    #[tokio::test]
+    async fn shelf_form_searches_all_books_without_a_picker() {
+        let f = fixture().await;
+        let (_, body, _) = open(&f, "/ui/").await;
+        assert!(!body.contains("<select"), "{body}");
+        assert!(
+            body.contains(
+                r#"<form action="/ui/search" method="get"><input type="search" name="q""#
+            ),
+            "{body}"
+        );
+        assert!(!body.contains(r#"name="book""#), "{body}");
+        assert!(!body.contains(r#"name="archived""#), "{body}");
+        // a shelf showing archived books searches them too
+        for uri in ["/ui/?archived=1", "/ui/search?q=needle&archived=1"] {
+            let (_, body, _) = open(&f, uri).await;
+            assert!(
+                body.contains(r#"<input type="hidden" name="archived" value="1">"#),
+                "{uri}: {body}"
+            );
+        }
+        let (_, body, _) = open(&f, "/ui/book/b/search?q=x&archived=1").await;
+        assert!(
+            body.contains(r#"<a href="/ui/search?q=x&amp;archived=1">search all books</a>"#),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_books_search_groups_hits_by_book() {
+        let f = fixture().await;
+        let (_, other, stored) = more_books(&f).await;
+        let (s, body, r) = open(&f, "/ui/search?q=NEEDLE").await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_headers(&r, "/ui/search");
+        assert!(body.contains("<h1>Search all books</h1>"), "{body}");
+        assert!(body.contains(r#"value="NEEDLE""#), "{body}");
+        let head_b = r#"<h2><a href="/ui/book/b">The &lt;Book&gt;</a></h2>"#;
+        let head_c = r#"<h2><a href="/ui/book/c">Second</a></h2>"#;
+        let link_b = format!("/ui/book/b/node/{}", f.child);
+        let link_c = format!("/ui/book/c/node/{other}");
+        for (head, link) in [(head_b, &link_b), (head_c, &link_c)] {
+            let h = body.find(head).unwrap_or_else(|| panic!("{head}: {body}"));
+            let l = body
+                .find(link.as_str())
+                .unwrap_or_else(|| panic!("{link}: {body}"));
+            assert!(h < l, "{body}");
+        }
+        assert_eq!(body.matches("<h2>").count(), 2, "{body}");
+        assert!(body.contains("<pre>"), "{body}");
+        assert!(!body.contains("<script"), "{body}");
+        // the archived node of `b` is counted, the archived book is not read
+        assert!(
+            !body.contains(&format!("/ui/book/b/node/{}", f.old)),
+            "{body}"
+        );
+        assert!(
+            !body.contains(&format!("/ui/book/d/node/{stored}")),
+            "{body}"
+        );
+        assert!(body.contains("1 archived matches hidden"), "{body}");
+        assert!(body.contains("1 archived books not searched"), "{body}");
+        assert!(
+            body.contains(r#"href="/ui/search?q=NEEDLE&amp;archived=1""#),
+            "{body}"
+        );
+
+        let (_, body, _) = open(&f, "/ui/search?q=needle&archived=1").await;
+        assert!(
+            body.contains(&format!("/ui/book/b/node/{}", f.old)),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!("/ui/book/d/node/{stored}")),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<h2><a href="/ui/book/d">Shelved</a></h2>"#),
+            "{body}"
+        );
+        assert!(!body.contains("archived matches hidden"), "{body}");
+        assert!(!body.contains("archived books not searched"), "{body}");
+
+        let (_, body, _) = open(&f, "/ui/search?q=zzzz").await;
+        assert!(body.contains("<p>No match.</p>"), "{body}");
+        assert!(!body.contains("<h2>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn all_books_search_matches_a_uuid_prefix() {
+        let f = fixture().await;
+        let (_, other, _) = more_books(&f).await;
+        let id = other.to_string();
+        let (_, body, _) = open(&f, &format!("/ui/search?q={}", &id[..8])).await;
+        assert!(body.contains(&format!("/ui/book/c/node/{other}")), "{body}");
+        assert!(
+            body.contains(r#"<h2><a href="/ui/book/c">Second</a></h2>"#),
+            "{body}"
+        );
+        assert!(!body.contains("/ui/book/b/node/"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn all_books_toc_number_lists_that_node_of_each_book() {
+        let f = fixture().await;
+        let (notes, other, _) = more_books(&f).await;
+        let (s, body, _) = open(&f, "/ui/search?q=%231").await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert!(
+            body.contains(&format!("/ui/book/b/node/{}", f.root)),
+            "{body}"
+        );
+        assert!(body.contains(&format!("/ui/book/c/node/{notes}")), "{body}");
+        assert!(
+            !body.contains(&format!("/ui/book/c/node/{other}")),
+            "{body}"
+        );
+        assert!(!body.contains("No node at"), "{body}");
+        assert!(!body.contains("<pre>"), "{body}");
+
+        let (_, body, _) = open(&f, "/ui/search?q=%231-1").await;
+        assert!(
+            body.contains(&format!("/ui/book/b/node/{}", f.child)),
+            "{body}"
+        );
+        assert!(body.contains(&format!("/ui/book/c/node/{other}")), "{body}");
+        assert!(
+            !body.contains(&format!("/ui/book/b/node/{}", f.root)),
+            "{body}"
+        );
+
+        // no book has #99: say so, then search the text
+        let (s, body, _) = open(&f, "/ui/search?q=%2399").await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert!(
+            body.contains("<p>No node at #99 in any book.</p>"),
+            "{body}"
+        );
+        assert!(body.contains(r##"value="#99""##), "{body}");
+        assert!(body.contains(&format!("/ui/book/c/node/{other}")), "{body}");
+        assert!(!body.contains("/ui/book/b/node/"), "{body}");
+
+        let (_, body, _) = open(&f, "/ui/search?q=%2398").await;
+        assert!(
+            body.contains("<p>No node at #98 in any book.</p>"),
+            "{body}"
+        );
+        assert!(body.contains("<p>No match.</p>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn empty_all_books_search_is_just_the_form() {
+        let f = fixture().await;
+        for uri in ["/ui/search", "/ui/search?q=", "/ui/search?q=%20%20"] {
+            let (s, body, _) = open(&f, uri).await;
+            assert_eq!(s, StatusCode::OK, "{uri}");
+            assert!(body.contains(r#"action="/ui/search""#), "{uri}: {body}");
+            assert!(!body.contains("/ui/book/"), "{uri}: {body}");
+            assert!(!body.contains("No match"), "{uri}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn book_search_page_names_its_book_and_links_to_all_books() {
+        let f = fixture().await;
+        let (_, body, _) = open(&f, "/ui/book/b/search?q=a%20b").await;
+        assert!(
+            body.contains("<h1>Search in The &lt;Book&gt;</h1>"),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<a href="/ui/search?q=a%20b">search all books</a>"#),
+            "{body}"
+        );
+        let (_, body, _) = open(&f, "/ui/book/b/search?q=").await;
+        assert!(
+            body.contains("<h1>Search in The &lt;Book&gt;</h1>"),
+            "{body}"
+        );
+        assert!(!body.contains("search all books"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn node_page_offers_selectable_short_forms() {
+        let f = fixture().await;
+        let (_, body, _) = open(&f, &format!("/ui/book/b/node/{}", f.child)).await;
+        assert!(body.contains(r#"<code class="ref">#1-1</code>"#), "{body}");
+        assert!(
+            body.contains(&format!(r#"<code class="ref">{}</code>"#, f.child.short())),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                r#"<code class="ref">outline:b/{}</code>"#,
+                f.child
+            )),
+            "{body}"
+        );
     }
 
     #[tokio::test]

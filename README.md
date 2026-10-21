@@ -63,7 +63,7 @@ Every request must then carry `Authorization: Bearer <token>` — set it whereve
 
 ### Browser view
 
-`--mcp-http` also serves a read-only browser view at `/ui/`: the shelf, each book's table of contents (inject / status / verification / pending-revision / link markers; archived subtrees hidden unless asked), node pages (rendered body, properties, links both ways, the pending revision with its diff, history), text search (which also matches a UUID prefix of 8+ hex characters, and `#<toc number>` such as `#2-3` opens that node) and book history. It never writes, runs no script and loads nothing from other hosts.
+`--mcp-http` also serves a read-only browser view at `/ui/`: the shelf, each book's table of contents (inject / status / verification / pending-revision / link markers; archived subtrees hidden unless asked), node pages (rendered body, properties, links both ways, the pending revision with its diff, history), text search (which also matches a UUID prefix of 8+ hex characters, and `#<toc number>` such as `#2-3` opens that node; the shelf's search box searches every book at once, and a node page shows its `#n` and 8-character id as separate click-to-select snippets) and book history. It never writes, runs no script and loads nothing from other hosts.
 
 When `OUTLINE_MCP_HTTP_TOKEN` is set, the browser asks for HTTP Basic credentials: any user name, the token as the password. Without a token (loopback binds only) the view answers only requests whose `Host` is `localhost`, `127.0.0.1` or `[::1]`. The stdio transport has no browser view.
 
