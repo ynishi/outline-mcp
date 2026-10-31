@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Release builds `aarch64-apple-darwin` on `macos-15`** (#40). dist 0.32 picked `macos-14`, which GitHub retires on 2026-11-02 and browned out in scheduled windows before that; the v0.15.3 tag run lost its macOS arm64 build, GitHub Release and Homebrew formula to one of them. `[dist.github-custom-runners]` in `dist-workspace.toml` pins `macos-15`; the published artifacts are unchanged.
+
 ### Deprecated
 
 ### Removed
