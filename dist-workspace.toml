@@ -24,3 +24,9 @@ publish-jobs = ["homebrew"]
 # The CI file is hand-merged with existing GHCR + MCP Registry publish jobs;
 # do not treat manual edits as drift.
 allow-dirty = ["ci"]
+
+# dist 0.32 builds aarch64-apple-darwin on macos-14, which GitHub retires on
+# 2026-11-02 (actions/runner-images#13518). The plan job reads this at run
+# time, so the hand-merged release.yml needs no change (#40).
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
