@@ -18,7 +18,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-outline-mcp-core = { path = "../outline-mcp-core", version = "0.15.2" }
+outline-mcp-core = { path = "../outline-mcp-core", version = "0.15.3" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
