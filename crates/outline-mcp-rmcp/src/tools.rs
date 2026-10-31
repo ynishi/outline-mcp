@@ -5967,4 +5967,40 @@ mod node_locate_tests {
         assert!(!is_uuid_prefix("2-3"));
         assert!(!is_uuid_prefix(""));
     }
+
+    /// An all-digit short id (`99102601`) is read as a toc number first; with
+    /// no node at that position it must go on to the prefix lookup, not fail.
+    #[tokio::test]
+    async fn an_all_digit_short_id_resolves_by_prefix() {
+        let (s, _, _, _) = shelf().await;
+        // The store generates ids; about 2.3 % of short ids are all digits.
+        let mut digits = None;
+        for i in 0..4000 {
+            let id = add(&s, "a", &format!("n{i}")).await;
+            if id.short().chars().all(|c| c.is_ascii_digit()) {
+                digits = Some(id);
+                break;
+            }
+        }
+        let id = digits.expect("an all-digit short id within 4000 nodes");
+        assert_eq!(s.resolve_id(&id.short()).await.unwrap(), id);
+
+        // A toc number that names no node, and is too short to be a UUID
+        // prefix, is still reported as a position.
+        for toc in ["9999", "2-3", "1-2-1"] {
+            let err = s.resolve_id(toc).await.unwrap_err();
+            assert!(
+                err.message.starts_with("No node at position"),
+                "{toc}: {}",
+                err.message
+            );
+        }
+        // Eight digits that are neither a position nor a prefix of any node.
+        let err = s.resolve_id("00000000").await.unwrap_err();
+        assert!(
+            err.message.starts_with("No node found matching"),
+            "{}",
+            err.message
+        );
+    }
 }
