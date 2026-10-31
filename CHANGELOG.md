@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.15.3] - 2026-10-31
+
+### Added
+
 - **Browser view search by id** — `/ui/` search also matches a UUID prefix (8 or more hex characters), and `#<toc number>` (for example `#2-3`) opens that node.
 - **Browser view searches all books** — the shelf's search box now searches every book and groups the hits by book (no book picker; archived books are skipped unless `archived=1`), a book's search page is titled with the book and links to the all-books search, and a node page shows its toc number and short id as separately selectable snippets.
 - **`node_locate`** — finds which book holds a node by its UUID or a prefix of at least 8 hex digits (the short id), across every book and without a selected book. Each hit is `<slug> "<book title>": <toc>. <title> (id: <uuid>, <status>)`; archived books are skipped unless `include_archived: true`. Toc numbers and titles are refused: they mean nothing outside one book.
