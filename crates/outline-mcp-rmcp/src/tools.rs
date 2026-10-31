@@ -23,12 +23,12 @@ use crate::request::{
     McpBookStatsRequest, McpBookUpdateRequest, McpDumpRequest, McpEjectRequest,
     McpGenRoutingRequest, McpImportRequest, McpInitRequest, McpLinkAddRequest,
     McpLinkRemoveRequest, McpLinksRequest, McpNodeCreateRequest, McpNodeHistoryRequest,
-    McpNodeMoveRequest, McpNodeQueryRequest, McpNodeUpdateRequest, McpNodeVerifyRequest,
-    McpRevisionApproveRequest, McpRevisionProposeRequest, McpRevisionRejectRequest,
-    McpRevisionShowRequest, McpRevisionsPendingRequest, McpSelectBookRequest, McpShelfRequest,
-    McpSnapshotCreateRequest, McpSnapshotDeleteRequest, McpSnapshotDiffRequest,
-    McpSnapshotDumpAllRequest, McpSnapshotDumpRequest, McpSnapshotListRequest,
-    McpSnapshotRestoreRequest, McpSnapshotTagRequest, McpTocRequest,
+    McpNodeLocateRequest, McpNodeMoveRequest, McpNodeQueryRequest, McpNodeUpdateRequest,
+    McpNodeVerifyRequest, McpRevisionApproveRequest, McpRevisionProposeRequest,
+    McpRevisionRejectRequest, McpRevisionShowRequest, McpRevisionsPendingRequest,
+    McpSelectBookRequest, McpShelfRequest, McpSnapshotCreateRequest, McpSnapshotDeleteRequest,
+    McpSnapshotDiffRequest, McpSnapshotDumpAllRequest, McpSnapshotDumpRequest,
+    McpSnapshotListRequest, McpSnapshotRestoreRequest, McpSnapshotTagRequest, McpTocRequest,
 };
 use crate::revision::{
     age as revision_age, fields_label, proposal_json, proposal_line, revision_diff,
@@ -2086,6 +2086,52 @@ impl OutlineMcpServer {
     }
 
     #[tool(
+        name = "node_locate",
+        description = "Find which book holds a node, by its UUID or a prefix of at least 8 hex digits (the short id). Searches every book, needs no selected book, and lists each hit as `<slug> \"<book title>\": <toc number>. <title> (id: <uuid>, <status>)`. Archived books are skipped unless `include_archived: true`; archived nodes of a searched book are listed with their status. Other tools resolve ids within the selected book only: use this when an id from another book, a note or a map does not resolve, then `select_book` the book it names.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn node_locate(
+        &self,
+        Parameters(req): Parameters<McpNodeLocateRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = req.id.trim();
+        if !crate::server::is_uuid_prefix(id) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "'{id}' is not a UUID or a prefix of one: give at least 8 hex digits (hex digits and '-' only). Toc numbers and titles are not searched across books."
+                ),
+                None,
+            ));
+        }
+        let include_archived = req.include_archived.unwrap_or(false);
+        let found = self.locate(id, include_archived).await?;
+        let mut output = if found.is_empty() {
+            format!("No node with id starting with '{id}' in any book")
+        } else {
+            format!(
+                "Found {} node(s) with id starting with '{id}':\n{}",
+                found.len(),
+                found
+                    .iter()
+                    .map(|l| format!("- {}", l.describe()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        if !include_archived {
+            output
+                .push_str("\n(archived books skipped; pass include_archived: true to search them)");
+        }
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            output,
+        )]))
+    }
+
+    #[tool(
         name = "book_history",
         description = "List the full edit history of the selected book (all nodes, chronological). Each entry shows action / node hierarchical id / title. Snapshot labels are cross-referenced when the entry's timestamp matches a snapshot. Use `since` / `until` (millis) to bound a range — e.g. pair with two snapshot timestamps from `snapshot_list` to see what changed between them.",
         annotations(
@@ -2288,6 +2334,7 @@ impl OutlineMcpServer {
             return crate::server::reject_book_level(id);
         }
         // 2. Short prefix in current book
+        let slug = self.selected_slug()?;
         let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
         let matches: Vec<outline_mcp_core::domain::model::id::NodeId> = book
@@ -2296,10 +2343,14 @@ impl OutlineMcpServer {
             .collect();
         match matches.len() {
             1 => Ok(matches[0]),
-            0 => Err(McpError::invalid_params(
-                format!("No node with UUID starting with '{s}'"),
-                None,
-            )),
+            // 3. Not here: say which book has it, if any
+            0 => match self.elsewhere_hint(s, &slug).await? {
+                Some(hint) => Err(McpError::invalid_params(hint, None)),
+                None => Err(McpError::invalid_params(
+                    format!("No node with UUID starting with '{s}'"),
+                    None,
+                )),
+            },
             n => Err(McpError::invalid_params(
                 format!("Ambiguous UUID prefix '{s}' matches {n} nodes"),
                 None,
@@ -5725,5 +5776,195 @@ mod revision_tool_tests {
             .unwrap(),
         );
         assert!(pending.starts_with("# Pending revisions (0)"), "{pending}");
+    }
+}
+
+#[cfg(test)]
+mod node_locate_tests {
+    use std::sync::Arc;
+
+    use outline_mcp_core::domain::model::id::NodeId;
+    use outline_mcp_core::domain::model::node::NodeType;
+    use outline_mcp_core::infra::memory_store::{MemoryBookStore, MemorySnapshotStore};
+
+    use super::*;
+    use crate::server::Storage;
+
+    fn text(r: &CallToolResult) -> String {
+        r.content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn add(s: &OutlineMcpServer, slug: &str, title: &str) -> NodeId {
+        s.service_for(slug)
+            .await
+            .unwrap()
+            .add_node(AddNodeRequest {
+                parent: None,
+                title: title.into(),
+                node_type: NodeType::Content,
+                body: None,
+                placeholder: None,
+                position: usize::MAX,
+                properties: HashMap::new(),
+            })
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// Books `a` (selected), `b` and archived `z`, one node each. Returns the
+    /// three node ids.
+    async fn shelf() -> (OutlineMcpServer, NodeId, NodeId, NodeId) {
+        let s = OutlineMcpServer::new(Storage::new(
+            Arc::new(MemoryBookStore::new()),
+            Arc::new(MemorySnapshotStore::new()),
+        ));
+        for (slug, title) in [("a", "Alpha"), ("b", "Beta"), ("z", "Zeta")] {
+            s.service_for(slug)
+                .await
+                .unwrap()
+                .create_book(title, 3)
+                .await
+                .unwrap();
+        }
+        let in_a = add(&s, "a", "in a").await;
+        let in_b = add(&s, "b", "in b").await;
+        let in_z = add(&s, "z", "in z").await;
+        s.service_for("z")
+            .await
+            .unwrap()
+            .update_book(None, None, Some(true))
+            .await
+            .unwrap();
+        *s.selected.write().unwrap() = Some("a".into());
+        (s, in_a, in_b, in_z)
+    }
+
+    fn locate(id: &str, include_archived: Option<bool>) -> McpNodeLocateRequest {
+        McpNodeLocateRequest {
+            id: id.into(),
+            include_archived,
+        }
+    }
+
+    #[tokio::test]
+    async fn locate_finds_a_node_of_another_book_without_a_selection() {
+        let (s, _, in_b, _) = shelf().await;
+        *s.selected.write().unwrap() = None;
+        let r = text(
+            &s.node_locate(Parameters(locate(&in_b.short(), None)))
+                .await
+                .unwrap(),
+        );
+        assert!(r.starts_with("Found 1 node(s)"), "{r}");
+        assert!(
+            r.contains(&format!("- b \"Beta\": 1. in b (id: {in_b}, active)")),
+            "{r}"
+        );
+        assert!(r.contains("archived books skipped"), "{r}");
+
+        let r = text(
+            &s.node_locate(Parameters(locate(&in_b.to_string(), None)))
+                .await
+                .unwrap(),
+        );
+        assert!(r.contains("- b \"Beta\": 1. in b"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn locate_skips_archived_books_unless_asked() {
+        let (s, _, _, in_z) = shelf().await;
+        let r = text(
+            &s.node_locate(Parameters(locate(&in_z.short(), None)))
+                .await
+                .unwrap(),
+        );
+        assert!(r.starts_with("No node with id starting with"), "{r}");
+        assert!(r.contains("archived books skipped"), "{r}");
+
+        let r = text(
+            &s.node_locate(Parameters(locate(&in_z.short(), Some(true))))
+                .await
+                .unwrap(),
+        );
+        assert!(r.contains("- z \"Zeta\" [archived]: 1. in z"), "{r}");
+        assert!(!r.contains("archived books skipped"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn locate_refuses_anything_but_a_uuid_prefix() {
+        let (s, _, _, _) = shelf().await;
+        for bad in ["1", "2-3", "in b", "abc", "ABCDEF"] {
+            let err = s
+                .node_locate(Parameters(locate(bad, None)))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{bad}");
+            assert!(
+                err.message.contains("8 hex digits"),
+                "{bad}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolving_an_id_of_another_book_names_that_book() {
+        let (s, in_a, in_b, in_z) = shelf().await;
+        assert_eq!(s.resolve_id(&in_a.short()).await.unwrap(), in_a);
+
+        for id in [in_b.short(), in_b.to_string()[..13].to_string()] {
+            let err = s.resolve_id(&id).await.unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(
+                err.message.contains("in the selected book 'a'")
+                    && err.message.contains("- b \"Beta\": 1. in b")
+                    && err.message.contains("`select_book b`"),
+                "{id}: {}",
+                err.message
+            );
+        }
+
+        // Archived books are named too: the id is real, the book just hidden.
+        let err = s.resolve_id(&in_z.short()).await.unwrap_err();
+        assert!(
+            err.message.contains("- z \"Zeta\" [archived]: 1. in z"),
+            "{}",
+            err.message
+        );
+
+        // An id no book has still falls through to the old message.
+        let err = s.resolve_id("0123456789ab").await.unwrap_err();
+        assert!(
+            err.message.starts_with("No node found matching"),
+            "{}",
+            err.message
+        );
+
+        // The UUID-only resolver (batch tools) gives the same hint.
+        let err = s.resolve_uuid(&in_b.short()).await.unwrap_err();
+        assert!(err.message.contains("`select_book b`"), "{}", err.message);
+        let err = s.resolve_uuid("0123456789ab").await.unwrap_err();
+        assert!(
+            err.message.starts_with("No node with UUID starting with"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn uuid_prefix_rule() {
+        use crate::server::is_uuid_prefix;
+        assert!(is_uuid_prefix("731ba1bb"));
+        assert!(is_uuid_prefix("731BA1BB-7960"));
+        assert!(is_uuid_prefix("731ba1bb-7960-463c-b686-d3289bf8edec"));
+        assert!(!is_uuid_prefix("731ba1b"));
+        assert!(!is_uuid_prefix("731ba1bb x"));
+        assert!(!is_uuid_prefix("2-3"));
+        assert!(!is_uuid_prefix(""));
     }
 }

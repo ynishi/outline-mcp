@@ -450,6 +450,19 @@ pub(crate) struct McpNodeHistoryRequest {
     pub node_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub(crate) struct McpNodeLocateRequest {
+    #[schemars(
+        description = "A node's UUID, or a prefix of it of at least 8 hex digits (the 8-character short id shown by `node_query`, `node_create` and the browser view). Toc numbers and titles are not accepted: they mean nothing outside one book."
+    )]
+    pub id: String,
+    #[schemars(
+        description = "Search archived books too (default false). Archived nodes of a searched book are always listed, marked by status."
+    )]
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub(crate) struct McpBookHistoryRequest {
     #[schemars(
@@ -889,6 +902,16 @@ mod tests {
     fn node_history_request_parse() {
         let req: McpNodeHistoryRequest = serde_json::from_str(r#"{"node_id": "2-3"}"#).unwrap();
         assert_eq!(req.node_id, "2-3");
+    }
+
+    #[test]
+    fn node_locate_request_parse() {
+        let req: McpNodeLocateRequest = serde_json::from_str(r#"{"id": "731ba1bb"}"#).unwrap();
+        assert_eq!(req.id, "731ba1bb");
+        assert!(req.include_archived.is_none());
+        let req: McpNodeLocateRequest =
+            serde_json::from_str(r#"{"id": "731ba1bb", "include_archived": true}"#).unwrap();
+        assert_eq!(req.include_archived, Some(true));
     }
 
     #[test]

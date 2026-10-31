@@ -8,8 +8,11 @@ All notable changes to this project will be documented in this file.
 
 - **Browser view search by id** — `/ui/` search also matches a UUID prefix (8 or more hex characters), and `#<toc number>` (for example `#2-3`) opens that node.
 - **Browser view searches all books** — the shelf's search box now searches every book and groups the hits by book (no book picker; archived books are skipped unless `archived=1`), a book's search page is titled with the book and links to the all-books search, and a node page shows its toc number and short id as separately selectable snippets.
+- **`node_locate`** — finds which book holds a node by its UUID or a prefix of at least 8 hex digits (the short id), across every book and without a selected book. Each hit is `<slug> "<book title>": <toc>. <title> (id: <uuid>, <status>)`; archived books are skipped unless `include_archived: true`. Toc numbers and titles are refused: they mean nothing outside one book.
 
 ### Changed
+
+- **An id of another book is named, not reported missing** — every tool still resolves ids within the selected book, but a UUID prefix (8 or more hex digits) that names no node there and does name one elsewhere is refused with that book's slug, the node's toc number and title, and the `select_book` to run, instead of falling through to the title match (`resolve_id`) or `No node with UUID starting with` (`node_batch_move` / `node_batch_update`). Archived books are named too. A prefix no book has keeps the old message.
 
 ### Deprecated
 
