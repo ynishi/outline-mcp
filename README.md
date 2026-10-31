@@ -77,6 +77,7 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
                                    checklist / import / init / book_update / book_delete / gen_routing
                                    snapshot_create / snapshot_list / snapshot_restore / snapshot_delete
                                    node_history / dump
+                                   node_locate (which book holds an id; needs no selected book)
                                    book_lint / book_stats (read-only health)
                                    node_verify (curation: verification dates)
                                    link_add / link_remove / links (curation: typed links)
@@ -99,6 +100,7 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 13. **`snapshot_create`** / **`snapshot_list`** / **`snapshot_restore`** / **`snapshot_delete`** — Full book versioning (create, list, restore, delete one snapshot; a labeled snapshot needs `force: true` to delete)
 14. **`node_history`** — View per-node change log with before/after diffs
 15. **`dump`** — Export full book as JSON file
+15a. **`node_locate`** — Find which book holds a node, by UUID or a prefix of at least 8 hex digits (the short id); searches every book and needs no selected book. Archived books are skipped unless `include_archived: true`; archived nodes of a searched book are listed with their status
 16. **`book_delete`** — Delete a book with its nodes, history and snapshots (cannot be undone). The slug is required; a book with any nodes, history or snapshots needs `force: true`, and `dry_run: true` only reports what would be removed. A write to the book between the check and the delete makes the delete fail without removing anything
 17. **`book_update`** — Change a book's title and / or `max_depth` (slug required). Lowering `max_depth` below an existing node's depth is refused and names that node; the change appears in `book_history` as a `book_update` entry
 18. **`book_lint`** — Read-only structural checks on a book (`slug` defaults to the selected book): content nodes at the root, similar titles (Jaccard over title words; character pairs for CJK; `threshold` default 0.6; pairs where both titles are a single token are skipped unless the titles are identical), property keys differing only by case / `_` / `-` / spaces, sections without children, drafts not updated for `stale_days` (default 90), and links whose target is not in the book (`dangling_links`). Archived nodes and everything under an archived section are ignored by every check. `checks` runs a subset; `limit` (default 50) caps findings per check and counts the rest; `format: "json"` for programs
@@ -121,6 +123,8 @@ shelf  →  select_book  →  toc  →  node_create / node_update / node_move
 ```
 
 These IDs (`1`, `1-2`, `2-1`, etc.) work in most tools. Full UUIDs and title substring matching are also supported as fallbacks.
+
+Every tool resolves an id within the selected book. A UUID prefix (8 or more hex digits) that names a node of another book is refused with that book's slug, the node's toc number and title, and the `select_book` to run. **`node_locate`** searches every book by UUID or prefix without a selection (archived books only with `include_archived: true`) and lists each hit as `<slug> "<book title>": <toc>. <title> (id: <uuid>, <status>)`.
 
 > **Note**: `node_batch_move` and `node_batch_update` require UUID or UUID-prefix IDs. Hierarchical toc IDs are intentionally rejected to prevent positional drift when the tree is modified mid-batch.
 

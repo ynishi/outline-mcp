@@ -23,6 +23,7 @@ use rmcp::{
 use outline_mcp_core::application::error::AppError;
 use outline_mcp_core::application::service::BookService;
 use outline_mcp_core::domain::model::book::TemplateBook;
+use outline_mcp_core::domain::model::changelog::NodeStatus;
 use outline_mcp_core::domain::model::id::NodeId;
 use outline_mcp_core::domain::store::{BookStore, SnapshotDelete, SnapshotStore, StoreError};
 
@@ -668,6 +669,7 @@ impl OutlineMcpServer {
             return reject_book_level(id);
         }
 
+        let slug = self.selected_slug()?;
         let svc = self.service().await?;
         let book = svc.read_tree().await.map_err(Self::to_mcp_error)?;
 
@@ -685,6 +687,11 @@ impl OutlineMcpServer {
                 ))
             }
             _ => {}
+        }
+
+        // 3b. 他の book にある prefix: どこにあるかを答える（title 一致には落ちない）
+        if let Some(hint) = self.elsewhere_hint(s, &slug).await? {
+            return Err(McpError::invalid_params(hint, None));
         }
 
         // 4. タイトル部分一致（case-insensitive, フォールバック）
@@ -720,6 +727,139 @@ impl OutlineMcpServer {
             )),
         }
     }
+
+    /// Every node of every book whose id starts with `prefix`, in shelf
+    /// (slug) order. Archived books are skipped unless `include_archived`;
+    /// archived nodes of a listed book are always included. Needs no
+    /// selected book.
+    pub(crate) async fn locate(
+        &self,
+        prefix: &str,
+        include_archived: bool,
+    ) -> Result<Vec<Located>, McpError> {
+        let prefix = prefix.to_ascii_lowercase();
+        let mut books =
+            self.storage.books.list_books().await.map_err(|e| {
+                McpError::internal_error(format!("Failed to list books: {e}"), None)
+            })?;
+        books.sort_by(|a, b| a.slug.cmp(&b.slug));
+        let mut found = Vec::new();
+        for summary in books {
+            if summary.archived && !include_archived {
+                continue;
+            }
+            let Some(v) = self.storage.books.load(&summary.slug).await.map_err(|e| {
+                McpError::internal_error(
+                    format!("Failed to read book '{}': {e}", summary.slug),
+                    None,
+                )
+            })?
+            else {
+                continue;
+            };
+            let book = &v.value;
+            let toc = build_hierarchical_ids(book);
+            for node in book.all_nodes_dfs() {
+                let id = node.id();
+                if !id.to_string().starts_with(&prefix) {
+                    continue;
+                }
+                found.push(Located {
+                    slug: summary.slug.clone(),
+                    book_title: book.title().to_string(),
+                    book_archived: book.is_archived(),
+                    toc: toc.iter().find(|(_, i)| *i == id).map(|(n, _)| n.clone()),
+                    id,
+                    title: node.title().to_string(),
+                    status: node.status(),
+                });
+            }
+        }
+        Ok(found)
+    }
+
+    /// When `s` is a UUID prefix that names no node of the selected book
+    /// `selected` but does name nodes of other books (archived ones
+    /// included), the message to answer with: which books hold it and how to
+    /// get there. `None` when `s` is not a UUID prefix or no book has it.
+    pub(crate) async fn elsewhere_hint(
+        &self,
+        s: &str,
+        selected: &str,
+    ) -> Result<Option<String>, McpError> {
+        if !is_uuid_prefix(s) {
+            return Ok(None);
+        }
+        let elsewhere: Vec<Located> = self
+            .locate(s, true)
+            .await?
+            .into_iter()
+            .filter(|l| l.slug != selected)
+            .collect();
+        if elsewhere.is_empty() {
+            return Ok(None);
+        }
+        let mut lines = vec![format!(
+            "No node with id starting with '{s}' in the selected book '{selected}'. It is in another book:"
+        )];
+        for l in &elsewhere {
+            lines.push(format!("- {}", l.describe()));
+        }
+        let slug = &elsewhere[0].slug;
+        lines.push(format!(
+            "Run `select_book {slug}` first, or `node_locate` to search every book by id."
+        ));
+        Ok(Some(lines.join("\n")))
+    }
+}
+
+/// A node found by [`OutlineMcpServer::locate`]: which book holds it and
+/// where it sits there.
+#[derive(Debug, Clone)]
+pub(crate) struct Located {
+    /// The book's slug.
+    pub slug: String,
+    /// The book's title.
+    pub book_title: String,
+    /// Whether the book is archived.
+    pub book_archived: bool,
+    /// The node's toc number in that book (`None` when it is not in the tree
+    /// walk, which does not happen for a stored node).
+    pub toc: Option<String>,
+    /// The node's id.
+    pub id: NodeId,
+    /// The node's title.
+    pub title: String,
+    /// The node's status.
+    pub status: NodeStatus,
+}
+
+impl Located {
+    /// One line: `<slug> "<book title>"[ [archived]]: <toc>. <title> (id: <uuid>, <status>)`.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{} \"{}\"{}: {}. {} (id: {}, {})",
+            self.slug,
+            self.book_title,
+            if self.book_archived {
+                " [archived]"
+            } else {
+                ""
+            },
+            self.toc.as_deref().unwrap_or("?"),
+            self.title,
+            self.id,
+            self.status.as_str()
+        )
+    }
+}
+
+/// Whether `s` is worth treating as a UUID prefix: hex digits and `-` only,
+/// at least 8 of them hex digits (the short id is 8). Anything shorter would
+/// match too much and is left to the title fallback.
+pub(crate) fn is_uuid_prefix(s: &str) -> bool {
+    let hex = s.chars().filter(char::is_ascii_hexdigit).count();
+    hex >= 8 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 /// Map a `book_update` failure for the slug-addressed tool: the messages name
@@ -796,7 +936,9 @@ impl ServerHandler for OutlineMcpServer {
                  Tools: `shelf` → `select_book` → `toc` → `node_create`/`node_update`/`node_move`. \
                  `checklist` for task export. `init` for new book, `book_update` to retitle, change max_depth or archive a book (hidden from `shelf`, nothing injected), `book_delete` to remove one.\n\
                  History: `snapshot_create`/`snapshot_list`/`snapshot_restore`/`snapshot_delete` for versioning. \
-                 `node_history` for change tracking. `dump` for full export.\n\
+                 `node_history` for change tracking. `dump` for full export. \
+                 Ids resolve within the selected book; `node_locate` finds which book holds \
+                 a UUID or 8+ hex prefix, no selection needed.\n\
                  Health: `book_lint` (structural smells) and `book_stats` (shape and freshness), both read-only.\n\
                  Batch: `node_batch_move`/`node_batch_update` for bulk operations (UUID required; \
                  `node_create` and `node_move` return it). `node_move`/`node_batch_move` take \
