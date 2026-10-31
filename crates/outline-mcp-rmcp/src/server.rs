@@ -645,7 +645,9 @@ impl OutlineMcpServer {
     /// 階層番号 / Full UUID / short prefix / title部分一致 → NodeId。
     ///
     /// 優先順位:
-    /// 1. 階層番号 (e.g. "1", "2-3") — `toc` 出力と対応
+    /// 1. 階層番号 (e.g. "1", "2-3") — `toc` 出力と対応。位置に node が無く、
+    ///    かつ UUID prefix の形 (hex 8 桁以上) なら 3 へ進む: 数字だけの short id
+    ///    (`99102601` など、約 2.3% の node) を toc 番号として拒否しない
     /// 2. Full UUID
     /// 3. 短縮UUIDプレフィックス
     /// 4. タイトル部分一致（フォールバック）
@@ -658,10 +660,12 @@ impl OutlineMcpServer {
             if let Some((_, id)) = mapping.iter().find(|(num, _)| num == s) {
                 return Ok(*id);
             }
-            return Err(McpError::invalid_params(
-                format!("No node at position '{s}'. Run `toc` to see available IDs."),
-                None,
-            ));
+            if !is_uuid_prefix(s) {
+                return Err(McpError::invalid_params(
+                    format!("No node at position '{s}'. Run `toc` to see available IDs."),
+                    None,
+                ));
+            }
         }
 
         // 2. Full UUIDとして解析
