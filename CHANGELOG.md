@@ -20,6 +20,8 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **An all-digit short id resolves** (#37). `resolve_id` read a node reference made of digits as a toc number and, when no node sat at that position, refused it with `No node at position` — so a node whose short id happens to be all digits (about 2.3 % of them, `99102601` say) could not be referred to by its short id in `node_history`, `node_update`, `node_move`, `links`, `node_verify` and the other tools that resolve through it (the batch tools and the full UUID were unaffected). A toc number still wins when it names a node; when it names none and the string looks like a UUID prefix (8 or more hex digits), the UUID prefix lookup runs next. `2-3` or `17` with no node at that position keep the toc-position error.
+
 ### Security
 
 ## [0.15.2] - 2026-10-19
